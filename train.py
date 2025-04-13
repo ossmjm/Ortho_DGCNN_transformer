@@ -61,7 +61,7 @@ def train_model(args):
     stages_criterion = nn.MSELoss()
     
     # Training utilities
-    scaler = torch.amp.GradScaler('cuda')  # Updated to torch.amp
+    scaler = torch.amp.GradScaler('cuda')
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     accumulation_steps = 2
 
@@ -81,7 +81,7 @@ def train_model(args):
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
             
-            with torch.amp.autocast('cuda'):  # Updated to torch.amp
+            with torch.amp.autocast('cuda'):
                 transforms_sequence, num_stages_pred = model(
                     cordinates, teacher_forcing=targets, 
                     true_num_stages=true_num_stages,
@@ -112,9 +112,10 @@ def train_model(args):
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
-                with torch.amp.autocast('cuda'):  # Updated to torch.amp
+                with torch.amp.autocast('cuda'):
                     transforms_sequence, num_stages_pred = model(cordinates)
-                    max_stages = num_stages_pred.max().item()
+                    max_stages = int(num_stages_pred.max().item())  # Convert to integer
+                    max_stages = min(max(1, max_stages), args.max_stages)  # Ensure within bounds
                     transform_loss = transform_criterion(
                         transforms_sequence[:, :max_stages, :, :], targets[:, :max_stages, :, :]
                     )
@@ -148,7 +149,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
     
     # Dataset and training arguments
-    parser.add_argument('--data_dir', type=str,
+    parser.add_argument('--data_dir', type=str, default="/media/osama/sm/Sample_data",
                         help="Path to the dataset directory containing jaw data.")
     parser.add_argument('--max_stages', type=int, default=20,
                         help="Maximum number of treatment stages.")
