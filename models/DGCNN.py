@@ -12,9 +12,9 @@ class DGCNN(nn.Module):
         self.in_channels = in_channels
         
         # EdgeConv layers for graph feature extraction
-        self.conv1 = nn.Conv2d(2 * in_channels, 64, kernel_size=1, bias=False)  # Fixed: 2 * in_channels
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
-        self.conv3 = nn.Conv2d(64, embed_dim, kernel_size=1, bias=False)
+        self.conv1 = nn.Conv2d(2 * in_channels, 64, kernel_size=1, bias=False)  # 2*13 → 64
+        self.conv2 = nn.Conv2d(2 * 64, 64, kernel_size=1, bias=False)           # 2*64 → 64
+        self.conv3 = nn.Conv2d(2 * 64, embed_dim, kernel_size=1, bias=False)    # 2*64 → embed_dim
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(embed_dim)
