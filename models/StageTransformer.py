@@ -1,7 +1,7 @@
 # models/StageTransformer.py
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint_sequential
+from torch.utils.checkpoint import checkpoint
 
 class StageTransformer(nn.Module):
     def __init__(self, d_model, max_stages=20):
@@ -35,17 +35,18 @@ class StageTransformer(nn.Module):
             x_b_list = [x_b[i] for i in range(self.max_stages)]
 
             for t in range(n_stages):
-                src = dgcnn_out[b].unsqueeze(0).repeat(t + 1, 1)
-                tgt = torch.stack(x_b_list[:t + 1])
-                src = src.unsqueeze(0)
-                tgt = tgt.unsqueeze(0)
-                transformer_out = checkpoint_sequential(
-                    modules=[self.transformer.encoder, self.transformer.decoder],
-                    segments=2,
-                    input=(src, tgt)
-                )
-                decoder_out = transformer_out[1]  # Decoder output
-                x_b_list[t] = decoder_out[:, -1, :]  # Shape: (1, d_model)
+                src = dgcnn_out[b].unsqueeze(0).repeat(t + 1, 1)  # Shape: (t+1, d_model)
+                tgt = torch.stack(x_b_list[:t + 1])               # Shape: (t+1, d_model)
+                src = src.unsqueeze(0)                            # Shape: (1, t+1, d_model)
+                tgt = tgt.unsqueeze(0)                            # Shape: (1, t+1, d_model)
+
+                # Use the transformer directly with checkpointing
+                def transformer_fn(src, tgt):
+                    return self.transformer(src, tgt)
+
+                # Apply checkpointing to the transformer call
+                out = checkpoint(transformer_fn, src, tgt, use_reentrant=False)
+                x_b_list[t] = out[:, -1, :]  # Shape: (1, d_model)
 
             x_b_updated = torch.stack(x_b_list)
             transformer_out = self.fc(x_b_updated[:n_stages])
