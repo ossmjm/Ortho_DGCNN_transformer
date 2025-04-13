@@ -1,4 +1,4 @@
-# train_model.py
+# train.py
 import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
@@ -8,48 +8,92 @@ from models.DGCNN import DGCNN
 from models.StageTransformer import StageTransformer
 from models.OrthoDGCNN import OrthoDGCNNModel
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.backends.cudnn.benchmark = True
+
 def train_model(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    train_dataset = JawTeethDataset(args.data_dir, max_stages=args.max_stages, split='train', train_ratio=args.train_ratio, inference=False)
-    test_dataset = JawTeethDataset(args.data_dir, max_stages=args.max_stages, split='test', train_ratio=args.train_ratio, inference=False)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    torch.cuda.empty_cache()
     
-    dgcnn = DGCNN(in_channels=3, embed_dim=512, num_teeth=14, k=20).to(device)
-    transformer = StageTransformer(d_model=14 * 512, max_stages=args.max_stages).to(device)
-    model = OrthoDGCNNModel(dgcnn, transformer, max_stages=args.max_stages).to(device)
+    train_dataset = JawTeethDataset(
+        args.data_dir, 
+        max_stages=args.max_stages, 
+        num_patches=args.num_patches, 
+        patch_size=args.patch_size, 
+        channels=13, 
+        split='train', 
+        train_ratio=args.train_ratio, 
+        inference=False
+    )
+    test_dataset = JawTeethDataset(
+        args.data_dir, 
+        max_stages=args.max_stages, 
+        num_patches=args.num_patches, 
+        patch_size=args.patch_size, 
+        channels=13, 
+        split='test', 
+        train_ratio=args.train_ratio, 
+        inference=False
+    )
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Test dataset size: {len(test_dataset)}")
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    
+    dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
+    transformer = StageTransformer(d_model=14 * args.embed_dim, max_stages=args.max_stages).to(device)
+    model = OrthoDGCNNModel(dgcnn, transformer, max_stages=args.max_stages, num_teeth=14, embed_dim=args.embed_dim).to(device)
     
     optimizer = torch.optim.Adam(
         list(dgcnn.parameters()) + list(transformer.parameters()) + 
         list(model.stage_predictor.parameters()) + list(model.transform_head.parameters()), 
-        lr=args.lr
+        lr=args.lr,
+        weight_decay=1e-4
     )
     transform_criterion = nn.MSELoss()
     stages_criterion = nn.MSELoss()
     
+    scaler = torch.cuda.amp.GradScaler()
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    accumulation_steps = 2
+
+    best_test_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
-        for batch in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        
+        for batch_idx, batch in enumerate(train_loader):
             cordinates, targets, true_num_stages = batch
             cordinates, targets, true_num_stages = [
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
             
-            optimizer.zero_grad()
-            transforms_sequence, num_stages_pred = model(
-                cordinates, teacher_forcing=targets, true_num_stages=true_num_stages,
-                epoch=epoch, total_epochs=args.epochs
-            )
+            with torch.cuda.amp.autocast():
+                transforms_sequence, num_stages_pred = model(
+                    cordinates, teacher_forcing=targets, 
+                    true_num_stages=true_num_stages,
+                    epoch=epoch, total_epochs=args.epochs
+                )
+                transform_loss = transform_criterion(transforms_sequence, targets)
+                stages_loss = stages_criterion(num_stages_pred.squeeze(-1).float(), true_num_stages.float())
+                loss = transform_loss + args.stages_loss_weight * stages_loss
+                loss = loss / accumulation_steps
             
-            transform_loss = transform_criterion(transforms_sequence, targets)
-            stages_loss = stages_criterion(num_stages_pred.float(), true_num_stages.float())
-            loss = transform_loss + args.stages_loss_weight * stages_loss
+            scaler.scale(loss).backward()
             
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            
+            train_loss += loss.item() * accumulation_steps
+        
         print(f"Epoch {epoch+1}/{args.epochs}, Train Loss: {train_loss / len(train_loader):.4f}")
         
         model.eval()
@@ -60,16 +104,29 @@ def train_model(args):
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
-                transforms_sequence, num_stages_pred = model(cordinates)
-                max_stages = num_stages_pred.max().item()
-                transform_loss = transform_criterion(
-                    transforms_sequence[:, :max_stages, :, :], targets[:, :max_stages, :, :]
-                )
-                stages_loss = stages_criterion(num_stages_pred.float(), true_num_stages.float())
-                loss = transform_loss + args.stages_loss_weight * stages_loss
+                with torch.cuda.amp.autocast():
+                    transforms_sequence, num_stages_pred = model(cordinates)
+                    max_stages = num_stages_pred.max().item()
+                    transform_loss = transform_criterion(
+                        transforms_sequence[:, :max_stages, :, :], targets[:, :max_stages, :, :]
+                    )
+                    stages_loss = stages_criterion(num_stages_pred.squeeze(-1).float(), true_num_stages.float())
+                    loss = transform_loss + args.stages_loss_weight * stages_loss
                 test_loss += loss.item()
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Loss: {test_loss / len(test_loader):.4f}")
-    
+        test_loss_avg = test_loss / len(test_loader)
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Loss: {test_loss_avg:.4f}")
+        
+        if test_loss_avg < best_test_loss:
+            best_test_loss = test_loss_avg
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if patience_counter >= patience:
+            print("Early stopping triggered")
+            break
+        
+        scheduler.step()
+
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(dgcnn.state_dict(), os.path.join(args.output_dir, "dgcnn.pth"))
     torch.save(model.stage_predictor.state_dict(), os.path.join(args.output_dir, "stage_predictor.pth"))
@@ -82,9 +139,12 @@ if __name__ == "__main__":
         max_stages = 20
         train_ratio = 0.8
         output_dir = "output"
-        lr = 0.001
-        epochs = 10
-        batch_size = 1
+        lr = 1e-4
+        epochs = 100
+        batch_size = 2
         stages_loss_weight = 1.0
+        embed_dim = 256
+        num_patches = 128
+        patch_size = 32
     args = Args()
     train_model(args)
