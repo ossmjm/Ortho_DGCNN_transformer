@@ -46,7 +46,7 @@ class StageTransformer(nn.Module):
 
                 # Apply checkpointing to the transformer call
                 out = checkpoint(transformer_fn, src, tgt, use_reentrant=False)
-                x_b_list[t] = out[:, -1, :]  # Shape: (1, d_model)
+                x_b_list[t] = out[:, -1, :].squeeze(0)  # Shape: (d_model,) to match x_b_list entries
 
             x_b_updated = torch.stack(x_b_list)
             transformer_out = self.fc(x_b_updated[:n_stages])

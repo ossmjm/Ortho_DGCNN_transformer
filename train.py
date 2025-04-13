@@ -61,7 +61,7 @@ def train_model(args):
     stages_criterion = nn.MSELoss()
     
     # Training utilities
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')  # Updated to torch.amp
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     accumulation_steps = 2
 
@@ -81,7 +81,7 @@ def train_model(args):
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):  # Updated to torch.amp
                 transforms_sequence, num_stages_pred = model(
                     cordinates, teacher_forcing=targets, 
                     true_num_stages=true_num_stages,
@@ -112,7 +112,7 @@ def train_model(args):
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):  # Updated to torch.amp
                     transforms_sequence, num_stages_pred = model(cordinates)
                     max_stages = num_stages_pred.max().item()
                     transform_loss = transform_criterion(
