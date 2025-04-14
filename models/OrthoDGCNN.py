@@ -3,18 +3,19 @@ import torch
 import torch.nn as nn
 
 class TransformHead(nn.Module):
-    def __init__(self, in_dim, max_stages, num_teeth):
+    def __init__(self, max_stages, num_teeth):
         super(TransformHead, self).__init__()
         self.max_stages = max_stages
         self.num_teeth = num_teeth
-        self.out_dim = max_stages * num_teeth * 6  # e.g., 20 * 14 * 6 = 1680
+        self.in_dim = num_teeth * 6  # Input dimension per stage: num_teeth * 6 (e.g., 84)
+        self.out_dim = num_teeth * 6  # Output dimension per stage: num_teeth * 6 (e.g., 84)
+        # A small network to refine the transformer output for each stage
         self.layers = nn.Sequential(
-            nn.Linear(in_dim, 512),
+            nn.Linear(self.in_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, self.out_dim)
+            nn.Linear(128, self.out_dim)
         )
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
@@ -25,8 +26,10 @@ class TransformHead(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        # Input x: (batch_size, max_stages, num_teeth * 6)
         batch_size = x.size(0)
-        out = self.layers(x)  # (batch_size, max_stages * num_teeth * 6)
+        x = x.view(batch_size * self.max_stages, self.in_dim)  # (batch_size * max_stages, num_teeth * 6)
+        out = self.layers(x)  # (batch_size * max_stages, num_teeth * 6)
         out = out.view(batch_size, self.max_stages, self.num_teeth, 6)  # (batch_size, max_stages, num_teeth, 6)
         return out
 
@@ -43,17 +46,14 @@ class OrthoDGCNNModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(256, 1),
-            nn.Sigmoid()  # Output in [0, 1]
+            nn.Sigmoid()
         )
         self.transform_head = TransformHead(
-            in_dim=num_teeth * embed_dim,
             max_stages=max_stages,
             num_teeth=num_teeth
         )
         self.max_stages = max_stages
         self.num_teeth = num_teeth
-
-        # Initialize weights for stage_predictor
         self._init_weights()
 
     def _init_weights(self):
@@ -65,12 +65,12 @@ class OrthoDGCNNModel(nn.Module):
 
     def forward(self, cordinates, teacher_forcing=None, true_num_stages=None, epoch=None, total_epochs=None):
         batch_size = cordinates.size(0)
-        dgcnn_out = self.dgcnn(cordinates)
+        dgcnn_out = self.dgcnn(cordinates)  # Shape: (batch_size, num_teeth * embed_dim)
         
         # Stage prediction
-        num_stages_pred = self.stage_predictor(dgcnn_out)  # Shape: (batch_size, 1), values in [0, 1]
-        num_stages_pred = 1 + (self.max_stages - 1) * num_stages_pred  # Scale to [1, 20]
-        num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)  # Round and clamp
+        num_stages_pred = self.stage_predictor(dgcnn_out)
+        num_stages_pred = 1 + (self.max_stages - 1) * num_stages_pred
+        num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred_rounded = {num_stages_pred_rounded.tolist()}")
         
@@ -86,18 +86,9 @@ class OrthoDGCNNModel(nn.Module):
         num_stages = num_stages.long()
         
         # Transformer processing with teacher forcing
-        transformer_out_list = self.transformer(dgcnn_out, num_stages, teacher_forcing)
+        transformer_out = self.transformer(dgcnn_out, num_stages, teacher_forcing)  # Shape: (batch_size, max_stages, num_teeth * 6)
         
-        # Compute the final output using TransformHead
-        transforms_sequence = self.transform_head(dgcnn_out)
-        
-        if transforms_sequence.size(1) < self.max_stages:
-            padding = torch.zeros(
-                batch_size, self.max_stages - transforms_sequence.size(1), self.num_teeth, 6,
-                device=transforms_sequence.device
-            )
-            transforms_sequence = torch.cat([transforms_sequence, padding], dim=1)
-        elif transforms_sequence.size(1) > self.max_stages:
-            transforms_sequence = transforms_sequence[:, :self.max_stages, :, :]
+        # Pass transformer_out to TransformHead
+        transforms_sequence = self.transform_head(transformer_out)  # Shape: (batch_size, max_stages, num_teeth, 6)
         
         return transforms_sequence, num_stages_pred

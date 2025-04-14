@@ -1,56 +1,51 @@
 # models/StageTransformer.py
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 class StageTransformer(nn.Module):
-    def __init__(self, d_model, max_stages=20):
+    def __init__(self, d_model, max_stages):
         super(StageTransformer, self).__init__()
         self.d_model = d_model
         self.max_stages = max_stages
+        self.num_teeth = 14
         self.transformer = nn.Transformer(
             d_model=d_model,
-            nhead=4,
-            num_encoder_layers=1,
-            num_decoder_layers=1,
-            batch_first=True,
-            dropout=0.5
+            nhead=8,
+            num_encoder_layers=3,
+            num_decoder_layers=3,
+            dim_feedforward=2048,
+            dropout=0.1
         )
-        self.fc = nn.Linear(d_model, 14 * 6)
-        self.teacher_forcing_projection = nn.Linear(14 * 6, d_model)
+        self.out_layer = nn.Linear(d_model, self.num_teeth * 6)
 
     def forward(self, dgcnn_out, num_stages, teacher_forcing=None):
         batch_size = dgcnn_out.size(0)
         transformer_out_list = []
 
         for b in range(batch_size):
-            n_stages = num_stages[b].item() if num_stages is not None else self.max_stages
-            x_b = torch.zeros(self.max_stages, self.d_model, device=dgcnn_out.device)
-
+            stages = num_stages[b].item()
+            src = dgcnn_out[b:b+1].repeat(stages, 1)
             if teacher_forcing is not None and self.training:
-                teacher_forcing_flat = teacher_forcing[b, :n_stages-1].view(n_stages-1, -1)
-                teacher_forcing_projected = self.teacher_forcing_projection(teacher_forcing_flat)
-                x_b = torch.cat((teacher_forcing_projected, x_b[n_stages-1:]), dim=0)
+                tgt = teacher_forcing[b, :stages, :, :]
+                tgt = tgt.view(stages, -1)
+                tgt = torch.nn.functional.pad(tgt, (0, self.d_model - self.num_teeth * 6))
+            else:
+                tgt = torch.zeros(stages, self.d_model, device=dgcnn_out.device)
 
-            x_b_list = [x_b[i] for i in range(self.max_stages)]
+            transformer_out = self.transformer(src, tgt)
+            transformer_out = self.out_layer(transformer_out)
 
-            for t in range(n_stages):
-                src = dgcnn_out[b].unsqueeze(0).repeat(t + 1, 1)  # Shape: (t+1, d_model)
-                tgt = torch.stack(x_b_list[:t + 1])               # Shape: (t+1, d_model)
-                src = src.unsqueeze(0)                            # Shape: (1, t+1, d_model)
-                tgt = tgt.unsqueeze(0)                            # Shape: (1, t+1, d_model)
+            if stages < self.max_stages:
+                padding = torch.zeros(
+                    self.max_stages - stages,
+                    self.num_teeth * 6,
+                    device=transformer_out.device
+                )
+                transformer_out = torch.cat([transformer_out, padding], dim=0)
+            elif stages > self.max_stages:
+                transformer_out = transformer_out[:self.max_stages, :]
 
-                # Use the transformer directly with checkpointing
-                def transformer_fn(src, tgt):
-                    return self.transformer(src, tgt)
-
-                # Apply checkpointing to the transformer call
-                out = checkpoint(transformer_fn, src, tgt, use_reentrant=False)
-                x_b_list[t] = out[:, -1, :].squeeze(0)  # Shape: (d_model,) to match x_b_list entries
-
-            x_b_updated = torch.stack(x_b_list)
-            transformer_out = self.fc(x_b_updated[:n_stages])
             transformer_out_list.append(transformer_out)
 
         transformer_out = torch.stack(transformer_out_list)
-        return transformer_out.view(batch_size, -1, 14, 6)
+        return transformer_out
