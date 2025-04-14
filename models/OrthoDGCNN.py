@@ -54,7 +54,7 @@ class OrthoDGCNNModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 1),
-            nn.ReLU()  # Ensure output is non-negative
+            nn.Softplus()  # Replace ReLU with Softplus for smooth positive outputs
         )
         self.transform_head = TransformHead(
             max_stages=max_stages,
@@ -80,22 +80,20 @@ class OrthoDGCNNModel(nn.Module):
         dgcnn_out = self.dgcnn(cordinates)
         
         # Stage prediction
-        num_stages_pred = self.stage_predictor(dgcnn_out)  # Shape: (batch_size, 1), values >= 0 due to ReLU
+        num_stages_pred = self.stage_predictor(dgcnn_out)  # Shape: (batch_size, 1), values > 0 due to Softplus
         num_stages_pred = torch.clamp(num_stages_pred, min=1, max=self.max_stages)  # Ensure range [1, max_stages]
         num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred_rounded = {num_stages_pred_rounded.tolist()}")
         
-        # Determine whether to use true_num_stages or num_stages_pred
+        # Determine whether to use true_num_stages or num_stages_pred with gradual transition
         if self.training and true_num_stages is not None and epoch is not None and total_epochs is not None:
-            if epoch < total_epochs * 0.5:
-                num_stages = true_num_stages
-            else:
-                num_stages = num_stages_pred_rounded
+            # Linearly interpolate between true_num_stages and num_stages_pred_rounded
+            alpha = min(1.0, epoch / (total_epochs * 0.5))  # 0 to 1 over first 50% of epochs
+            num_stages = alpha * num_stages_pred_rounded + (1 - alpha) * true_num_stages
+            num_stages = torch.round(num_stages).clamp(1, self.max_stages).long()
         else:
-            num_stages = num_stages_pred_rounded
-        
-        num_stages = num_stages.long()
+            num_stages = num_stages_pred_rounded.long()
         
         # Transformer processing with teacher forcing
         transformer_out = self.transformer(dgcnn_out, num_stages, teacher_forcing)

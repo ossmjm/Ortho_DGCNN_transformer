@@ -20,7 +20,7 @@ def train_model(args):
     torch.cuda.empty_cache()
     
     # Calculate d_model and check compatibility with n_head
-    num_teeth = 14  # Fixed in the dataset and models
+    num_teeth = 14
     d_model = num_teeth * args.embed_dim
     if d_model % args.n_head != 0:
         raise ValueError(
@@ -53,6 +53,8 @@ def train_model(args):
     print(f"Test dataset size: {len(test_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    print(f"Number of training batches: {len(train_loader)}")
+    print(f"Number of test batches: {len(test_loader)}")
     
     # Initialize models
     dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
@@ -86,7 +88,11 @@ def train_model(args):
     # Training loop
     for epoch in range(args.epochs):
         model.train()
-        train_loss = 0
+        train_transform_loss = 0
+        train_stages_loss = 0
+        train_stages_loss_unnorm = 0
+        train_total_loss = 0
+        
         optimizer.zero_grad(set_to_none=True)
         
         for batch_idx, batch in enumerate(train_loader):
@@ -108,6 +114,7 @@ def train_model(args):
                     epoch=epoch, total_epochs=args.epochs
                 )
                 
+                # Compute transform loss
                 transform_loss = 0
                 for b in range(cordinates.size(0)):
                     n_stages = true_num_stages[b].item()
@@ -117,11 +124,17 @@ def train_model(args):
                         transform_loss += transform_criterion(pred, tgt)
                 transform_loss = transform_loss / cordinates.size(0)
                 
+                # Compute stages loss (normalized and unnormalized)
                 stages_loss = stages_criterion(
                     num_stages_pred.squeeze(-1).float() / args.max_stages,
                     true_num_stages_normalized
                 )
+                stages_loss_unnorm = stages_criterion(
+                    num_stages_pred.squeeze(-1).float(),
+                    true_num_stages.float()
+                )
                 
+                # Combine losses
                 loss = transform_loss + args.stages_loss_weight * stages_loss
                 loss = loss / accumulation_steps
             
@@ -133,15 +146,26 @@ def train_model(args):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             
-            train_loss += loss.item() * accumulation_steps
+            train_transform_loss += transform_loss.item()
+            train_stages_loss += stages_loss.item()
+            train_stages_loss_unnorm += stages_loss_unnorm.item()
+            train_total_loss += loss.item() * accumulation_steps
         
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Loss: {train_loss / len(train_loader):.4f}")
+        # Log average losses per epoch
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss: {train_transform_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Normalized): {train_stages_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized): {train_stages_loss_unnorm / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {train_total_loss / len(train_loader):.4f}")
         
         # Evaluation loop
         model.eval()
-        test_loss = 0
+        test_transform_loss = 0
+        test_stages_loss = 0
+        test_stages_loss_unnorm = 0
+        test_total_loss = 0
+        
         with torch.no_grad():
-            for batch in test_loader:
+            for batch_idx, batch in enumerate(test_loader):
                 cordinates, targets, true_num_stages = batch
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
@@ -153,6 +177,8 @@ def train_model(args):
                     transforms_sequence, num_stages_pred = model(cordinates)
                     max_stages = int(num_stages_pred.max().item())
                     max_stages = min(max(1, max_stages), args.max_stages)
+                    
+                    print(f"Test Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
                     
                     transform_loss = 0
                     for b in range(cordinates.size(0)):
@@ -167,13 +193,27 @@ def train_model(args):
                         num_stages_pred.squeeze(-1).float() / args.max_stages,
                         true_num_stages_normalized
                     )
+                    stages_loss_unnorm = stages_criterion(
+                        num_stages_pred.squeeze(-1).float(),
+                        true_num_stages.float()
+                    )
+                    
                     loss = transform_loss + args.stages_loss_weight * stages_loss
-                test_loss += loss.item()
-        test_loss_avg = test_loss / len(test_loader)
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Loss: {test_loss_avg:.4f}")
+                
+                test_transform_loss += transform_loss.item()
+                test_stages_loss += stages_loss.item()
+                test_stages_loss_unnorm += stages_loss_unnorm.item()
+                test_total_loss += loss.item()
+        
+        # Log average test losses
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss: {test_transform_loss / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Normalized): {test_stages_loss / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized): {test_stages_loss_unnorm / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {test_total_loss / len(test_loader):.4f}")
         
         # Early stopping (optional)
         if args.early_stopping:
+            test_loss_avg = test_total_loss / len(test_loader)
             if test_loss_avg < best_test_loss:
                 best_test_loss = test_loss_avg
                 patience_counter = 0
@@ -201,7 +241,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--stages_loss_weight', type=float, default=1.0)
+    parser.add_argument('--stages_loss_weight', type=float, default=1.0)  # Increased from 0.1 to 1.0
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_patches', type=int, default=128)
     parser.add_argument('--patch_size', type=int, default=32)
