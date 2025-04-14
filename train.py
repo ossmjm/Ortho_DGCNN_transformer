@@ -19,6 +19,15 @@ def train_model(args):
     
     torch.cuda.empty_cache()
     
+    # Calculate d_model and check compatibility with n_head
+    num_teeth = 14  # Fixed in the dataset and models
+    d_model = num_teeth * args.embed_dim
+    if d_model % args.n_head != 0:
+        raise ValueError(
+            f"d_model ({d_model}) must be divisible by n_head ({args.n_head}). "
+            f"Choose a different n_head or adjust embed_dim ({args.embed_dim})."
+        )
+    
     # Initialize datasets
     train_dataset = JawTeethDataset(
         args.data_dir, 
@@ -47,7 +56,13 @@ def train_model(args):
     
     # Initialize models
     dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
-    transformer = StageTransformer(d_model=14 * args.embed_dim, max_stages=args.max_stages).to(device)
+    transformer = StageTransformer(
+        d_model=d_model,
+        max_stages=args.max_stages,
+        n_head=args.n_head,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers
+    ).to(device)
     model = OrthoDGCNNModel(dgcnn, transformer, max_stages=args.max_stages, num_teeth=14, embed_dim=args.embed_dim).to(device)
     
     # Optimizer and loss functions
@@ -66,7 +81,6 @@ def train_model(args):
     accumulation_steps = 2
 
     best_test_loss = float('inf')
-    patience = 10
     patience_counter = 0
 
     # Training loop
@@ -82,10 +96,9 @@ def train_model(args):
             ]
             
             # Normalize targets and true_num_stages
-            targets = targets / (torch.abs(targets).max() + 1e-8)  # Normalize transformations to [-1, 1]
-            true_num_stages_normalized = true_num_stages.float() / args.max_stages  # Normalize stages to [0, 1]
+            targets = targets / (torch.abs(targets).max() + 1e-8)
+            true_num_stages_normalized = true_num_stages.float() / args.max_stages
             
-            # Debug: Print true_num_stages
             print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
             
             with torch.amp.autocast('cuda'):
@@ -95,7 +108,6 @@ def train_model(args):
                     epoch=epoch, total_epochs=args.epochs
                 )
                 
-                # Compute transform loss using true_num_stages
                 transform_loss = 0
                 for b in range(cordinates.size(0)):
                     n_stages = true_num_stages[b].item()
@@ -105,7 +117,6 @@ def train_model(args):
                         transform_loss += transform_criterion(pred, tgt)
                 transform_loss = transform_loss / cordinates.size(0)
                 
-                # Compute stages loss (num_stages_pred is in [1, 20])
                 stages_loss = stages_criterion(
                     num_stages_pred.squeeze(-1).float() / args.max_stages,
                     true_num_stages_normalized
@@ -161,15 +172,16 @@ def train_model(args):
         test_loss_avg = test_loss / len(test_loader)
         print(f"Epoch {epoch+1}/{args.epochs}, Test Loss: {test_loss_avg:.4f}")
         
-        # Early stopping
-        if test_loss_avg < best_test_loss:
-            best_test_loss = test_loss_avg
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        if patience_counter >= patience:
-            print("Early stopping triggered")
-            break
+        # Early stopping (optional)
+        if args.early_stopping:
+            if test_loss_avg < best_test_loss:
+                best_test_loss = test_loss_avg
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
         
         scheduler.step()
 
@@ -182,7 +194,7 @@ def train_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
-    parser.add_argument('--data_dir', type=str)
+    parser.add_argument('--data_dir', type=str, default="/media/osama/sm/Sample_data")
     parser.add_argument('--max_stages', type=int, default=20)
     parser.add_argument('--train_ratio', type=float, default=0.8)
     parser.add_argument('--output_dir', type=str, default="output")
@@ -193,6 +205,11 @@ if __name__ == "__main__":
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_patches', type=int, default=128)
     parser.add_argument('--patch_size', type=int, default=32)
+    parser.add_argument('--early_stopping', action='store_true', default=False, help="Enable early stopping")
+    parser.add_argument('--patience', type=int, default=10, help="Patience for early stopping")
+    parser.add_argument('--n_head', type=int, default=16, help="Number of attention heads in transformer")
+    parser.add_argument('--num_encoder_layers', type=int, default=6, help="Number of encoder layers in transformer")
+    parser.add_argument('--num_decoder_layers', type=int, default=6, help="Number of decoder layers in transformer")
 
     args = parser.parse_args()
     print("Training with the following arguments:")
