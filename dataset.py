@@ -58,7 +58,6 @@ class JawTeethDataset(Dataset):
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
                         "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
         
-        jaw_id = str(jaw_id).lstrip('0')
         jaw_data = transform_df[transform_df["Jaw_ID"] == jaw_id]
         if jaw_data.empty:
             print(f"Warning: No data found for Jaw_ID {jaw_id} in {transform_file}")
