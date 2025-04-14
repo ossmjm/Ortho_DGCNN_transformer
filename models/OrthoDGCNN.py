@@ -46,7 +46,6 @@ class OrthoDGCNNModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(256, 1),
-            nn.Sigmoid()
         )
         self.transform_head = TransformHead(
             max_stages=max_stages,
@@ -69,7 +68,6 @@ class OrthoDGCNNModel(nn.Module):
         
         # Stage prediction
         num_stages_pred = self.stage_predictor(dgcnn_out)
-        num_stages_pred = 1 + (self.max_stages - 1) * num_stages_pred
         num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred_rounded = {num_stages_pred_rounded.tolist()}")
