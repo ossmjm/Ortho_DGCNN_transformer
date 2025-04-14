@@ -75,7 +75,7 @@ def train_model(args):
         weight_decay=1e-4
     )
     transform_criterion = nn.MSELoss()
-    stages_criterion = nn.MSELoss()
+    stages_criterion = nn.CrossEntropyLoss()  # Changed to cross-entropy for classification
     
     # Training utilities
     scaler = torch.amp.GradScaler('cuda')
@@ -101,20 +101,19 @@ def train_model(args):
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
             
-            # Normalize targets and true_num_stages
+            # Normalize targets
             targets = targets / (torch.abs(targets).max() + 1e-8)
-            true_num_stages_normalized = true_num_stages.float() / args.max_stages
             
             print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
             
             with torch.amp.autocast('cuda'):
-                transforms_sequence, num_stages_pred = model(
+                transforms_sequence, stage_logits = model(
                     cordinates, teacher_forcing=targets, 
                     true_num_stages=true_num_stages,
                     epoch=epoch, total_epochs=args.epochs
                 )
                 
-                # Compute transform loss
+                # Compute transform loss using true_num_stages
                 transform_loss = 0
                 for b in range(cordinates.size(0)):
                     n_stages = true_num_stages[b].item()
@@ -124,15 +123,14 @@ def train_model(args):
                         transform_loss += transform_criterion(pred, tgt)
                 transform_loss = transform_loss / cordinates.size(0)
                 
-                # Compute stages loss (normalized and unnormalized)
-                stages_loss = stages_criterion(
-                    num_stages_pred.squeeze(-1).float() / args.max_stages,
-                    true_num_stages_normalized
-                )
-                stages_loss_unnorm = stages_criterion(
-                    num_stages_pred.squeeze(-1).float(),
-                    true_num_stages.float()
-                )
+                # Compute stages loss (cross-entropy)
+                # Convert true_num_stages to class indices (0 to max_stages-1)
+                stage_targets = true_num_stages - 1  # Shape: (batch_size,), values in [0, max_stages-1]
+                stages_loss = stages_criterion(stage_logits, stage_targets)
+                
+                # Compute unnormalized stages loss (MSE between predicted and true stages)
+                num_stages_pred = torch.argmax(stage_logits, dim=1) + 1  # Shape: (batch_size,)
+                stages_loss_unnorm = ((num_stages_pred.float() - true_num_stages.float()) ** 2).mean()
                 
                 # Combine losses
                 loss = transform_loss + args.stages_loss_weight * stages_loss
@@ -153,13 +151,14 @@ def train_model(args):
         
         # Log average losses per epoch
         print(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss: {train_transform_loss / len(train_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Normalized): {train_stages_loss / len(train_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized): {train_stages_loss_unnorm / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Cross-Entropy): {train_stages_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized MSE): {train_stages_loss_unnorm / len(train_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {train_total_loss / len(train_loader):.4f}")
         
         # Evaluation loop
         model.eval()
         test_transform_loss = 0
+        test_transform_loss_pred_stages = 0
         test_stages_loss = 0
         test_stages_loss_unnorm = 0
         test_total_loss = 0
@@ -171,44 +170,54 @@ def train_model(args):
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
                 targets = targets / (torch.abs(targets).max() + 1e-8)
-                true_num_stages_normalized = true_num_stages.float() / args.max_stages
                 
                 with torch.amp.autocast('cuda'):
-                    transforms_sequence, num_stages_pred = model(cordinates)
-                    max_stages = int(num_stages_pred.max().item())
-                    max_stages = min(max(1, max_stages), args.max_stages)
+                    transforms_sequence, stage_logits = model(cordinates)
                     
                     print(f"Test Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
                     
+                    # Transform loss using true_num_stages
                     transform_loss = 0
                     for b in range(cordinates.size(0)):
-                        n_stages = min(max_stages, true_num_stages[b].item())
+                        n_stages = true_num_stages[b].item()
                         if n_stages > 0:
                             pred = transforms_sequence[b, :n_stages, :, :]
                             tgt = targets[b, :n_stages, :, :]
                             transform_loss += transform_criterion(pred, tgt)
                     transform_loss = transform_loss / cordinates.size(0)
                     
-                    stages_loss = stages_criterion(
-                        num_stages_pred.squeeze(-1).float() / args.max_stages,
-                        true_num_stages_normalized
-                    )
-                    stages_loss_unnorm = stages_criterion(
-                        num_stages_pred.squeeze(-1).float(),
-                        true_num_stages.float()
-                    )
+                    # Transform loss using predicted num_stages (for comparison)
+                    transform_loss_pred_stages = 0
+                    num_stages_pred = torch.argmax(stage_logits, dim=1) + 1
+                    for b in range(cordinates.size(0)):
+                        n_stages = min(num_stages_pred[b].item(), true_num_stages[b].item())
+                        if n_stages > 0:
+                            pred = transforms_sequence[b, :n_stages, :, :]
+                            tgt = targets[b, :n_stages, :, :]
+                            transform_loss_pred_stages += transform_criterion(pred, tgt)
+                    transform_loss_pred_stages = transform_loss_pred_stages / cordinates.size(0)
                     
+                    # Stages loss (cross-entropy)
+                    stage_targets = true_num_stages - 1
+                    stages_loss = stages_criterion(stage_logits, stage_targets)
+                    
+                    # Unnormalized stages loss (MSE)
+                    stages_loss_unnorm = ((num_stages_pred.float() - true_num_stages.float()) ** 2).mean()
+                    
+                    # Combine losses
                     loss = transform_loss + args.stages_loss_weight * stages_loss
                 
                 test_transform_loss += transform_loss.item()
+                test_transform_loss_pred_stages += transform_loss_pred_stages.item()
                 test_stages_loss += stages_loss.item()
                 test_stages_loss_unnorm += stages_loss_unnorm.item()
                 test_total_loss += loss.item()
         
         # Log average test losses
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss: {test_transform_loss / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Normalized): {test_stages_loss / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized): {test_stages_loss_unnorm / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (True Stages): {test_transform_loss / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (Pred Stages): {test_transform_loss_pred_stages / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Cross-Entropy): {test_stages_loss / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized MSE): {test_stages_loss_unnorm / len(test_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {test_total_loss / len(test_loader):.4f}")
         
         # Early stopping (optional)
@@ -234,14 +243,14 @@ def train_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
-    parser.add_argument('--data_dir', type=str, default="/media/osama/sm/Sample_data")
+    parser.add_argument('--data_dir', type=str)
     parser.add_argument('--max_stages', type=int, default=20)
     parser.add_argument('--train_ratio', type=float, default=0.8)
     parser.add_argument('--output_dir', type=str, default="output")
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--stages_loss_weight', type=float, default=1.0)  # Increased from 0.1 to 1.0
+    parser.add_argument('--stages_loss_weight', type=float, default=10.0)  # Increased to 10.0
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_patches', type=int, default=128)
     parser.add_argument('--patch_size', type=int, default=32)

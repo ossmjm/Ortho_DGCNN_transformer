@@ -53,8 +53,7 @@ class OrthoDGCNNModel(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1),
-            nn.Softplus()
+            nn.Linear(128, max_stages)  # Output logits for max_stages classes (1 to max_stages)
         )
         self.transform_head = TransformHead(
             max_stages=max_stages,
@@ -69,33 +68,29 @@ class OrthoDGCNNModel(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    if m.bias.shape[0] == 1:
-                        nn.init.constant_(m.bias, 1.0)
-                    else:
-                        nn.init.constant_(m.bias, 0)
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, cordinates, teacher_forcing=None, true_num_stages=None, epoch=None, total_epochs=None):
         batch_size = cordinates.size(0)
         dgcnn_out = self.dgcnn(cordinates)
         
-        # Stage prediction
-        num_stages_pred = self.stage_predictor(dgcnn_out)
-        num_stages_pred = torch.clamp(num_stages_pred, min=1, max=self.max_stages)
-        num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)
+        # Stage prediction (classification)
+        stage_logits = self.stage_predictor(dgcnn_out)  # Shape: (batch_size, max_stages)
+        # Convert logits to predicted stages (1 to max_stages)
+        num_stages_pred = torch.argmax(stage_logits, dim=1) + 1  # Shape: (batch_size,), values in [1, max_stages]
+        
+        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: stage_logits = {stage_logits.tolist()}")
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
-        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred_rounded = {num_stages_pred_rounded.tolist()}")
         
         # Determine whether to use true_num_stages or num_stages_pred with gradual transition
         if self.training and true_num_stages is not None and epoch is not None and total_epochs is not None:
-            alpha = min(1.0, epoch / (total_epochs * 0.5))
-            num_stages = alpha * num_stages_pred_rounded + (1 - alpha) * true_num_stages.unsqueeze(-1)
+            alpha = min(1.0, epoch / (total_epochs * 0.75))  # Extend transition to 75% of epochs
+            num_stages = alpha * num_stages_pred + (1 - alpha) * true_num_stages
             num_stages = torch.round(num_stages).clamp(1, self.max_stages).long()
         else:
-            num_stages = num_stages_pred_rounded.long()
+            num_stages = num_stages_pred
         
-        # Squeeze num_stages to ensure shape (batch_size,)
-        num_stages = num_stages.squeeze(-1)
-        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages (after squeeze) = {num_stages.tolist()}")
+        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages (after transition) = {num_stages.tolist()}")
         
         # Transformer processing with teacher forcing
         transformer_out = self.transformer(dgcnn_out, num_stages, teacher_forcing)
@@ -103,4 +98,4 @@ class OrthoDGCNNModel(nn.Module):
         # Pass transformer_out to TransformHead
         transforms_sequence = self.transform_head(transformer_out)
         
-        return transforms_sequence, num_stages_pred
+        return transforms_sequence, stage_logits  # Return logits for cross-entropy loss
