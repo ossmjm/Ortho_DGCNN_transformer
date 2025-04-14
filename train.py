@@ -81,18 +81,41 @@ def train_model(args):
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
             
+            # Normalize targets and true_num_stages
+            targets = targets / (torch.abs(targets).max() + 1e-8)  # Normalize transformations to [-1, 1]
+            true_num_stages_normalized = true_num_stages.float() / args.max_stages  # Normalize stages to [0, 1]
+            
+            # Debug: Print true_num_stages for this batch
+            print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
+            
             with torch.amp.autocast('cuda'):
                 transforms_sequence, num_stages_pred = model(
                     cordinates, teacher_forcing=targets, 
                     true_num_stages=true_num_stages,
                     epoch=epoch, total_epochs=args.epochs
                 )
-                transform_loss = transform_criterion(transforms_sequence, targets)
-                stages_loss = stages_criterion(num_stages_pred.squeeze(-1).float(), true_num_stages.float())
+                
+                # Compute transform loss only for valid stages
+                transform_loss = 0
+                for b in range(cordinates.size(0)):
+                    n_stages = true_num_stages[b].item()
+                    if n_stages > 0:  # Ensure there are stages to compute loss for
+                        pred = transforms_sequence[b, :n_stages, :, :]
+                        tgt = targets[b, :n_stages, :, :]
+                        transform_loss += transform_criterion(pred, tgt)
+                transform_loss = transform_loss / cordinates.size(0)  # Average over batch
+                
+                # Compute stages loss
+                stages_loss = stages_criterion(
+                    num_stages_pred.squeeze(-1).float() / args.max_stages,  # Normalize predicted stages
+                    true_num_stages_normalized
+                )
+                
                 loss = transform_loss + args.stages_loss_weight * stages_loss
                 loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
@@ -112,14 +135,29 @@ def train_model(args):
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
+                # Normalize targets and true_num_stages
+                targets = targets / (torch.abs(targets).max() + 1e-8)
+                true_num_stages_normalized = true_num_stages.float() / args.max_stages
+                
                 with torch.amp.autocast('cuda'):
                     transforms_sequence, num_stages_pred = model(cordinates)
-                    max_stages = int(num_stages_pred.max().item())  # Convert to integer
-                    max_stages = min(max(1, max_stages), args.max_stages)  # Ensure within bounds
-                    transform_loss = transform_criterion(
-                        transforms_sequence[:, :max_stages, :, :], targets[:, :max_stages, :, :]
+                    max_stages = int(num_stages_pred.max().item())
+                    max_stages = min(max(1, max_stages), args.max_stages)
+                    
+                    # Compute transform loss for evaluation
+                    transform_loss = 0
+                    for b in range(cordinates.size(0)):
+                        n_stages = min(max_stages, true_num_stages[b].item())
+                        if n_stages > 0:
+                            pred = transforms_sequence[b, :n_stages, :, :]
+                            tgt = targets[b, :n_stages, :, :]
+                            transform_loss += transform_criterion(pred, tgt)
+                    transform_loss = transform_loss / cordinates.size(0)
+                    
+                    stages_loss = stages_criterion(
+                        num_stages_pred.squeeze(-1).float() / args.max_stages,
+                        true_num_stages_normalized
                     )
-                    stages_loss = stages_criterion(num_stages_pred.squeeze(-1).float(), true_num_stages.float())
                     loss = transform_loss + args.stages_loss_weight * stages_loss
                 test_loss += loss.item()
         test_loss_avg = test_loss / len(test_loader)
@@ -145,42 +183,21 @@ def train_model(args):
     torch.save(model.state_dict(), os.path.join(args.output_dir, "ortho_dgcnn.pth"))
 
 if __name__ == "__main__":
-    # Set up argument parser
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
-    
-    # Dataset and training arguments
-    parser.add_argument('--data_dir', type=str, default="/media/osama/sm/Sample_data",
-                        help="Path to the dataset directory containing jaw data.")
-    parser.add_argument('--max_stages', type=int, default=20,
-                        help="Maximum number of treatment stages.")
-    parser.add_argument('--train_ratio', type=float, default=0.8,
-                        help="Ratio of data to use for training (vs. testing).")
-    parser.add_argument('--output_dir', type=str, default="output",
-                        help="Directory to save model checkpoints and outputs.")
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help="Learning rate for the optimizer.")
-    parser.add_argument('--epochs', type=int, default=100,
-                        help="Number of epochs to train the model.")
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help="Batch size for training and evaluation.")
-    parser.add_argument('--stages_loss_weight', type=float, default=1.0,
-                        help="Weight for the stage prediction loss in the total loss.")
-    
-    # Model architecture arguments
-    parser.add_argument('--embed_dim', type=int, default=256,
-                        help="Embedding dimension for the DGCNN model.")
-    parser.add_argument('--num_patches', type=int, default=128,
-                        help="Number of patches per tooth in the point cloud.")
-    parser.add_argument('--patch_size', type=int, default=32,
-                        help="Size of each patch in the point cloud.")
+    parser.add_argument('--data_dir', type=str)
+    parser.add_argument('--max_stages', type=int, default=20)
+    parser.add_argument('--train_ratio', type=float, default=0.8)
+    parser.add_argument('--output_dir', type=str, default="output")
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--stages_loss_weight', type=float, default=1.0)
+    parser.add_argument('--embed_dim', type=int, default=256)
+    parser.add_argument('--num_patches', type=int, default=128)
+    parser.add_argument('--patch_size', type=int, default=32)
 
-    # Parse arguments
     args = parser.parse_args()
-    
-    # Print arguments for verification
     print("Training with the following arguments:")
     for arg, value in vars(args).items():
         print(f"{arg}: {value}")
-    
-    # Run training
     train_model(args)
