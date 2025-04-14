@@ -18,16 +18,21 @@ class JawTeethDataset(Dataset):
         self.num_teeth = 14
         self.inference = inference
         
+        # Load num_stages.xlsx and normalize Jaw_ID
         self.num_stages_df = pd.read_excel(os.path.join(data_dir, "num_stages.xlsx"))
+        self.num_stages_df["Jaw_ID"] = self.num_stages_df["Jaw_ID"].astype(str).str.lstrip('0')
         self.num_stages_dict = dict(zip(self.num_stages_df["Jaw_ID"], self.num_stages_df["Num_Stages"]))
+        print(f"num_stages_dict: {self.num_stages_dict}")
         
         self.cases = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d.isdigit()]
+        print(f"cases: {self.cases}")
         train_cases, test_cases = train_test_split(self.cases, train_size=train_ratio, random_state=42)
         self.cases = train_cases if split == 'train' else test_cases
         
         self.stl_files = []
         self.json_files = []
         self.transformations = []
+        self.num_stages_list = []
         for case in self.cases:
             case_dir = os.path.join(data_dir, case)
             stl_file = os.path.join(case_dir, "ori", "before_treatment.stl")
@@ -35,8 +40,17 @@ class JawTeethDataset(Dataset):
             transform_file = os.path.join(case_dir, "Transformations.xlsx")
             self.stl_files.append(stl_file)
             self.json_files.append(json_file)
-            self.transformations.append(self._load_transformations(transform_file, case))
+            transformations = self._load_transformations(transform_file, case)
+            self.transformations.append(transformations)
+            num_stages = self._compute_num_stages(transformations)
+            self.num_stages_list.append(num_stages)
         self.transformations = torch.stack(self.transformations)
+
+    def _compute_num_stages(self, transformations):
+        for stage in range(self.max_stages):
+            if not torch.any(transformations[stage, :, :] != 0):
+                return stage if stage > 0 else 1
+        return self.max_stages
 
     def _load_transformations(self, transform_file, jaw_id):
         transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
@@ -44,7 +58,7 @@ class JawTeethDataset(Dataset):
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
                         "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
         
-        jaw_id = str(jaw_id)
+        jaw_id = str(jaw_id).lstrip('0')
         jaw_data = transform_df[transform_df["Jaw_ID"] == jaw_id]
         if jaw_data.empty:
             print(f"Warning: No data found for Jaw_ID {jaw_id} in {transform_file}")
@@ -112,7 +126,12 @@ class JawTeethDataset(Dataset):
             
             faces_list[tooth_idx], feats_list[tooth_idx], vertices_list[tooth_idx] = faces, feats, vertices
         
-        num_stages = self.num_stages_dict.get(jaw_id, self.max_stages)
+        num_stages = self.num_stages_list[idx]
+        jaw_id_normalized = str(jaw_id).lstrip('0')
+        dict_num_stages = self.num_stages_dict.get(jaw_id_normalized, None)
+        print(f"actual num_stages :{dict_num_stages}")
+        if dict_num_stages is not None:
+            num_stages = min(dict_num_stages, self.max_stages)
         
         if self.inference:
             return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
