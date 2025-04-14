@@ -54,7 +54,7 @@ class OrthoDGCNNModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 1),
-            nn.Softplus()  # Replace ReLU with Softplus for smooth positive outputs
+            nn.Softplus()
         )
         self.transform_head = TransformHead(
             max_stages=max_stages,
@@ -69,9 +69,8 @@ class OrthoDGCNNModel(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    # Initialize bias of the last layer to encourage positive outputs
-                    if m.bias.shape[0] == 1:  # Last layer
-                        nn.init.constant_(m.bias, 1.0)  # Small positive bias
+                    if m.bias.shape[0] == 1:
+                        nn.init.constant_(m.bias, 1.0)
                     else:
                         nn.init.constant_(m.bias, 0)
 
@@ -80,20 +79,23 @@ class OrthoDGCNNModel(nn.Module):
         dgcnn_out = self.dgcnn(cordinates)
         
         # Stage prediction
-        num_stages_pred = self.stage_predictor(dgcnn_out)  # Shape: (batch_size, 1), values > 0 due to Softplus
-        num_stages_pred = torch.clamp(num_stages_pred, min=1, max=self.max_stages)  # Ensure range [1, max_stages]
+        num_stages_pred = self.stage_predictor(dgcnn_out)
+        num_stages_pred = torch.clamp(num_stages_pred, min=1, max=self.max_stages)
         num_stages_pred_rounded = torch.round(num_stages_pred).clamp(1, self.max_stages)
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
         print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred_rounded = {num_stages_pred_rounded.tolist()}")
         
         # Determine whether to use true_num_stages or num_stages_pred with gradual transition
         if self.training and true_num_stages is not None and epoch is not None and total_epochs is not None:
-            # Linearly interpolate between true_num_stages and num_stages_pred_rounded
-            alpha = min(1.0, epoch / (total_epochs * 0.5))  # 0 to 1 over first 50% of epochs
-            num_stages = alpha * num_stages_pred_rounded + (1 - alpha) * true_num_stages
+            alpha = min(1.0, epoch / (total_epochs * 0.5))
+            num_stages = alpha * num_stages_pred_rounded + (1 - alpha) * true_num_stages.unsqueeze(-1)
             num_stages = torch.round(num_stages).clamp(1, self.max_stages).long()
         else:
             num_stages = num_stages_pred_rounded.long()
+        
+        # Squeeze num_stages to ensure shape (batch_size,)
+        num_stages = num_stages.squeeze(-1)
+        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages (after squeeze) = {num_stages.tolist()}")
         
         # Transformer processing with teacher forcing
         transformer_out = self.transformer(dgcnn_out, num_stages, teacher_forcing)
