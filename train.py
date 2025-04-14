@@ -75,7 +75,7 @@ def train_model(args):
         weight_decay=1e-4
     )
     transform_criterion = nn.MSELoss()
-    stages_criterion = nn.CrossEntropyLoss()  # Changed to cross-entropy for classification
+    stages_criterion = nn.CrossEntropyLoss()
     
     # Training utilities
     scaler = torch.amp.GradScaler('cuda')
@@ -100,6 +100,10 @@ def train_model(args):
             cordinates, targets, true_num_stages = [
                 x.to(device) for x in [cordinates, targets, true_num_stages]
             ]
+            
+            # Ensure true_num_stages is torch.long
+            true_num_stages = true_num_stages.long()
+            print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages type = {true_num_stages.dtype}, values = {true_num_stages.tolist()}")
             
             # Normalize targets
             targets = targets / (torch.abs(targets).max() + 1e-8)
@@ -126,6 +130,7 @@ def train_model(args):
                 # Compute stages loss (cross-entropy)
                 # Convert true_num_stages to class indices (0 to max_stages-1)
                 stage_targets = true_num_stages - 1  # Shape: (batch_size,), values in [0, max_stages-1]
+                stage_targets = stage_targets.long()  # Ensure type is torch.long
                 stages_loss = stages_criterion(stage_logits, stage_targets)
                 
                 # Compute unnormalized stages loss (MSE between predicted and true stages)
@@ -169,6 +174,7 @@ def train_model(args):
                 cordinates, targets, true_num_stages = [
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
+                true_num_stages = true_num_stages.long()  # Ensure type is torch.long
                 targets = targets / (torch.abs(targets).max() + 1e-8)
                 
                 with torch.amp.autocast('cuda'):
@@ -199,6 +205,7 @@ def train_model(args):
                     
                     # Stages loss (cross-entropy)
                     stage_targets = true_num_stages - 1
+                    stage_targets = stage_targets.long()  # Ensure type is torch.long
                     stages_loss = stages_criterion(stage_logits, stage_targets)
                     
                     # Unnormalized stages loss (MSE)
@@ -243,14 +250,14 @@ def train_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
-    parser.add_argument('--data_dir', type=str)
+    parser.add_argument('--data_dir', type=str, default="/media/osama/sm/Sample_data")
     parser.add_argument('--max_stages', type=int, default=20)
     parser.add_argument('--train_ratio', type=float, default=0.8)
     parser.add_argument('--output_dir', type=str, default="output")
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--stages_loss_weight', type=float, default=10.0)  # Increased to 10.0
+    parser.add_argument('--stages_loss_weight', type=float, default=10.0)
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_patches', type=int, default=128)
     parser.add_argument('--patch_size', type=int, default=32)
