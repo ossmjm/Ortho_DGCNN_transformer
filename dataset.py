@@ -94,7 +94,7 @@ class JawTeethDataset(Dataset):
                 
                 # Apply cleaning and conversion to each transformation value
                 transformations[stage - 1, tooth_idx] = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm)"]), 
+                    clean_and_convert(row["Left/Right (mm"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
