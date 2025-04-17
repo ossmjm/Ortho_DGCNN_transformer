@@ -80,7 +80,7 @@ class OrthoDGCNNModel(nn.Module):
         num_stages_pred = torch.argmax(stage_logits, dim=1) + 1  # Shape: (batch_size,), values in [1, max_stages]
         
         # print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: stage_logits = {stage_logits.tolist()}")
-        print(f"Epoch {epoch+1}: num_stages_pred = {num_stages_pred.tolist()}")
+        print(f"Epoch {epoch+1 if epoch is not None else 'N/A'}: num_stages_pred = {num_stages_pred.tolist()}")
         
         # Determine whether to use true_num_stages or num_stages_pred with gradual transition
         if self.training and true_num_stages is not None and epoch is not None and total_epochs is not None:
