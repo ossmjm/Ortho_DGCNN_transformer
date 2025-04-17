@@ -8,13 +8,37 @@ from dataset import JawTeethDataset
 from models.DGCNN import DGCNN
 from models.StageTransformer import StageTransformer
 from models.OrthoDGCNN import OrthoDGCNNModel
+import logging
 
 # Set environment variables for CUDA
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cudnn.benchmark = True
 
+# Set up logging
+def setup_logging(log_file):
+    logger = logging.getLogger('TrainLogger')
+    logger.setLevel(logging.INFO)
+    
+    # Create handlers
+    file_handler = logging.FileHandler(log_file)
+    console_handler = logging.StreamHandler()
+    
+    # Create formatters and add them to handlers
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+    
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
 def train_model(args):
+    # Initialize logger with the user-specified log file path
+    logger = setup_logging(args.log_file)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     torch.cuda.empty_cache()
@@ -28,7 +52,7 @@ def train_model(args):
             f"Choose a different n_head or adjust embed_dim ({args.embed_dim})."
         )
     
-    # Initialize datasets
+    # Initialize datasets, passing the log_file parameter
     train_dataset = JawTeethDataset(
         args.data_dir, 
         max_stages=args.max_stages, 
@@ -37,7 +61,8 @@ def train_model(args):
         channels=13, 
         split='train', 
         train_ratio=args.train_ratio, 
-        inference=False
+        inference=False,
+        log_file=args.log_file
     )
     test_dataset = JawTeethDataset(
         args.data_dir, 
@@ -47,14 +72,15 @@ def train_model(args):
         channels=13, 
         split='test', 
         train_ratio=args.train_ratio, 
-        inference=False
+        inference=False,
+        log_file=args.log_file
     )
-    print(f"Training dataset size: {len(train_dataset)}")
-    print(f"Test dataset size: {len(test_dataset)}")
+    logger.info(f"Training dataset size: {len(train_dataset)}")
+    logger.info(f"Test dataset size: {len(test_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
-    print(f"Number of training batches: {len(train_loader)}")
-    print(f"Number of test batches: {len(test_loader)}")
+    logger.info(f"Number of training batches: {len(train_loader)}")
+    logger.info(f"Number of test batches: {len(test_loader)}")
     
     # Initialize models
     dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
@@ -116,25 +142,25 @@ def train_model(args):
             
             # Ensure true_num_stages is torch.long
             true_num_stages = true_num_stages.long()
-            print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages type = {true_num_stages.dtype}, values = {true_num_stages.tolist()}")
+            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages type = {true_num_stages.dtype}, values = {true_num_stages.tolist()}")
             
             # Debug: Check for nan/inf in inputs
             if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
-                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
             if torch.isnan(targets).any() or torch.isinf(targets).any():
-                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
                 # Replace nan/inf with 0 to prevent propagation
                 targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Normalize targets safely
             max_abs_targets = torch.abs(targets).max()
             if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
                 normalized_targets = targets
             else:
                 normalized_targets = targets / (max_abs_targets + 1e-8)
             
-            print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
+            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
             
             with torch.amp.autocast('cuda'):
                 transforms_sequence, stage_logits = model(
@@ -145,9 +171,9 @@ def train_model(args):
                 
                 # Debug: Check for nan/inf in model outputs
                 if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
-                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
+                    logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
                 if torch.isnan(stage_logits).any() or torch.isinf(stage_logits).any():
-                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
+                    logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
                 
                 # Compute transform loss using true_num_stages
                 transform_loss = 0
@@ -159,14 +185,14 @@ def train_model(args):
                         tgt = normalized_targets[b, :n_stages, :, :]
                         # Skip if pred or tgt contains nan/inf
                         if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
-                            print(f"Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
+                            logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
                             continue
                         transform_loss += transform_criterion(pred, tgt)
                         valid_samples += 1
                 
                 # Handle case where all samples are skipped
                 if valid_samples == 0:
-                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
+                    logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
                     transform_loss = torch.tensor(0.0, device=device)
                 else:
                     transform_loss = transform_loss / valid_samples
@@ -199,10 +225,10 @@ def train_model(args):
             train_total_loss += loss.item() * accumulation_steps
         
         # Log average losses per epoch
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss (MSE): {train_transform_loss / len(train_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Cross-Entropy): {train_stages_loss / len(train_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized MSE): {train_stages_loss_unnorm / len(train_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {train_total_loss / len(train_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss (MSE): {train_transform_loss / len(train_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Cross-Entropy): {train_stages_loss / len(train_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized MSE): {train_stages_loss_unnorm / len(train_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {train_total_loss / len(train_loader):.4f}")
         
         # Evaluation loop
         model.eval()
@@ -222,15 +248,15 @@ def train_model(args):
                 
                 # Debug: Check for nan/inf in test inputs
                 if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
-                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
+                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
                 if torch.isnan(targets).any() or torch.isinf(targets).any():
-                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
+                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
                     targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 # Normalize targets safely
                 max_abs_targets = torch.abs(targets).max()
                 if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
-                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
+                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
                     normalized_targets = targets
                 else:
                     normalized_targets = targets / (max_abs_targets + 1e-8)
@@ -240,11 +266,11 @@ def train_model(args):
                     
                     # Debug: Check for nan/inf in test outputs
                     if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
-                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
                     if torch.isnan(stage_logits).any() or torch.isinf(stage_logits).any():
-                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
                     
-                    print(f"Test Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
+                    logger.info(f"Test Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
                     
                     # Transform loss using true_num_stages
                     transform_loss = 0
@@ -255,13 +281,13 @@ def train_model(args):
                             pred = transforms_sequence[b, :n_stages, :, :]
                             tgt = normalized_targets[b, :n_stages, :, :]
                             if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
-                                print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
+                                logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
                                 continue
                             transform_loss += transform_criterion(pred, tgt)
                             valid_samples += 1
                     
                     if valid_samples == 0:
-                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
                         transform_loss = torch.tensor(0.0, device=device)
                     else:
                         transform_loss = transform_loss / valid_samples
@@ -276,13 +302,13 @@ def train_model(args):
                             pred = transforms_sequence[b, :n_stages, :, :]
                             tgt = normalized_targets[b, :n_stages, :, :]
                             if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
-                                print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss (pred stages) due to nan/inf")
+                                logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss (pred stages) due to nan/inf")
                                 continue
                             transform_loss_pred_stages += transform_criterion(pred, tgt)
                             valid_samples_pred += 1
                     
                     if valid_samples_pred == 0:
-                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss (pred stages), setting to 0")
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss (pred stages), setting to 0")
                         transform_loss_pred_stages = torch.tensor(0.0, device=device)
                     else:
                         transform_loss_pred_stages = transform_loss_pred_stages / valid_samples_pred
@@ -305,11 +331,11 @@ def train_model(args):
                 test_total_loss += loss.item()
         
         # Log average test losses
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (True Stages) (MSE): {test_transform_loss / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (Pred Stages) (MSE): {test_transform_loss_pred_stages / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Cross-Entropy): {test_stages_loss / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized MSE): {test_stages_loss_unnorm / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {test_total_loss / len(test_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (True Stages) (MSE): {test_transform_loss / len(test_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (Pred Stages) (MSE): {test_transform_loss_pred_stages / len(test_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Cross-Entropy): {test_stages_loss / len(test_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized MSE): {test_stages_loss_unnorm / len(test_loader):.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {test_total_loss / len(test_loader):.4f}")
         
         # Early stopping (optional)
         if args.early_stopping:
@@ -320,7 +346,7 @@ def train_model(args):
             else:
                 patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"Early stopping triggered after {epoch+1} epochs")
+                logger.info(f"Early stopping triggered after {epoch+1} epochs")
                 break
         
         scheduler.step()
@@ -331,6 +357,7 @@ def train_model(args):
     torch.save(model.stage_predictor.state_dict(), os.path.join(args.output_dir, "stage_predictor.pth"))
     torch.save(transformer.state_dict(), os.path.join(args.output_dir, "stage_transformer.pth"))
     torch.save(model.state_dict(), os.path.join(args.output_dir, "ortho_dgcnn.pth"))
+    logger.info("Models saved successfully.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an OrthoDGCNN model for orthodontic transformation prediction.")
@@ -350,9 +377,19 @@ if __name__ == "__main__":
     parser.add_argument('--n_head', type=int, default=16, help="Number of attention heads in transformer")
     parser.add_argument('--num_encoder_layers', type=int, default=6, help="Number of encoder layers in transformer")
     parser.add_argument('--num_decoder_layers', type=int, default=6, help="Number of decoder layers in transformer")
+    parser.add_argument('--log_file', type=str, default="training_log.txt", help="Path to the log file")
 
     args = parser.parse_args()
-    print("Training with the following arguments:")
+    
+    # Ensure the directory for the log file exists
+    log_dir = os.path.dirname(args.log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Set up logging for the main script
+    logger = setup_logging(args.log_file)
+    logger.info("Training with the following arguments:")
     for arg, value in vars(args).items():
-        print(f"{arg}: {value}")
+        logger.info(f"{arg}: {value}")
+    
     train_model(args)

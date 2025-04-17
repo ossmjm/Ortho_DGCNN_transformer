@@ -7,9 +7,30 @@ from torch.utils.data import Dataset
 import pandas as pd
 import trimesh
 from sklearn.model_selection import train_test_split
+import logging
+
+# Set up logging
+def setup_logging(log_file):
+    logger = logging.getLogger('DatasetLogger')
+    logger.setLevel(logging.INFO)
+    
+    # Create handlers
+    file_handler = logging.FileHandler(log_file)
+    console_handler = logging.StreamHandler()
+    
+    # Create formatters and add them to handlers
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+    
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
 
 class JawTeethDataset(Dataset):
-    def __init__(self, data_dir, max_stages=20, num_patches=128, patch_size=32, channels=13, split='train', train_ratio=0.8, inference=False):
+    def __init__(self, data_dir, max_stages=25, num_patches=128, patch_size=32, channels=13, split='train', train_ratio=0.8, inference=False, log_file='training_log.txt'):
         self.data_dir = data_dir
         self.max_stages = max_stages
         self.num_patches = num_patches
@@ -18,14 +39,17 @@ class JawTeethDataset(Dataset):
         self.num_teeth = 14
         self.inference = inference
         
+        # Initialize logger
+        self.logger = setup_logging(log_file)
+        
         # Load num_stages.xlsx and normalize Jaw_ID
         self.num_stages_df = pd.read_excel(os.path.join(data_dir, "num_stages.xlsx"))
         self.num_stages_df["Jaw_ID"] = self.num_stages_df["Jaw_ID"].astype(str).str.lstrip('0')
         self.num_stages_dict = dict(zip(self.num_stages_df["Jaw_ID"], self.num_stages_df["Num_Stages"]))
-        print(f"num_stages_dict: {self.num_stages_dict}")
+        self.logger.info(f"num_stages_dict: {self.num_stages_dict}")
         
         self.cases = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d.isdigit()]
-        print(f"cases: {self.cases}")
+        self.logger.info(f"cases: {self.cases}")
         train_cases, test_cases = train_test_split(self.cases, train_size=train_ratio, random_state=42)
         self.cases = train_cases if split == 'train' else test_cases
         
@@ -41,6 +65,15 @@ class JawTeethDataset(Dataset):
             self.stl_files.append(stl_file)
             self.json_files.append(json_file)
             transformations = self._load_transformations(transform_file, case)
+            # Debug: Check for nan/inf in transformations
+            if torch.isnan(transformations).any() or torch.isinf(transformations).any():
+                self.logger.warning(f"transformations for Jaw_ID {case} contains nan/inf")
+            # Debug: Check for unexpected zeros (possible missing data)
+            zero_mask = (transformations == 0).all(dim=-1)  # Check if all 6 transformation values are 0
+            zero_count = zero_mask.sum().item()
+            total_entries = zero_mask.numel()
+            zero_percentage = (zero_count / total_entries) * 100
+            self.logger.info(f"transformations for Jaw_ID {case}: {zero_count}/{total_entries} entries are all zeros ({zero_percentage:.2f}%)")
             self.transformations.append(transformations)
             num_stages = self._compute_num_stages(transformations)
             self.num_stages_list.append(num_stages)
@@ -61,8 +94,27 @@ class JawTeethDataset(Dataset):
         
         jaw_data = transform_df[transform_df["Jaw_ID"] == jaw_id]
         if jaw_data.empty:
-            print(f"Warning: No data found for Jaw_ID {jaw_id} in {transform_file}")
+            self.logger.warning(f"No data found for Jaw_ID {jaw_id} in {transform_file}")
             return transformations
+        
+        # Debug: Check for missing values in raw Excel data
+        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+                            "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+        for col in transform_columns:
+            # Check for NaN
+            nan_count = jaw_data[col].isna().sum()
+            if nan_count > 0:
+                self.logger.info(f"Jaw_ID {jaw_id}, Column {col} has {nan_count} NaN values")
+            # Check for inf
+            inf_count = jaw_data[col].isin([float('inf'), -float('inf')]).sum()
+            if inf_count > 0:
+                self.logger.info(f"Jaw_ID {jaw_id}, Column {col} has {inf_count} inf values")
+        
+        # Replace nan/inf with 0
+        for col in transform_columns:
+            if jaw_data[col].isna().any() or jaw_data[col].isin([float('inf'), -float('inf')]).any():
+                self.logger.warning(f"Column {col} for Jaw_ID {jaw_id} contains nan/inf. Replacing with 0.")
+                jaw_data[col] = jaw_data[col].fillna(0).replace([float('inf'), -float('inf')], 0)
         
         # Impute NaN Stage values by looking at the previous row
         jaw_data = jaw_data.copy()  # Avoid SettingWithCopyWarning
@@ -74,7 +126,7 @@ class JawTeethDataset(Dataset):
                 # Handle the first row
                 if pd.isna(jaw_data.at[idx, "Stage"]):
                     imputed_stage = 1  # Default to Stage 1 for the first row
-                    print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {jaw_data.at[idx, 'Tooth_ID']}: First row, defaulting to Stage {imputed_stage}")
+                    self.logger.info(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {jaw_data.at[idx, 'Tooth_ID']}: First row, defaulting to Stage {imputed_stage}")
                     jaw_data.at[idx, "Stage"] = imputed_stage
             else:
                 # Handle subsequent rows
@@ -84,11 +136,11 @@ class JawTeethDataset(Dataset):
                     if tooth_id != "31":
                         # If Tooth_ID is not 31, use the previous row's Stage
                         imputed_stage = prev_stage
-                        print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Using previous Stage {imputed_stage}")
+                        self.logger.info(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Using previous Stage {imputed_stage}")
                     else:
                         # If Tooth_ID is 31, use the previous row's Stage + 1
                         imputed_stage = prev_stage + 1
-                        print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Tooth_ID is 31, using previous Stage {prev_stage} + 1 = {imputed_stage}")
+                        self.logger.info(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Tooth_ID is 31, using previous Stage {prev_stage} + 1 = {imputed_stage}")
                     jaw_data.at[idx, "Stage"] = imputed_stage
         
         # Convert Stage to nullable integer type Int64
@@ -98,9 +150,19 @@ class JawTeethDataset(Dataset):
         if jaw_data["Stage"].isna().any():
             raise ValueError(f"After imputation, Stage column for Jaw_ID {jaw_id} in {transform_file} still contains NaN values")
         
+        # Validate Stage values are within bounds (1 to max_stages)
+        invalid_stages = jaw_data[jaw_data["Stage"] > self.max_stages]["Stage"].unique()
+        if invalid_stages.size > 0:
+            self.logger.warning(f"Skipping transformations for Jaw_ID {jaw_id} with Stage values {invalid_stages} exceeding max_stages ({self.max_stages})")
+        
         for stage in jaw_data["Stage"].unique():
-            print(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
+            self.logger.info(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
             stage = int(stage)  # Ensure stage is an integer (should already be int due to Int64)
+            
+            # Skip stages that exceed max_stages
+            if stage > self.max_stages:
+                continue
+                
             stage_data = jaw_data[jaw_data["Stage"] == stage]
             if stage_data.empty:
                 continue
@@ -112,11 +174,11 @@ class JawTeethDataset(Dataset):
                     tooth_id = tooth_id_clean.split('.')[0]
                     tooth_id = ''.join(filter(str.isdigit, tooth_id))
                     if tooth_id not in FDI_TO_INDEX:
-                        print(f"Skipping Tooth_ID {tooth_id} as it is not in FDI_TO_INDEX.")
+                        self.logger.info(f"Skipping Tooth_ID {tooth_id} as it is not in FDI_TO_INDEX.")
                         continue
                     tooth_idx = FDI_TO_INDEX[tooth_id]
                 except Exception as e:
-                    print(f"Error processing Tooth_ID {tooth_id_raw}: {e}")
+                    self.logger.error(f"Error processing Tooth_ID {tooth_id_raw}: {e}")
                     raise
                 
                 # Helper function to clean and convert transformation values
@@ -126,11 +188,11 @@ class JawTeethDataset(Dataset):
                         value_str = str(value).replace('o', '0').replace('O', '0')
                         return float(value_str)
                     except (ValueError, TypeError) as e:
-                        print(f"Error converting value '{value}' to float: {e}. Setting to 0.")
+                        self.logger.warning(f"Error converting value '{value}' to float: {e}. Setting to 0.")
                         return 0.0
                 
                 # Apply cleaning and conversion to each transformation value
-                transformations[stage - 1, tooth_idx] = torch.tensor([
+                transform_values = torch.tensor([
                     clean_and_convert(row["Left/Right (mm"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
@@ -138,6 +200,14 @@ class JawTeethDataset(Dataset):
                     clean_and_convert(row["Mesial/Distal (degrees)"]), 
                     clean_and_convert(row["Rotation (degrees)"])
                 ], dtype=torch.float32)
+                
+                # Debug: Check transform_values before assignment
+                if torch.isnan(transform_values).any() or torch.isinf(transform_values).any():
+                    self.logger.info(f"Jaw_ID {jaw_id}, Stage {stage}, Tooth_ID {tooth_id}: transform_values contains nan/inf: {transform_values.tolist()}")
+                # if (transform_values == 0).all():
+                #     self.logger.info(f"Jaw_ID {jaw_id}, Stage {stage}, Tooth_ID {tooth_id}: All transform values are zero: {transform_values.tolist()}")
+                
+                transformations[stage - 1, tooth_idx] = transform_values
         return transformations
 
     def __len__(self):
@@ -160,7 +230,7 @@ class JawTeethDataset(Dataset):
         for fdi in FDI_TO_INDEX.keys():
             tooth_idx = FDI_TO_INDEX[fdi]
             if fdi not in teeth_data:
-                print(f"Warning: Tooth {fdi} missing in JSON file {json_file}")
+                self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
                 total_points = self.num_patches * self.patch_size
                 vertices = np.zeros((total_points, 3))
                 faces = np.array([[0, 0, 0]])
@@ -176,7 +246,7 @@ class JawTeethDataset(Dataset):
         num_stages = self.num_stages_list[idx]
         jaw_id_normalized = str(jaw_id).lstrip('0')
         dict_num_stages = self.num_stages_dict.get(jaw_id_normalized, None)
-        print(f"actual num_stages :{dict_num_stages}")
+        self.logger.info(f"actual num_stages: {dict_num_stages}")
         if dict_num_stages is not None:
             num_stages = min(dict_num_stages, self.max_stages)
         
