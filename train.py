@@ -142,7 +142,7 @@ def train_model(args):
             
             # Ensure true_num_stages is torch.long
             true_num_stages = true_num_stages.long()
-            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages type = {true_num_stages.dtype}, values = {true_num_stages.tolist()}")
+            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: values = {true_num_stages.tolist()}")
             
             # Debug: Check for nan/inf in inputs
             if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
@@ -160,7 +160,6 @@ def train_model(args):
             else:
                 normalized_targets = targets / (max_abs_targets + 1e-8)
             
-            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
             
             with torch.amp.autocast('cuda'):
                 transforms_sequence, stage_logits = model(
@@ -263,7 +262,7 @@ def train_model(args):
                 
                 with torch.amp.autocast('cuda'):
                     transforms_sequence, stage_logits = model(cordinates)
-                    
+
                     # Debug: Check for nan/inf in test outputs
                     if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
                         logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")

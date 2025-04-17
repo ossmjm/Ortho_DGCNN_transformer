@@ -156,7 +156,7 @@ class JawTeethDataset(Dataset):
             self.logger.warning(f"Skipping transformations for Jaw_ID {jaw_id} with Stage values {invalid_stages} exceeding max_stages ({self.max_stages})")
         
         for stage in jaw_data["Stage"].unique():
-            self.logger.info(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
+            # self.logger.info(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
             stage = int(stage)  # Ensure stage is an integer (should already be int due to Int64)
             
             # Skip stages that exceed max_stages
@@ -246,7 +246,6 @@ class JawTeethDataset(Dataset):
         num_stages = self.num_stages_list[idx]
         jaw_id_normalized = str(jaw_id).lstrip('0')
         dict_num_stages = self.num_stages_dict.get(jaw_id_normalized, None)
-        self.logger.info(f"actual num_stages: {dict_num_stages}")
         if dict_num_stages is not None:
             num_stages = min(dict_num_stages, self.max_stages)
         
