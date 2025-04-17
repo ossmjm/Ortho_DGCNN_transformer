@@ -53,7 +53,8 @@ class JawTeethDataset(Dataset):
         return self.max_stages
 
     def _load_transformations(self, transform_file, jaw_id):
-        transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str, "Stage": int})
+        # Load the Excel file without forcing Stage to int, allowing NaN values
+        transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
                         "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
@@ -63,9 +64,43 @@ class JawTeethDataset(Dataset):
             print(f"Warning: No data found for Jaw_ID {jaw_id} in {transform_file}")
             return transformations
         
+        # Impute NaN Stage values by looking at the previous row
+        jaw_data = jaw_data.copy()  # Avoid SettingWithCopyWarning
+        jaw_data["Stage"] = jaw_data["Stage"].astype("float64")  # Ensure Stage is float to handle NaN
+        
+        # Process rows sequentially to impute NaN Stage values
+        for idx in jaw_data.index:
+            if idx == jaw_data.index[0]:
+                # Handle the first row
+                if pd.isna(jaw_data.at[idx, "Stage"]):
+                    imputed_stage = 1  # Default to Stage 1 for the first row
+                    print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {jaw_data.at[idx, 'Tooth_ID']}: First row, defaulting to Stage {imputed_stage}")
+                    jaw_data.at[idx, "Stage"] = imputed_stage
+            else:
+                # Handle subsequent rows
+                if pd.isna(jaw_data.at[idx, "Stage"]):
+                    prev_stage = jaw_data.at[idx - 1, "Stage"]  # Stage of the previous row
+                    tooth_id = jaw_data.at[idx, "Tooth_ID"]
+                    if tooth_id != "31":
+                        # If Tooth_ID is not 31, use the previous row's Stage
+                        imputed_stage = prev_stage
+                        print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Using previous Stage {imputed_stage}")
+                    else:
+                        # If Tooth_ID is 31, use the previous row's Stage + 1
+                        imputed_stage = prev_stage + 1
+                        print(f"Imputing NaN Stage at index {idx} for Jaw_ID {jaw_id}, Tooth_ID {tooth_id}: Tooth_ID is 31, using previous Stage {prev_stage} + 1 = {imputed_stage}")
+                    jaw_data.at[idx, "Stage"] = imputed_stage
+        
+        # Convert Stage to nullable integer type Int64
+        jaw_data["Stage"] = jaw_data["Stage"].astype("Int64")
+        
+        # Validate that all Stage values are now integers
+        if jaw_data["Stage"].isna().any():
+            raise ValueError(f"After imputation, Stage column for Jaw_ID {jaw_id} in {transform_file} still contains NaN values")
+        
         for stage in jaw_data["Stage"].unique():
             print(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
-            stage = int(stage)  # Ensure stage is an integer
+            stage = int(stage)  # Ensure stage is an integer (should already be int due to Int64)
             stage_data = jaw_data[jaw_data["Stage"] == stage]
             if stage_data.empty:
                 continue
