@@ -30,7 +30,7 @@ class StageTransformer(nn.Module):
 
     def forward(self, dgcnn_out, num_stages, teacher_forcing=None):
         batch_size = dgcnn_out.size(0)
-        print(f"StageTransformer: num_stages shape = {num_stages.shape}, values = {num_stages.tolist()}")
+        # print(f"StageTransformer: num_stages shape = {num_stages.shape}, values = {num_stages.tolist()}")
         
         transformer_out_list = []
         for b in range(batch_size):

@@ -296,7 +296,7 @@ def train_model(args):
                     num_stages_pred = torch.argmax(stage_logits, dim=1) + 1
                     valid_samples_pred = 0
                     for b in range(cordinates.size(0)):
-                        n_stages = min(num_stages_pred[b].item(), true_num_stages[b].item())
+                        n_stages = true_num_stages[b].item()
                         if n_stages > 0:
                             pred = transforms_sequence[b, :n_stages, :, :]
                             tgt = normalized_targets[b, :n_stages, :, :]
