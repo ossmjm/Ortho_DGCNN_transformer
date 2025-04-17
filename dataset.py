@@ -53,7 +53,7 @@ class JawTeethDataset(Dataset):
         return self.max_stages
 
     def _load_transformations(self, transform_file, jaw_id):
-        transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+        transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str, "Stage": int})
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
                         "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
@@ -64,6 +64,8 @@ class JawTeethDataset(Dataset):
             return transformations
         
         for stage in jaw_data["Stage"].unique():
+            print(f"Loading transformations for Jaw_ID {jaw_id}, Stage {stage} (type: {type(stage)})")
+            stage = int(stage)  # Ensure stage is an integer
             stage_data = jaw_data[jaw_data["Stage"] == stage]
             if stage_data.empty:
                 continue
