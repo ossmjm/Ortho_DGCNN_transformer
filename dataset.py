@@ -82,13 +82,24 @@ class JawTeethDataset(Dataset):
                     print(f"Error processing Tooth_ID {tooth_id_raw}: {e}")
                     raise
                 
+                # Helper function to clean and convert transformation values
+                def clean_and_convert(value):
+                    try:
+                        # Convert to string, replace 'o' or 'O' with '0'
+                        value_str = str(value).replace('o', '0').replace('O', '0')
+                        return float(value_str)
+                    except (ValueError, TypeError) as e:
+                        print(f"Error converting value '{value}' to float: {e}. Setting to 0.")
+                        return 0.0
+                
+                # Apply cleaning and conversion to each transformation value
                 transformations[stage - 1, tooth_idx] = torch.tensor([
-                    float(row["Left/Right (mm"]), 
-                    float(row["Forward/Backward (mm)"]), 
-                    float(row["Extrude/Intrude (mm)"]),
-                    float(row["Buccal/Lingual (degrees)"]), 
-                    float(row["Mesial/Distal (degrees)"]), 
-                    float(row["Rotation (degrees)"])
+                    clean_and_convert(row["Left/Right (mm)"]), 
+                    clean_and_convert(row["Forward/Backward (mm)"]), 
+                    clean_and_convert(row["Extrude/Intrude (mm)"]),
+                    clean_and_convert(row["Buccal/Lingual (degrees)"]), 
+                    clean_and_convert(row["Mesial/Distal (degrees)"]), 
+                    clean_and_convert(row["Rotation (degrees)"])
                 ], dtype=torch.float32)
         return transformations
 
@@ -142,7 +153,7 @@ class JawTeethDataset(Dataset):
             return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
                     self.transformations[idx],
                     torch.tensor(num_stages, dtype=torch.int))
-
+    
     def preprocess_tooth_points(self, vertices, faces):
         vertices = np.array(vertices)
         faces = np.array(faces)
