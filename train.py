@@ -67,6 +67,19 @@ def train_model(args):
     ).to(device)
     model = OrthoDGCNNModel(dgcnn, transformer, max_stages=args.max_stages, num_teeth=14, embed_dim=args.embed_dim).to(device)
     
+    # Initialize weights to prevent numerical instability
+    def initialize_weights(module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.uniform_(module.weight, -0.1, 0.1)
+
+    dgcnn.apply(initialize_weights)
+    transformer.apply(initialize_weights)
+    model.apply(initialize_weights)
+    
     # Optimizer and loss functions
     optimizer = torch.optim.Adam(
         list(dgcnn.parameters()) + list(transformer.parameters()) + 
@@ -105,30 +118,60 @@ def train_model(args):
             true_num_stages = true_num_stages.long()
             print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages type = {true_num_stages.dtype}, values = {true_num_stages.tolist()}")
             
-            # Normalize targets
-            targets = targets / (torch.abs(targets).max() + 1e-8)
+            # Debug: Check for nan/inf in inputs
+            if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
+                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
+            if torch.isnan(targets).any() or torch.isinf(targets).any():
+                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
+                # Replace nan/inf with 0 to prevent propagation
+                targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Normalize targets safely
+            max_abs_targets = torch.abs(targets).max()
+            if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
+                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
+                normalized_targets = targets
+            else:
+                normalized_targets = targets / (max_abs_targets + 1e-8)
             
             print(f"Epoch {epoch+1}, Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
             
             with torch.amp.autocast('cuda'):
                 transforms_sequence, stage_logits = model(
-                    cordinates, teacher_forcing=targets, 
+                    cordinates, teacher_forcing=normalized_targets, 
                     true_num_stages=true_num_stages,
                     epoch=epoch, total_epochs=args.epochs
                 )
                 
+                # Debug: Check for nan/inf in model outputs
+                if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
+                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
+                if torch.isnan(stage_logits).any() or torch.isinf(stage_logits).any():
+                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
+                
                 # Compute transform loss using true_num_stages
                 transform_loss = 0
+                valid_samples = 0
                 for b in range(cordinates.size(0)):
                     n_stages = true_num_stages[b].item()
                     if n_stages > 0:
                         pred = transforms_sequence[b, :n_stages, :, :]
-                        tgt = targets[b, :n_stages, :, :]
+                        tgt = normalized_targets[b, :n_stages, :, :]
+                        # Skip if pred or tgt contains nan/inf
+                        if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
+                            print(f"Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
+                            continue
                         transform_loss += transform_criterion(pred, tgt)
-                transform_loss = transform_loss / cordinates.size(0)
+                        valid_samples += 1
+                
+                # Handle case where all samples are skipped
+                if valid_samples == 0:
+                    print(f"Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
+                    transform_loss = torch.tensor(0.0, device=device)
+                else:
+                    transform_loss = transform_loss / valid_samples
                 
                 # Compute stages loss (cross-entropy)
-                # Convert true_num_stages to class indices (0 to max_stages-1)
                 stage_targets = true_num_stages - 1  # Shape: (batch_size,), values in [0, max_stages-1]
                 stage_targets = stage_targets.long()  # Ensure type is torch.long
                 stages_loss = stages_criterion(stage_logits, stage_targets)
@@ -142,7 +185,8 @@ def train_model(args):
                 loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            # Adjust gradient clipping to be more aggressive
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # Reduced from 0.5 to 0.1
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
@@ -155,7 +199,7 @@ def train_model(args):
             train_total_loss += loss.item() * accumulation_steps
         
         # Log average losses per epoch
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss: {train_transform_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Transform Loss (MSE): {train_transform_loss / len(train_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Cross-Entropy): {train_stages_loss / len(train_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Train Stages Loss (Unnormalized MSE): {train_stages_loss_unnorm / len(train_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {train_total_loss / len(train_loader):.4f}")
@@ -175,33 +219,73 @@ def train_model(args):
                     x.to(device) for x in [cordinates, targets, true_num_stages]
                 ]
                 true_num_stages = true_num_stages.long()  # Ensure type is torch.long
-                targets = targets / (torch.abs(targets).max() + 1e-8)
+                
+                # Debug: Check for nan/inf in test inputs
+                if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
+                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
+                if torch.isnan(targets).any() or torch.isinf(targets).any():
+                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
+                    targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Normalize targets safely
+                max_abs_targets = torch.abs(targets).max()
+                if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
+                    print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
+                    normalized_targets = targets
+                else:
+                    normalized_targets = targets / (max_abs_targets + 1e-8)
                 
                 with torch.amp.autocast('cuda'):
                     transforms_sequence, stage_logits = model(cordinates)
+                    
+                    # Debug: Check for nan/inf in test outputs
+                    if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
+                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
+                    if torch.isnan(stage_logits).any() or torch.isinf(stage_logits).any():
+                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: stage_logits contains nan/inf")
                     
                     print(f"Test Batch {batch_idx+1}: true_num_stages = {true_num_stages.tolist()}")
                     
                     # Transform loss using true_num_stages
                     transform_loss = 0
+                    valid_samples = 0
                     for b in range(cordinates.size(0)):
                         n_stages = true_num_stages[b].item()
                         if n_stages > 0:
                             pred = transforms_sequence[b, :n_stages, :, :]
-                            tgt = targets[b, :n_stages, :, :]
+                            tgt = normalized_targets[b, :n_stages, :, :]
+                            if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
+                                print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss due to nan/inf")
+                                continue
                             transform_loss += transform_criterion(pred, tgt)
-                    transform_loss = transform_loss / cordinates.size(0)
+                            valid_samples += 1
+                    
+                    if valid_samples == 0:
+                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss, setting to 0")
+                        transform_loss = torch.tensor(0.0, device=device)
+                    else:
+                        transform_loss = transform_loss / valid_samples
                     
                     # Transform loss using predicted num_stages (for comparison)
                     transform_loss_pred_stages = 0
                     num_stages_pred = torch.argmax(stage_logits, dim=1) + 1
+                    valid_samples_pred = 0
                     for b in range(cordinates.size(0)):
                         n_stages = min(num_stages_pred[b].item(), true_num_stages[b].item())
                         if n_stages > 0:
                             pred = transforms_sequence[b, :n_stages, :, :]
-                            tgt = targets[b, :n_stages, :, :]
+                            tgt = normalized_targets[b, :n_stages, :, :]
+                            if torch.isnan(pred).any() or torch.isinf(pred).any() or torch.isnan(tgt).any() or torch.isinf(tgt).any():
+                                print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}, Sample {b}: Skipping transform loss (pred stages) due to nan/inf")
+                                continue
                             transform_loss_pred_stages += transform_criterion(pred, tgt)
-                    transform_loss_pred_stages = transform_loss_pred_stages / cordinates.size(0)
+                            valid_samples_pred += 1
+                    
+                    if valid_samples_pred == 0:
+                        print(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: No valid samples for transform loss (pred stages), setting to 0")
+                        transform_loss_pred_stages = torch.tensor(0.0, device=device)
+                    else:
+                        transform_loss_pred_stages = transform_loss_pred_stages / valid_samples_pred
                     
                     # Stages loss (cross-entropy)
                     stage_targets = true_num_stages - 1
@@ -221,8 +305,8 @@ def train_model(args):
                 test_total_loss += loss.item()
         
         # Log average test losses
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (True Stages): {test_transform_loss / len(test_loader):.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (Pred Stages): {test_transform_loss_pred_stages / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (True Stages) (MSE): {test_transform_loss / len(test_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Transform Loss (Pred Stages) (MSE): {test_transform_loss_pred_stages / len(test_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Cross-Entropy): {test_stages_loss / len(test_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Test Stages Loss (Unnormalized MSE): {test_stages_loss_unnorm / len(test_loader):.4f}")
         print(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {test_total_loss / len(test_loader):.4f}")
