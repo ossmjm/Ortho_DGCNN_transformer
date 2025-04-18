@@ -72,7 +72,7 @@ class JawTeethDataset(Dataset):
         
         # Check for NaN/inf in transformation columns
         transform_columns = [
-            "Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+            "Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
         ]
         for col in transform_columns:
@@ -153,7 +153,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm"]),
+                    clean_and_convert(row["Left/Right (mm)"]),
                     clean_and_convert(row["Forward/Backward (mm)"]),
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]),
@@ -193,9 +193,9 @@ class JawTeethDataset(Dataset):
         teeth_data = data.get("teeth", {})
         for fdi in FDI_TO_INDEX.keys():
             tooth_idx = FDI_TO_INDEX[fdi]
+            total_points = self.num_patches * self.patch_size  # 128 * 32 = 4096
             if fdi not in teeth_data:
                 self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
-                total_points = self.num_patches * self.patch_size
                 vertices = np.zeros((total_points, 3))
                 faces = np.array([[0, 0, 0]])
                 feats = np.zeros((self.num_patches, self.channels, self.patch_size))
@@ -205,13 +205,11 @@ class JawTeethDataset(Dataset):
                 faces = np.array(tooth_data.get("f", []))
                 if len(vertices) == 0 or len(faces) == 0:
                     self.logger.warning(f"Tooth {fdi} in {json_file} has empty vertices or faces")
-                    total_points = self.num_patches * self.patch_size
                     vertices = np.zeros((total_points, 3))
                     faces = np.array([[0, 0, 0]])
                     feats = np.zeros((self.num_patches, self.channels, self.patch_size))
                 else:
-                    # Minimal preprocessing: sample or pad vertices
-                    total_points = self.num_patches * self.patch_size  # 128 * 32 = 4096
+                    # Standardize vertices to exactly total_points
                     if len(vertices) > total_points:
                         indices = np.random.choice(len(vertices), total_points, replace=False)
                         vertices = vertices[indices]
@@ -221,6 +219,8 @@ class JawTeethDataset(Dataset):
                     elif len(vertices) < total_points:
                         pad_size = total_points - len(vertices)
                         vertices = np.pad(vertices, ((0, pad_size), (0, 0)), mode='edge')
+                    else:
+                        vertices = vertices  # Already correct size
                     
                     # Create feature tensor with only xyz coordinates
                     feats = np.zeros((self.num_patches, self.channels, self.patch_size))
@@ -246,7 +246,6 @@ class JawTeethDataset(Dataset):
         if not self.inference:
             transform_file = os.path.join(case_dir, "Transformations.xlsx")
             transformations = self._load_transformations(transform_file, case)
-            # Log zero transformations
             zero_entries = (transformations == 0).all(dim=-1).sum().item()
             total_entries = transformations.shape[0] * transformations.shape[1]
             self.logger.info(f"Transformations for Jaw_ID {case}: {zero_entries}/{total_entries} entries are all zeros ({100 * zero_entries / total_entries:.2f}%)")
