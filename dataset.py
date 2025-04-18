@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 import logging
-import trimesh
+import json
+import open3d as o3d
+from scipy.spatial import cKDTree
 
 def setup_logging(log_file):
     logger = logging.getLogger('DatasetLogger')
@@ -26,6 +28,10 @@ class JawTeethDataset(Dataset):
         self.train_ratio = train_ratio
         self.inference = inference
         self.num_teeth = 14
+        self.num_patches = 128
+        self.patch_size = 32
+        self.channels = 13  # 3 (xyz) + 3 (normals) + 3 (centroid dist) + 4 (placeholder)
+        self.voxel_size = 0.1  # For downsampling
         
         # Initialize logger
         self.logger = setup_logging(log_file)
@@ -165,36 +171,131 @@ class JawTeethDataset(Dataset):
         
         return transformations
     
+    def _downsample_point_cloud(self, points, voxel_size):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd = pcd.voxel_down_sample(voxel_size)
+        return np.asarray(pcd.points)
+    
+    def _estimate_normals(self, points, k=10):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
+        return np.asarray(pcd.normals)
+    
+    def _preprocess_tooth_points(self, vertices, faces):
+        # Downsample point cloud
+        vertices = self._downsample_point_cloud(vertices, self.voxel_size)
+        if len(vertices) < 10:  # Minimum points for processing
+            self.logger.warning("Too few points after downsampling, using dummy data")
+            total_points = self.num_patches * self.patch_size
+            return (np.zeros((self.num_patches, self.channels, self.patch_size)),
+                    np.zeros((total_points, 3)),
+                    np.array([[0, 0, 0]]))
+        
+        # Estimate normals
+        normals = self._estimate_normals(vertices, k=10)
+        
+        # Sample or pad to fixed number of points
+        total_points = self.num_patches * self.patch_size  # 128 * 32 = 4096
+        if len(vertices) > total_points:
+            indices = np.random.choice(len(vertices), total_points, replace=False)
+            vertices = vertices[indices]
+            normals = normals[indices]
+            vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
+            faces = np.array([[vertex_mapping.get(idx, 0) for idx in face]
+                            for face in faces if all(idx in vertex_mapping for idx in face)])
+        elif len(vertices) < total_points:
+            pad_size = total_points - len(vertices)
+            vertices = np.pad(vertices, ((0, pad_size), (0, 0)), mode='edge')
+            normals = np.pad(normals, ((0, pad_size), (0, 0)), mode='edge')
+        
+        # Compute centroid and distances
+        centroid = vertices.mean(axis=0)
+        tree = cKDTree(vertices)
+        dists, _ = tree.query(centroid, k=len(vertices))
+        dist_features = np.column_stack([
+            dists / (dists.max() + 1e-8),  # Normalized distance to centroid
+            dists**2 / (dists.max()**2 + 1e-8),  # Squared normalized distance
+            np.log1p(dists) / np.log1p(dists.max() + 1e-8)  # Log-normalized distance
+        ])
+        
+        # Create feature tensor
+        feats = np.zeros((self.num_patches, self.channels, self.patch_size))
+        for i in range(self.num_patches):
+            start = i * self.patch_size
+            end = (i + 1) * self.patch_size
+            patch_points = vertices[start:end]
+            patch_normals = normals[start:end]
+            patch_dists = dist_features[start:end]
+            if len(patch_points) < self.patch_size:
+                pad_size = self.patch_size - len(patch_points)
+                patch_points = np.pad(patch_points, ((0, pad_size), (0, 0)), mode='edge')
+                patch_normals = np.pad(patch_normals, ((0, pad_size), (0, 0)), mode='edge')
+                patch_dists = np.pad(patch_dists, ((0, pad_size), (0, 0)), mode='edge')
+            feats[i, :3, :] = patch_points.T  # x, y, z
+            feats[i, 3:6, :] = patch_normals.T  # nx, ny, nz
+            feats[i, 6:9, :] = patch_dists.T  # distance features
+            # Channels 9-12 remain zero for future use
+        
+        return feats, vertices, faces
+    
     def __getitem__(self, idx):
         case = self.cases[idx]
         case_dir = os.path.join(self.data_dir, case)
+        json_file = os.path.join(case_dir, "before_treatment.json")
+        
+        # Load JSON file
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.logger.error(f"Error loading JSON file {json_file}: {e}")
+            raise
+        
+        FDI_TO_INDEX = {
+            "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
+            "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
+        }
+        
         vertices_list = []
         faces_list = []
-        num_faces_list = []
+        feats_list = []
         
-        for tooth_idx in range(self.num_teeth):
-            tooth_file = os.path.join(case_dir, f"{tooth_idx}.obj")
-            try:
-                mesh = trimesh.load(tooth_file)
-                vertices = np.array(mesh.vertices)
-                faces = np.array(mesh.faces)
-            except Exception as e:
-                self.logger.warning(f"Error loading {tooth_file}: {e}. Using dummy mesh.")
-                vertices = np.zeros((100, 3))
-                faces = np.array([[0, 1, 2]])
+        teeth_data = data.get("teeth", {})
+        for fdi in FDI_TO_INDEX.keys():
+            tooth_idx = FDI_TO_INDEX[fdi]
+            if fdi not in teeth_data:
+                self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
+                total_points = self.num_patches * self.patch_size
+                feats = np.zeros((self.num_patches, self.channels, self.patch_size))
+                vertices = np.zeros((total_points, 3))
+                faces = np.array([[0, 0, 0]])
+            else:
+                tooth_data = teeth_data[fdi]
+                vertices = np.array(tooth_data.get("v", []))
+                faces = np.array(tooth_data.get("f", []))
+                if len(vertices) == 0 or len(faces) == 0:
+                    self.logger.warning(f"Tooth {fdi} in {json_file} has empty vertices or faces")
+                    total_points = self.num_patches * self.patch_size
+                    feats = np.zeros((self.num_patches, self.channels, self.patch_size))
+                    vertices = np.zeros((total_points, 3))
+                    faces = np.array([[0, 0, 0]])
+                else:
+                    feats, vertices, faces = self._preprocess_tooth_points(vertices, faces)
+            
+            feats_list.append(feats)
             vertices_list.append(vertices)
             faces_list.append(faces)
-            num_faces_list.append(len(faces))
         
-        # Placeholder cordinates (replace with actual preprocessing if available)
-        cordinates = np.random.randn(self.num_teeth, 128, 13, 32)
+        # Stack feats into cordinates
+        cordinates = np.stack(feats_list)
         cordinates = torch.tensor(cordinates, dtype=torch.float32)
         
         true_num_stages = self.num_stages_dict[case]
         if not self.inference:
             transform_file = os.path.join(case_dir, "Transformations.xlsx")
             transformations = self._load_transformations(transform_file, case)
-            # Log zero transformations
             zero_entries = (transformations == 0).all(dim=-1).sum().item()
             total_entries = transformations.shape[0] * transformations.shape[1]
             self.logger.info(f"Transformations for Jaw_ID {case}: {zero_entries}/{total_entries} entries are all zeros ({100 * zero_entries / total_entries:.2f}%)")
@@ -202,6 +303,5 @@ class JawTeethDataset(Dataset):
             transformations = torch.zeros(self.max_stages, self.num_teeth, 6, dtype=torch.float32)
         
         faces_list = [torch.tensor(faces, dtype=torch.long) for faces in faces_list]
-        num_faces_list = torch.tensor(num_faces_list, dtype=torch.long)
         
         return cordinates, transformations, vertices_list, faces_list, true_num_stages
