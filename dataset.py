@@ -223,17 +223,12 @@ class JawTeethDataset(Dataset):
         num_stages = self.num_stages_dict.get(jaw_id_normalized, 1)
         num_stages = min(num_stages, self.max_stages)
         
-        if self.inference:
-            return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
-                    self.transformations[idx],
-                    vertices_list,
-                    faces_list,
-                    torch.tensor(num_stages, dtype=torch.int))
-        else:
-            return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
-                    self.transformations[idx],
-                    torch.tensor(num_stages, dtype=torch.int))
-    
+        return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
+                self.transformations[idx],
+                vertices_list,
+                faces_list,
+                torch.tensor(num_stages, dtype=torch.int))
+
     def preprocess_tooth_points(self, vertices, faces):
         vertices = np.array(vertices)
         faces = np.array(faces)
