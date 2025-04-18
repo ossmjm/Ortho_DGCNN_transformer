@@ -84,7 +84,7 @@ class JawTeethDataset(Dataset):
             return transformations
         
         # Debug: Check for missing values in raw Excel data
-        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         for col in transform_columns:
             # Check for NaN
