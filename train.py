@@ -76,12 +76,12 @@ def train_model(args):
     model = OrthoDGCNNModel(dgcnn, transformer, max_stages=args.max_stages, num_teeth=14, embed_dim=args.embed_dim).to(device)
     
     def initialize_weights(module):
-        if isinstance(m, (nn.Linear, nn.Conv1d)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.uniform_(m.weight, -0.1, 0.1)
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.uniform_(module.weight, -0.1, 0.1)
     
     dgcnn.apply(initialize_weights)
     transformer.apply(initialize_weights)
