@@ -108,7 +108,7 @@ def train_model(args):
         train_loss = 0
         optimizer.zero_grad(set_to_none=True)
         
-        for batch_idx, (cordinates, targets, _, _, true_num_stages) in enumerate(train_loader):
+        for batch_idx, (cordinates, targets, true_num_stages) in enumerate(train_loader):
             cordinates, targets, true_num_stages = cordinates.to(device), targets.to(device), true_num_stages.to(device)
             
             if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
@@ -162,7 +162,7 @@ def train_model(args):
         model.eval()
         test_loss = 0
         with torch.no_grad():
-            for batch_idx, (cordinates, targets, _, _, true_num_stages) in enumerate(test_loader):
+            for batch_idx, (cordinates, targets, true_num_stages) in enumerate(test_loader):
                 cordinates, targets, true_num_stages = cordinates.to(device), targets.to(device), true_num_stages.to(device)
                 
                 if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
