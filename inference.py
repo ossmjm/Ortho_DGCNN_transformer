@@ -1,4 +1,3 @@
-# inference.py
 import argparse
 import trimesh
 import numpy as np
@@ -131,7 +130,7 @@ def save_transformations_excel(transforms_sequence, output_dir, jaw_ids=None, tr
                 all_data.append(row)
         
         # Log predicted vs. true stages (Enhancement 5)
-        true_stages = true_num_stages[batch_idx].item() if true_num_stages is not None else "N/A"
+        true_stages = true_num_stages[batch_idx] if true_num_stages is not None else "N/A"
         logger.info(f"Jaw {jaw_id}: Predicted stages = {predicted_stages}, True stages = {true_stages}")
         
         if all_data:
