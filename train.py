@@ -33,12 +33,13 @@ def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, devi
 
     # Huber loss for translations
     huber = nn.HuberLoss(reduction='none', delta=0.5)
-    loss_trans = huber(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
+    loss_trans = huber(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])  # Shape: [batch_size, max_stages, num_teeth, 3]
+    loss_trans = loss_trans.mean(dim=3)  # Reduce over translation dimensions: [batch_size, max_stages, num_teeth]
 
     # Log-MSE for rotations
-    rot_diff = torch.abs(transforms_sequence[:, :, :, 3:] - targets[:, :, :, 3:])
+    rot_diff = torch.abs(transforms_sequence[:, :, :, 3:] - targets[:, :, :, 3:])  # Shape: [batch_size, max_stages, num_teeth, 3]
     log_rot_diff = torch.log1p(rot_diff)  # log(1 + |error|)
-    loss_rot = torch.mean(log_rot_diff**2, dim=[2, 3])  # Mean over teeth and dimensions
+    loss_rot = torch.mean(log_rot_diff**2, dim=3)  # Mean over rotation dimensions: [batch_size, max_stages, num_teeth]
 
     # Stage weights: 1.0 for active stages, 0 for padded
     batch_size = transforms_sequence.size(0)
@@ -46,9 +47,13 @@ def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, devi
     for b in range(batch_size):
         stage_weights[b, :true_num_stages[b]] = 1.0
 
+    # Debug shapes
+    logging.info(f"loss_trans shape: {loss_trans.shape}")
+    logging.info(f"stage_weights.unsqueeze(-1) shape: {stage_weights.unsqueeze(-1).shape}")
+
     # Apply stage weights
-    loss_trans = (loss_trans * stage_weights.unsqueeze(-1)).mean()
-    loss_rot = (loss_rot * stage_weights).mean()
+    loss_trans = (loss_trans * stage_weights.unsqueeze(-1)).mean()  # Broadcast over num_teeth
+    loss_rot = (loss_rot * stage_weights.unsqueeze(-1)).mean()  # Broadcast over num_teeth
 
     # Padded stage regularization
     padded_loss = 0.0
@@ -62,7 +67,7 @@ def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, devi
     alpha, beta, gamma = 10.0, 5.0, 0.1
     total_loss = alpha * loss_trans + beta * loss_rot + gamma * padded_loss
 
-    return total_loss, loss_trans, loss_rot, padded_loss
+    return total_loss, loss_trans, rot_loss, padded_loss
 
 def train_model(args):
     logger = setup_logging(args.log_file)
@@ -88,6 +93,7 @@ def train_model(args):
         train_ratio=args.train_ratio, 
         inference=False,
         log_file=args.log_file,
+        augment=True  # Enable data augmentation
     )
     test_dataset = JawTeethDataset(
         args.data_dir, 
@@ -96,6 +102,7 @@ def train_model(args):
         train_ratio=args.train_ratio, 
         inference=False,
         log_file=args.log_file,
+        augment=False
     )
     logger.info(f"Training dataset size: {len(train_dataset)}")
     logger.info(f"Test dataset size: {len(test_dataset)}")
@@ -278,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--embed_dim', type=int, default=256)  # Increased
-    parser.add_argument('--early_stopping', action='store_true', default=False)  # Enable early stopping
+    parser.add_argument('--early_stopping', action='store_true', default=True)  # Enable early stopping
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--n_head', type=int, default=32)  # Increased
     parser.add_argument('--num_encoder_layers', type=int, default=6)
