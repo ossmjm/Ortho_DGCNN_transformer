@@ -31,7 +31,7 @@ class TransformHead(nn.Module):
         return out
 
 class OrthoDGCNNModel(nn.Module):
-    def __init__(self, dgcnn, transformer, max_stages, num_teeth, embed_dim):
+    def __init__(self, dgcnn, transformer, max_stages, num_teeth, embed_dim, teacher_forcing=False):
         super(OrthoDGCNNModel, self).__init__()
         self.dgcnn = dgcnn
         self.transformer = transformer
@@ -39,6 +39,7 @@ class OrthoDGCNNModel(nn.Module):
         self.max_stages = max_stages
         self.num_teeth = num_teeth
         self.embed_dim = embed_dim
+        self.teacher_forcing = teacher_forcing
         self._init_weights()
 
     def _init_weights(self):
@@ -48,8 +49,14 @@ class OrthoDGCNNModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, cordinates, teacher_forcing=None, epoch=None, total_epochs=None):
+    def forward(self, cordinates, targets=None, epoch=None, total_epochs=None):
         dgcnn_out = self.dgcnn(cordinates)  # Shape: [batch_size, num_teeth * embed_dim]
-        transformer_out = self.transformer(dgcnn_out, teacher_forcing, epoch, total_epochs)  # Shape: [batch_size, max_stages, num_teeth*6]
+        transformer_out = self.transformer(
+            dgcnn_out, 
+            targets=targets, 
+            teacher_forcing=self.teacher_forcing, 
+            epoch=epoch, 
+            total_epochs=total_epochs
+        )  # Shape: [batch_size, max_stages, num_teeth*6]
         transforms_sequence = self.transform_head(transformer_out)  # Shape: [batch_size, max_stages, num_teeth, 6]
         return transforms_sequence

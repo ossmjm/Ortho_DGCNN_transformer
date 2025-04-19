@@ -37,17 +37,17 @@ class StageTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, dgcnn_out, teacher_forcing=None, epoch=None, total_epochs=None):
+    def forward(self, dgcnn_out, targets=None, teacher_forcing=False, epoch=None, total_epochs=None):
         batch_size = dgcnn_out.size(0)
         src = dgcnn_out.unsqueeze(1).repeat(1, self.max_stages, 1)  # Shape: [batch_size, max_stages, d_model]
         src = src + self.positional_encoding[:, :self.max_stages, :]
 
-        if self.training and teacher_forcing is not None:
+        if self.training and teacher_forcing and targets is not None:
             # Scheduled teacher forcing
             alpha = min(1.0, epoch / (total_epochs * 0.5)) if epoch is not None and total_epochs is not None else 1.0
             if torch.rand(1).item() < alpha:
                 # Teacher forcing
-                tgt = teacher_forcing.view(batch_size, self.max_stages, -1)  # Shape: [batch_size, max_stages, num_teeth*6]
+                tgt = targets.view(batch_size, self.max_stages, -1)  # Shape: [batch_size, max_stages, num_teeth*6]
                 tgt = torch.nn.functional.pad(tgt, (0, self.d_model - self.num_teeth * 6))  # Shape: [batch_size, max_stages, d_model]
                 start_token = torch.zeros(batch_size, 1, self.d_model, device=dgcnn_out.device)  # Shape: [batch_size, 1, d_model]
                 tgt = torch.cat([start_token, tgt[:, :-1, :]], dim=1)  # Shape: [batch_size, max_stages, d_model]
@@ -71,7 +71,7 @@ class StageTransformer(nn.Module):
                 
                 transformer_out = torch.cat(outputs, dim=1)  # Shape: [batch_size, max_stages, num_teeth*6]
         else:
-            # Inference: autoregressive generation
+            # Inference or no teacher forcing: autoregressive generation
             tgt = torch.zeros(batch_size, 1, self.d_model, device=dgcnn_out.device)  # Shape: [batch_size, 1, d_model]
             outputs = []
             for t in range(self.max_stages):
