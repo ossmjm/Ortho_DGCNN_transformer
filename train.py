@@ -25,6 +25,36 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
+def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, device):
+    criterion = nn.MSELoss(reduction='none')
+    
+    # Linear stage weights: 1.0 for stage 0, decreasing to 0.0 for stage max_stages
+    stage_weights = 1.0 - torch.arange(max_stages, device=device, dtype=torch.float32) / max_stages
+    stage_weights = stage_weights.view(1, max_stages, 1, 1)
+    
+    # Separate MSE for translations (first 3 dims) and rotations (last 3 dims)
+    mse_loss_trans = criterion(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
+    mse_loss_rot = criterion(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
+    
+    # Apply stage weights and compute mean per batch
+    mse_loss_trans = (mse_loss_trans * stage_weights).mean()
+    mse_loss_rot = (mse_loss_rot * stage_weights).mean()
+    
+    # Padded stage regularization
+    padded_loss = 0.0
+    batch_size = transforms_sequence.size(0)
+    for b in range(batch_size):
+        true_stages = true_num_stages[b].item()
+        if true_stages < max_stages:
+            padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
+    padded_loss = padded_loss / batch_size if batch_size > 0 else 0.0
+    
+    # Combine losses: weight translations 10x more than rotations
+    alpha, beta, gamma = 10.0, 1.0, 0.1
+    total_loss = alpha * mse_loss_trans + beta * mse_loss_rot + gamma * padded_loss
+    
+    return total_loss, mse_loss_trans, mse_loss_rot, padded_loss
+
 def train_model(args):
     logger = setup_logging(args.log_file)
     logger.info("Training with the following arguments:")
@@ -99,20 +129,18 @@ def train_model(args):
         lr=args.lr,
         weight_decay=1e-4
     )
-    criterion = nn.MSELoss(reduction='none')  # For stage-weighted loss
     scaler = torch.amp.GradScaler('cuda')
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     accumulation_steps = 2
     best_test_loss = float('inf')
     patience_counter = 0
 
-    # Stage weights for loss (Enhancement 4)
-    stage_weights = torch.exp(-torch.arange(args.max_stages, device=device, dtype=torch.float32) / args.max_stages)
-    stage_weights = stage_weights.view(1, args.max_stages, 1, 1)
-
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
+        train_trans_loss = 0
+        train_rot_loss = 0
+        train_padded_loss = 0
         optimizer.zero_grad(set_to_none=True)
         
         for batch_idx, (cordinates, targets, true_num_stages) in enumerate(train_loader):
@@ -124,17 +152,10 @@ def train_model(args):
                 logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
                 targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
             
-            max_abs_targets = torch.abs(targets).max()
-            if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
-                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
-                normalized_targets = targets
-            else:
-                normalized_targets = targets / (max_abs_targets + 1e-8)
-            
             with torch.amp.autocast('cuda'):
                 transforms_sequence = model(
                     cordinates, 
-                    targets=normalized_targets, 
+                    targets=targets,  # Pass raw targets
                     epoch=epoch, 
                     total_epochs=args.epochs
                 )
@@ -143,19 +164,11 @@ def train_model(args):
                     logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
                     continue
                 
-                # Weighted MSE loss (Enhancement 4)
-                mse_loss = criterion(transforms_sequence * stage_weights, normalized_targets * stage_weights)
-                mse_loss = mse_loss.mean()
-                
-                # Regularization for padded stages (Enhancement 1)
-                padded_loss = 0
-                for b in range(cordinates.size(0)):
-                    true_stages = true_num_stages[b].item()
-                    if true_stages < args.max_stages:
-                        padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
-                padded_loss = padded_loss / cordinates.size(0) if cordinates.size(0) > 0 else 0
-                
-                loss = (mse_loss + 0.1 * padded_loss) / accumulation_steps
+                # Compute custom loss
+                loss, mse_loss_trans, mse_loss_rot, padded_loss = compute_loss(
+                    transforms_sequence, targets, true_num_stages, args.max_stages, device
+                )
+                loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
@@ -166,13 +179,27 @@ def train_model(args):
                 optimizer.zero_grad(set_to_none=True)
             
             train_loss += loss.item() * accumulation_steps
-            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: Loss = {loss.item() * accumulation_steps:.6f}")
+            train_trans_loss += mse_loss_trans.item()
+            train_rot_loss += mse_loss_rot.item()
+            train_padded_loss += padded_loss.item()
+            
+            logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: Total Loss = {loss.item() * accumulation_steps:.6f}, "
+                       f"Translation Loss = {mse_loss_trans.item():.6f}, Rotation Loss = {mse_loss_rot.item():.6f}, "
+                       f"Padded Loss = {padded_loss.item():.6f}")
         
         avg_train_loss = train_loss / len(train_loader)
-        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Loss (Weighted MSE + Reg): {avg_train_loss:.4f}")
+        avg_trans_loss = train_trans_loss / len(train_loader)
+        avg_rot_loss = train_rot_loss / len(train_loader)
+        avg_padded_loss = train_padded_loss / len(train_loader)
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {avg_train_loss:.4f}, "
+                   f"Train Translation Loss: {avg_trans_loss:.4f}, Train Rotation Loss: {avg_rot_loss:.4f}, "
+                   f"Train Padded Loss: {avg_padded_loss:.4f}")
         
         model.eval()
         test_loss = 0
+        test_trans_loss = 0
+        test_rot_loss = 0
+        test_padded_loss = 0
         with torch.no_grad():
             for batch_idx, (cordinates, targets, true_num_stages) in enumerate(test_loader):
                 cordinates, targets, true_num_stages = cordinates.to(device), targets.to(device), true_num_stages.to(device)
@@ -183,13 +210,6 @@ def train_model(args):
                     logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: targets contains nan/inf")
                     targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                max_abs_targets = torch.abs(targets).max()
-                if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
-                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
-                    normalized_targets = targets
-                else:
-                    normalized_targets = targets / (max_abs_targets + 1e-8)
-                
                 with torch.amp.autocast('cuda'):
                     transforms_sequence = model(cordinates)
                     
@@ -197,22 +217,23 @@ def train_model(args):
                         logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
                         continue
                     
-                    mse_loss = criterion(transforms_sequence * stage_weights, normalized_targets * stage_weights)
-                    mse_loss = mse_loss.mean()
-                    
-                    padded_loss = 0
-                    for b in range(cordinates.size(0)):
-                        true_stages = true_num_stages[b].item()
-                        if true_stages < args.max_stages:
-                            padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
-                    padded_loss = padded_loss / cordinates.size(0) if cordinates.size(0) > 0 else 0
-                    
-                    loss = mse_loss + 0.1 * padded_loss
+                    # Compute custom loss
+                    loss, mse_loss_trans, mse_loss_rot, padded_loss = compute_loss(
+                        transforms_sequence, targets, true_num_stages, args.max_stages, device
+                    )
                 
                 test_loss += loss.item()
+                test_trans_loss += mse_loss_trans.item()
+                test_rot_loss += mse_loss_rot.item()
+                test_padded_loss += padded_loss.item()
         
         avg_test_loss = test_loss / len(test_loader)
-        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Loss (Weighted MSE + Reg): {avg_test_loss:.4f}")
+        avg_test_trans_loss = test_trans_loss / len(test_loader)
+        avg_test_rot_loss = test_rot_loss / len(test_loader)
+        avg_test_padded_loss = test_padded_loss / len(test_loader)
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {avg_test_loss:.4f}, "
+                   f"Test Translation Loss: {avg_test_trans_loss:.4f}, Test Rotation Loss: {avg_test_rot_loss:.4f}, "
+                   f"Test Padded Loss: {avg_test_padded_loss:.4f}")
         
         if args.early_stopping:
             if avg_test_loss < best_test_loss:
