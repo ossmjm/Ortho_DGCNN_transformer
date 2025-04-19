@@ -3,6 +3,7 @@ import trimesh
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import os
 import logging
@@ -202,20 +203,52 @@ def inference(args):
     logger.info(f"Loaded model from {model_path}")
     logger.info(f"Model GPU memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
     
+    # Loss criterion and stage weights (consistent with train.py)
+    criterion = nn.MSELoss(reduction='none')
+    stage_weights = torch.exp(-torch.arange(args.max_stages, device=device, dtype=torch.float32) / args.max_stages)
+    stage_weights = stage_weights.view(1, args.max_stages, 1, 1)
+    
     all_transforms = []
     all_jaw_ids = []
     all_true_stages = []
+    total_inference_loss = 0.0
+    num_batches = 0
     
     with torch.no_grad():
-        for batch_idx, (cordinates, _, vertices_list, faces_list, true_num_stages) in enumerate(dataloader):
+        for batch_idx, (cordinates, targets, vertices_list, faces_list, true_num_stages) in enumerate(dataloader):
             cordinates = cordinates.to(device)
+            targets = targets.to(device)
+            true_num_stages = true_num_stages.to(device)
             
             logger.info(f"Batch {batch_idx+1}: Input cordinates shape: {cordinates.shape}")
+            logger.info(f"Batch {batch_idx+1}: Targets shape: {targets.shape}")
             logger.info(f"Batch {batch_idx+1}: True num_stages: {true_num_stages.tolist()}")
             logger.info(f"Batch {batch_idx+1}: GPU memory before inference: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
             
             with torch.amp.autocast('cuda'):
                 transforms_sequence = model(cordinates)
+                
+                # Normalize targets (consistent with train.py)
+                max_abs_targets = torch.abs(targets).max()
+                if torch.isnan(max_abs_targets) or torch.isinf(max_abs_targets) or max_abs_targets == 0:
+                    logger.warning(f"Batch {batch_idx+1}: Invalid max_abs_targets ({max_abs_targets}), skipping normalization")
+                    normalized_targets = targets
+                else:
+                    normalized_targets = targets / (max_abs_targets + 1e-8)
+                
+                # Compute loss (consistent with train.py)
+                mse_loss = criterion(transforms_sequence * stage_weights, normalized_targets * stage_weights)
+                
+                # Apply true_num_stages to exclude padded stages
+                batch_loss = 0.0
+                for b in range(cordinates.size(0)):
+                    num_stages = true_num_stages[b].item()
+                    batch_loss += mse_loss[b, :num_stages, :, :].mean()
+                batch_loss = batch_loss / cordinates.size(0) if cordinates.size(0) > 0 else 0.0
+                
+                total_inference_loss += batch_loss.item()
+                num_batches += 1
+                logger.info(f"Batch {batch_idx+1}: Inference Loss (MSE): {batch_loss.item():.6f}")
             
             logger.info(f"Batch {batch_idx+1}: transforms_sequence shape: {transforms_sequence.shape}")
             logger.info(f"Batch {batch_idx+1}: GPU memory after inference: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
@@ -230,11 +263,15 @@ def inference(args):
                                for i in range(transforms_sequence.shape[0])])
             all_true_stages.extend(true_num_stages.tolist())
             
-            del cordinates, transforms_sequence
+            del cordinates, targets, transforms_sequence
             torch.cuda.empty_cache()
             logger.info(f"Batch {batch_idx+1}: GPU memory after cleanup: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
             
             logger.info(f"Inference complete for {len(vertices_list)} jaws in batch {batch_idx+1}")
+    
+    # Compute and log average inference loss
+    avg_inference_loss = total_inference_loss / num_batches if num_batches > 0 else 0.0
+    logger.info(f"Average Inference Loss (MSE) across {num_batches} batches: {avg_inference_loss:.6f}")
     
     all_transforms = torch.cat(all_transforms, dim=0)
     excel_paths = save_transformations_excel(all_transforms, args.output_dir, jaw_ids=all_jaw_ids, true_num_stages=all_true_stages, logger=logger)
