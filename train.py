@@ -96,7 +96,7 @@ def train_model(args):
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
-        for batch_idx, (cordinates, targets, _, _, true_num_stages) in enumerate(train_loader):
+        for batch_idx, (cordinates, targets, true_num_stages) in enumerate(train_loader):
             cordinates, targets = cordinates.to(device), targets.to(device)
             true_num_stages = true_num_stages.to(device)
             
@@ -121,7 +121,7 @@ def train_model(args):
         model.eval()
         test_loss = 0.0
         with torch.no_grad():
-            for batch_idx, (cordinates, targets, _, _, true_num_stages) in enumerate(test_loader):
+            for batch_idx, (cordinates, targets, true_num_stages) in enumerate(test_loader):
                 cordinates, targets = cordinates.to(device), targets.to(device)
                 true_num_stages = true_num_stages.to(device)
                 
