@@ -88,7 +88,6 @@ def train_model(args):
         train_ratio=args.train_ratio, 
         inference=False,
         log_file=args.log_file,
-        augment=True  # Enable data augmentation
     )
     test_dataset = JawTeethDataset(
         args.data_dir, 
@@ -97,7 +96,6 @@ def train_model(args):
         train_ratio=args.train_ratio, 
         inference=False,
         log_file=args.log_file,
-        augment=False
     )
     logger.info(f"Training dataset size: {len(train_dataset)}")
     logger.info(f"Test dataset size: {len(test_dataset)}")
