@@ -8,6 +8,7 @@ from dataset import JawTeethDataset
 from models.DGCNN import DGCNN
 from models.StageTransformer import StageTransformer
 from models.OrthoDGCNN import OrthoDGCNNModel
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -26,34 +27,42 @@ def setup_logging(log_file):
     return logger
 
 def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, device):
-    criterion = nn.MSELoss(reduction='none')
-    
-    # Linear stage weights: 1.0 for stage 0, decreasing to 0.0 for stage max_stages
-    stage_weights = 1.0 - torch.arange(max_stages, device=device, dtype=torch.float32) / max_stages
-    stage_weights = stage_weights.view(1, max_stages, 1, 1)
-    
-    # Separate MSE for translations (first 3 dims) and rotations (last 3 dims)
-    mse_loss_trans = criterion(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
-    mse_loss_rot = criterion(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
-    
-    # Apply stage weights and compute mean per batch
-    mse_loss_trans = (mse_loss_trans * stage_weights).mean()
-    mse_loss_rot = (mse_loss_rot * stage_weights).mean()
-    
+    # Clip predictions and targets to reasonable ranges
+    transforms_sequence = torch.clamp(transforms_sequence, -45.0, 45.0)  # ±45° for rotations, ±10 mm for translations
+    targets = torch.clamp(targets, -45.0, 45.0)
+
+    # Huber loss for translations
+    huber = nn.HuberLoss(reduction='none', delta=0.5)
+    loss_trans = huber(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
+
+    # Log-MSE for rotations
+    rot_diff = torch.abs(transforms_sequence[:, :, :, 3:] - targets[:, :, :, 3:])
+    log_rot_diff = torch.log1p(rot_diff)  # log(1 + |error|)
+    loss_rot = torch.mean(log_rot_diff**2, dim=[2, 3])  # Mean over teeth and dimensions
+
+    # Stage weights: 1.0 for active stages, 0 for padded
+    batch_size = transforms_sequence.size(0)
+    stage_weights = torch.zeros(batch_size, max_stages, device=device)
+    for b in range(batch_size):
+        stage_weights[b, :true_num_stages[b]] = 1.0
+
+    # Apply stage weights
+    loss_trans = (loss_trans * stage_weights.unsqueeze(-1)).mean()
+    loss_rot = (loss_rot * stage_weights).mean()
+
     # Padded stage regularization
     padded_loss = 0.0
-    batch_size = transforms_sequence.size(0)
     for b in range(batch_size):
         true_stages = true_num_stages[b].item()
         if true_stages < max_stages:
             padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
     padded_loss = padded_loss / batch_size if batch_size > 0 else 0.0
-    
-    # Combine losses: weight translations 10x more than rotations
-    alpha, beta, gamma = 10.0, 1.0, 0.1
-    total_loss = alpha * mse_loss_trans + beta * mse_loss_rot + gamma * padded_loss
-    
-    return total_loss, mse_loss_trans, mse_loss_rot, padded_loss
+
+    # Combine losses
+    alpha, beta, gamma = 10.0, 5.0, 0.1
+    total_loss = alpha * loss_trans + beta * loss_rot + gamma * padded_loss
+
+    return total_loss, loss_trans, loss_rot, padded_loss
 
 def train_model(args):
     logger = setup_logging(args.log_file)
@@ -78,7 +87,8 @@ def train_model(args):
         split='train', 
         train_ratio=args.train_ratio, 
         inference=False,
-        log_file=args.log_file
+        log_file=args.log_file,
+        augment=True  # Enable data augmentation
     )
     test_dataset = JawTeethDataset(
         args.data_dir, 
@@ -86,7 +96,8 @@ def train_model(args):
         split='test', 
         train_ratio=args.train_ratio, 
         inference=False,
-        log_file=args.log_file
+        log_file=args.log_file,
+        augment=False
     )
     logger.info(f"Training dataset size: {len(train_dataset)}")
     logger.info(f"Test dataset size: {len(test_dataset)}")
@@ -127,10 +138,10 @@ def train_model(args):
     optimizer = torch.optim.Adam(
         model.parameters(), 
         lr=args.lr,
-        weight_decay=1e-4
+        weight_decay=1e-3  # Increased weight decay
     )
     scaler = torch.amp.GradScaler('cuda')
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     accumulation_steps = 2
     best_test_loss = float('inf')
     patience_counter = 0
@@ -142,6 +153,9 @@ def train_model(args):
         train_rot_loss = 0
         train_padded_loss = 0
         optimizer.zero_grad(set_to_none=True)
+        
+        # Dynamic teacher forcing probability
+        tf_prob = max(0.0, 1.0 - epoch / (args.epochs * 0.5)) if args.teacher_forcing else 0.0
         
         for batch_idx, (cordinates, targets, true_num_stages) in enumerate(train_loader):
             cordinates, targets, true_num_stages = cordinates.to(device), targets.to(device), true_num_stages.to(device)
@@ -155,7 +169,7 @@ def train_model(args):
             with torch.amp.autocast('cuda'):
                 transforms_sequence = model(
                     cordinates, 
-                    targets=targets,  # Pass raw targets
+                    targets=targets if torch.rand(1).item() < tf_prob else None,  # Dynamic teacher forcing
                     epoch=epoch, 
                     total_epochs=args.epochs
                 )
@@ -165,13 +179,13 @@ def train_model(args):
                     continue
                 
                 # Compute custom loss
-                loss, mse_loss_trans, mse_loss_rot, padded_loss = compute_loss(
+                loss, trans_loss, rot_loss, padded_loss = compute_loss(
                     transforms_sequence, targets, true_num_stages, args.max_stages, device
                 )
                 loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Increased clip norm
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
@@ -179,13 +193,13 @@ def train_model(args):
                 optimizer.zero_grad(set_to_none=True)
             
             train_loss += loss.item() * accumulation_steps
-            train_trans_loss += mse_loss_trans.item()
-            train_rot_loss += mse_loss_rot.item()
+            train_trans_loss += trans_loss.item()
+            train_rot_loss += rot_loss.item()
             train_padded_loss += padded_loss.item()
             
             logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: Total Loss = {loss.item() * accumulation_steps:.6f}, "
-                       f"Translation Loss = {mse_loss_trans.item():.6f}, Rotation Loss = {mse_loss_rot.item():.6f}, "
-                       f"Padded Loss = {padded_loss.item():.6f}")
+                       f"Translation Loss = {trans_loss.item():.6f}, Rotation Loss = {rot_loss.item():.6f}, "
+                       f"Padded Loss = {padded_loss.item():.6f}, TF Prob = {tf_prob:.2f}")
         
         avg_train_loss = train_loss / len(train_loader)
         avg_trans_loss = train_trans_loss / len(train_loader)
@@ -218,13 +232,13 @@ def train_model(args):
                         continue
                     
                     # Compute custom loss
-                    loss, mse_loss_trans, mse_loss_rot, padded_loss = compute_loss(
+                    loss, trans_loss, rot_loss, padded_loss = compute_loss(
                         transforms_sequence, targets, true_num_stages, args.max_stages, device
                     )
                 
                 test_loss += loss.item()
-                test_trans_loss += mse_loss_trans.item()
-                test_rot_loss += mse_loss_rot.item()
+                test_trans_loss += trans_loss.item()
+                test_rot_loss += rot_loss.item()
                 test_padded_loss += padded_loss.item()
         
         avg_test_loss = test_loss / len(test_loader)
@@ -263,16 +277,16 @@ if __name__ == "__main__":
     parser.add_argument('--train_ratio', type=float, default=0.8)
     parser.add_argument('--output_dir', type=str, default="output")
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--early_stopping', action='store_true', default=False)
+    parser.add_argument('--embed_dim', type=int, default=256)  # Increased
+    parser.add_argument('--early_stopping', action='store_true', default=False)  # Enable early stopping
     parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--n_head', type=int, default=16)
+    parser.add_argument('--n_head', type=int, default=32)  # Increased
     parser.add_argument('--num_encoder_layers', type=int, default=6)
     parser.add_argument('--num_decoder_layers', type=int, default=6)
     parser.add_argument('--log_file', type=str, default="training_log.txt")
-    parser.add_argument('--teacher_forcing', action='store_true', default=False, help="Use teacher forcing during training")
+    parser.add_argument('--teacher_forcing', action='store_true', default=True)
     
     args = parser.parse_args()
     
