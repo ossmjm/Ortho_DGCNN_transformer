@@ -67,7 +67,7 @@ def compute_loss(transforms_sequence, targets, true_num_stages, max_stages, devi
     alpha, beta, gamma = 10.0, 5.0, 0.1
     total_loss = alpha * loss_trans + beta * loss_rot + gamma * padded_loss
 
-    return total_loss, loss_trans, rot_loss, padded_loss
+    return total_loss, loss_trans, loss_rot, padded_loss
 
 def train_model(args):
     logger = setup_logging(args.log_file)
