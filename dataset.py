@@ -114,81 +114,13 @@ class JawTeethDataset(Dataset):
             zero_percentage = (zero_count / total_entries) * 100
             self.logger.info(f"Jaw_ID {case}: {zero_count}/{total_entries} tooth-stages are inactive ({zero_percentage:.2f}%)")
             
-            # Append original data
+            # Append data
             self.transformations.append(transformations)
             self.activity_labels.append(activity)
             self.transform_types.append(transform_type)
             self.param_activity_labels.append(param_activity)
             self.json_files.append(json_file)
             self.cases.append(case)
-            
-            # Data augmentation for training
-            if not inference and split == 'train':
-                active_teeth = torch.any(activity, dim=0).nonzero(as_tuple=True)[0]
-                self.logger.debug(f"Case {case}: Found {len(active_teeth)} active teeth")
-                
-                for tooth_idx in active_teeth:
-                    active_stages = activity[:, tooth_idx].nonzero(as_tuple=True)[0]
-                    num_active_stages = len(active_stages)
-                    if num_active_stages >= max_stages:
-                        self.logger.debug(f"Case {case}, Tooth {tooth_idx}: Already has {num_active_stages} stages, skipping augmentation")
-                        continue
-                    
-                    num_synthetic = min(2, max_stages - num_active_stages)
-                    self.logger.debug(f"Case {case}, Tooth {tooth_idx}: Adding {num_synthetic} synthetic stages")
-                    
-                    for synth_idx in range(num_synthetic):
-                        # Check dataset size limit
-                        if len(self.transformations) >= len(original_cases) * 5:
-                            self.logger.info("Reached maximum augmented dataset size, stopping augmentation")
-                            break
-                        
-                        try:
-                            # Create synthetic transformations
-                            synthetic_transforms = torch.zeros(1, self.num_teeth, 6)
-                            num_active_params = np.random.randint(1, 4)
-                            active_params = np.random.choice(6, num_active_params, replace=False)
-                            for param_idx in active_params:
-                                if param_idx < 3:  # Translation
-                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-15, 15)
-                                else:  # Rotation
-                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-45, 45)
-                            
-                            # Compute activity labels
-                            synthetic_activity = torch.any(synthetic_transforms != 0, dim=-1).float()  # Shape: [1, num_teeth]
-                            synthetic_param_activity = (synthetic_transforms != 0).float()  # Shape: [1, num_teeth, 6]
-                            
-                            # Determine transformation type
-                            synthetic_type = torch.zeros(1, self.num_teeth, dtype=torch.long)
-                            trans_only = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & ~torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                            rot_only = ~torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                            both = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                            synthetic_type[trans_only] = 1
-                            synthetic_type[rot_only] = 2
-                            synthetic_type[both] = 3
-                            
-                            # Append augmented data
-                            self.transformations.append(torch.cat([transformations, synthetic_transforms], dim=0)[:max_stages])
-                            self.activity_labels.append(torch.cat([activity, synthetic_activity], dim=0)[:max_stages])
-                            self.transform_types.append(torch.cat([transform_type, synthetic_type], dim=0)[:max_stages])
-                            self.param_activity_labels.append(torch.cat([param_activity, synthetic_param_activity], dim=0)[:max_stages])
-                            self.json_files.append(json_file)
-                            self.cases.append(case)
-                            
-                            # Log memory usage
-                            current, peak = tracemalloc.get_traced_memory()
-                            process = psutil.Process()
-                            mem_info = process.memory_info()
-                            self.logger.debug(f"Case {case}, Tooth {tooth_idx}, Synthetic {synth_idx+1}: "
-                                            f"Memory: Current={current/1e6:.2f}MB, Peak={peak/1e6:.2f}MB, "
-                                            f"RSS={mem_info.rss/1e6:.2f}MB")
-                        except Exception as e:
-                            self.logger.error(f"Error in augmentation for case {case}, tooth {tooth_idx}, synthetic {synth_idx+1}: {e}")
-                            continue
-                    
-                    # Check if augmentation was stopped early
-                    if len(self.transformations) >= len(original_cases) * 5:
-                        break
             
             # Log completion of case
             elapsed = time.time() - start_time
@@ -221,7 +153,8 @@ class JawTeethDataset(Dataset):
         # Stop memory tracking
         tracemalloc.stop()
         
-        self.logger.info(f"Dataset initialized with {len(self.cases)} cases (including {len(self.cases)-len(original_cases)} augmented)")
+        self.logger.info(f"Dataset initialized with {len(self.cases)} cases")
+
     def _load_transformations(self, transform_df, jaw_id):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
@@ -232,7 +165,7 @@ class JawTeethDataset(Dataset):
             self.logger.warning(f"No data found for Jaw_ID {jaw_id}")
             return transformations
         
-        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         for col in transform_columns:
             nan_count = jaw_data[col].isna().sum()
@@ -309,7 +242,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm"]), 
+                    clean_and_convert(row["Left/Right (mm)"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
