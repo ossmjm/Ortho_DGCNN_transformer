@@ -213,7 +213,7 @@ class JawTeethDataset(Dataset):
             self.logger.warning(f"No data found for Jaw_ID {jaw_id}")
             return transformations
         
-        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         for col in transform_columns:
             nan_count = jaw_data[col].isna().sum()
@@ -290,7 +290,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm)"]), 
+                    clean_and_convert(row["Left/Right (mm"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
