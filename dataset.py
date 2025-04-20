@@ -66,7 +66,7 @@ class JawTeethDataset(Dataset):
             zero_count = (activity == 0).sum().item()
             total_entries = activity.numel()
             zero_percentage = (zero_count / total_entries) * 100
-            self.logger.info(f"Jaw_ID {case}: {zero_count}/{total_entries} tooth-stages are inactive ({zero_percentage:.2f}%)")
+            # self.logger.info(f"Jaw_ID {case}: {zero_count}/{total_entries} tooth-stages are inactive ({zero_percentage:.2f}%)")
             self.transformations.append(transformations)
             self.activity_labels.append(activity)
             self.transform_types.append(transform_type)
