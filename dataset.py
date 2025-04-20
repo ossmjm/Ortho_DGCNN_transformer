@@ -45,7 +45,7 @@ class JawTeethDataset(Dataset):
         self.transformations = []
         self.activity_labels = []
         self.transform_types = []
-        self.param_activity_labels = []  # New: Activity labels for each transformation parameter
+        self.param_activity_labels = []
         for case in self.cases:
             case_dir = os.path.join(data_dir, case)
             json_file = os.path.join(case_dir, "ori", "before_treatment.json")
@@ -79,28 +79,31 @@ class JawTeethDataset(Dataset):
                     if len(active_stages) < max_stages:
                         num_synthetic = min(5, max_stages - len(active_stages))
                         for _ in range(num_synthetic):
-                            synthetic_transforms = torch.zeros(transformations.shape[-1])
-                            # Randomly select 1-3 parameters to be non-zero
+                            # Create a full jaw transformation tensor
+                            synthetic_transforms = torch.zeros(1, self.num_teeth, 6)
+                            # Randomly select 1-3 parameters to be non-zero for the chosen tooth
                             num_active_params = np.random.randint(1, 4)
                             active_params = np.random.choice(6, num_active_params, replace=False)
                             for param_idx in active_params:
                                 if param_idx < 3:  # Translation
-                                    synthetic_transforms[param_idx] = np.random.uniform(-15, 15)
+                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-15, 15)
                                 else:  # Rotation
-                                    synthetic_transforms[param_idx] = np.random.uniform(-45, 45)
-                            synthetic_activity = torch.any(synthetic_transforms != 0).float()
-                            synthetic_param_activity = (synthetic_transforms != 0).float()
-                            synthetic_type = 0
-                            if torch.any(synthetic_transforms[:3] != 0) and torch.any(synthetic_transforms[3:] != 0):
-                                synthetic_type = 3
-                            elif torch.any(synthetic_transforms[:3] != 0):
-                                synthetic_type = 1
-                            elif torch.any(synthetic_transforms[3:] != 0):
-                                synthetic_type = 2
-                            synthetic_transforms = synthetic_transforms.unsqueeze(0)
-                            synthetic_activity = synthetic_activity.unsqueeze(0)
-                            synthetic_param_activity = synthetic_param_activity.unsqueeze(0)
-                            synthetic_type = torch.tensor([synthetic_type], dtype=torch.long)
+                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-45, 45)
+                            
+                            # Compute activity labels
+                            synthetic_activity = torch.any(synthetic_transforms != 0, dim=-1).float()  # Shape: [1, num_teeth]
+                            synthetic_param_activity = (synthetic_transforms != 0).float()  # Shape: [1, num_teeth, 6]
+                            
+                            # Determine transformation type
+                            synthetic_type = torch.zeros(1, self.num_teeth, dtype=torch.long)
+                            trans_only = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & ~torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            rot_only = ~torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            both = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            synthetic_type[trans_only] = 1
+                            synthetic_type[rot_only] = 2
+                            synthetic_type[both] = 3
+                            
+                            # Append augmented data
                             self.transformations.append(torch.cat([transformations, synthetic_transforms], dim=0)[:max_stages])
                             self.activity_labels.append(torch.cat([activity, synthetic_activity], dim=0)[:max_stages])
                             self.transform_types.append(torch.cat([transform_type, synthetic_type], dim=0)[:max_stages])
