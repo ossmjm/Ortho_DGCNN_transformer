@@ -44,12 +44,12 @@ class JawTeethDataset(Dataset):
         self.cases = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d.isdigit()]
         self.logger.info(f"cases: {self.cases}")
         train_cases, test_cases = train_test_split(self.cases, train_size=train_ratio, random_state=42)
-        self.cases = train_cases if split == 'train' else test_cases
+        original_cases = train_cases if split == 'train' else test_cases
         
-        # Preload transformation files to reduce I/O
+        # Preload transformation files
         self.logger.info("Preloading transformation files")
         transform_cache = {}
-        for case in self.cases:
+        for case in original_cases:
             transform_file = os.path.join(data_dir, case, "Transformations.xlsx")
             if os.path.exists(transform_file):
                 try:
@@ -63,12 +63,12 @@ class JawTeethDataset(Dataset):
         self.activity_labels = []
         self.transform_types = []
         self.param_activity_labels = []
-        original_cases = self.cases.copy()
+        self.cases = []
         
         # Start memory tracking
         tracemalloc.start()
         
-        self.logger.info(f"Processing {len(self.cases)} cases for split '{split}'")
+        self.logger.info(f"Processing {len(original_cases)} cases for split '{split}'")
         
         for case_idx, case in enumerate(original_cases):
             start_time = time.time()
@@ -85,7 +85,7 @@ class JawTeethDataset(Dataset):
             
             self.logger.debug(f"Processing case {case} ({case_idx+1}/{len(original_cases)})")
             
-            # Load transformations from cache
+            # Load transformations
             try:
                 transformations = self._load_transformations(transform_cache[case], case)
             except Exception as e:
@@ -134,75 +134,94 @@ class JawTeethDataset(Dataset):
                         self.logger.debug(f"Case {case}, Tooth {tooth_idx}: Already has {num_active_stages} stages, skipping augmentation")
                         continue
                     
-                    # Limit synthetic stages
-                    num_synthetic = min(2, max_stages - num_active_stages)  # Reduced from 5 to 2
+                    num_synthetic = min(2, max_stages - num_active_stages)
                     self.logger.debug(f"Case {case}, Tooth {tooth_idx}: Adding {num_synthetic} synthetic stages")
                     
                     for synth_idx in range(num_synthetic):
-                        # Check total dataset size to prevent excessive growth
+                        # Check dataset size limit
                         if len(self.transformations) >= len(original_cases) * 5:
                             self.logger.info("Reached maximum augmented dataset size, stopping augmentation")
                             break
                         
-                        # Create synthetic transformations
-                        synthetic_transforms = torch.zeros(1, self.num_teeth, 6)
-                        num_active_params = np.random.randint(1, 4)
-                        active_params = np.random.choice(6, num_active_params, replace=False)
-                        for param_idx in active_params:
-                            if param_idx < 3:  # Translation
-                                synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-15, 15)
-                            else:  # Rotation
-                                synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-45, 45)
-                        
-                        # Compute activity labels
-                        synthetic_activity = torch.any(synthetic_transforms != 0, dim=-1).float()  # Shape: [1, num_teeth]
-                        synthetic_param_activity = (synthetic_transforms != 0).float()  # Shape: [1, num_teeth, 6]
-                        
-                        # Determine transformation type
-                        synthetic_type = torch.zeros(1, self.num_teeth, dtype=torch.long)
-                        trans_only = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & ~torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                        rot_only = ~torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                        both = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
-                        synthetic_type[trans_only] = 1
-                        synthetic_type[rot_only] = 2
-                        synthetic_type[both] = 3
-                        
-                        # Append augmented data
-                        self.transformations.append(torch.cat([transformations, synthetic_transforms], dim=0)[:max_stages])
-                        self.activity_labels.append(torch.cat([activity, synthetic_activity], dim=0)[:max_stages])
-                        self.transform_types.append(torch.cat([transform_type, synthetic_type], dim=0)[:max_stages])
-                        self.param_activity_labels.append(torch.cat([param_activity, synthetic_param_activity], dim=0)[:max_stages])
-                        self.json_files.append(json_file)
-                        self.cases.append(case)
-                        
-                        # Log memory usage
-                        current, peak = tracemalloc.get_traced_memory()
-                        process = psutil.Process()
-                        mem_info = process.memory_info()
-                        self.logger.debug(f"Case {case}, Tooth {tooth_idx}, Synthetic {synth_idx+1}: "
-                                        f"Memory: Current={current/1e6:.2f}MB, Peak={peak/1e6:.2f}MB, "
-                                        f"RSS={mem_info.rss/1e6:.2f}MB")
-                
-                # Check if augmentation was stopped early
-                if len(self.transformations) >= len(original_cases) * 5:
-                    break
+                        try:
+                            # Create synthetic transformations
+                            synthetic_transforms = torch.zeros(1, self.num_teeth, 6)
+                            num_active_params = np.random.randint(1, 4)
+                            active_params = np.random.choice(6, num_active_params, replace=False)
+                            for param_idx in active_params:
+                                if param_idx < 3:  # Translation
+                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-15, 15)
+                                else:  # Rotation
+                                    synthetic_transforms[0, tooth_idx, param_idx] = np.random.uniform(-45, 45)
+                            
+                            # Compute activity labels
+                            synthetic_activity = torch.any(synthetic_transforms != 0, dim=-1).float()  # Shape: [1, num_teeth]
+                            synthetic_param_activity = (synthetic_transforms != 0).float()  # Shape: [1, num_teeth, 6]
+                            
+                            # Determine transformation type
+                            synthetic_type = torch.zeros(1, self.num_teeth, dtype=torch.long)
+                            trans_only = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & ~torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            rot_only = ~torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            both = torch.any(synthetic_transforms[:, :, :3] != 0, dim=-1) & torch.any(synthetic_transforms[:, :, 3:] != 0, dim=-1)
+                            synthetic_type[trans_only] = 1
+                            synthetic_type[rot_only] = 2
+                            synthetic_type[both] = 3
+                            
+                            # Append augmented data
+                            self.transformations.append(torch.cat([transformations, synthetic_transforms], dim=0)[:max_stages])
+                            self.activity_labels.append(torch.cat([activity, synthetic_activity], dim=0)[:max_stages])
+                            self.transform_types.append(torch.cat([transform_type, synthetic_type], dim=0)[:max_stages])
+                            self.param_activity_labels.append(torch.cat([param_activity, synthetic_param_activity], dim=0)[:max_stages])
+                            self.json_files.append(json_file)
+                            self.cases.append(case)
+                            
+                            # Log memory usage
+                            current, peak = tracemalloc.get_traced_memory()
+                            process = psutil.Process()
+                            mem_info = process.memory_info()
+                            self.logger.debug(f"Case {case}, Tooth {tooth_idx}, Synthetic {synth_idx+1}: "
+                                            f"Memory: Current={current/1e6:.2f}MB, Peak={peak/1e6:.2f}MB, "
+                                            f"RSS={mem_info.rss/1e6:.2f}MB")
+                        except Exception as e:
+                            self.logger.error(f"Error in augmentation for case {case}, tooth {tooth_idx}, synthetic {synth_idx+1}: {e}")
+                            continue
+                    
+                    # Check if augmentation was stopped early
+                    if len(self.transformations) >= len(original_cases) * 5:
+                        break
             
             # Log completion of case
             elapsed = time.time() - start_time
             self.logger.info(f"Finished case {case} in {elapsed:.2f} seconds")
         
+        # Validate list lengths
+        list_lengths = {
+            "cases": len(self.cases),
+            "json_files": len(self.json_files),
+            "transformations": len(self.transformations),
+            "activity_labels": len(self.activity_labels),
+            "transform_types": len(self.transform_types),
+            "param_activity_labels": len(self.param_activity_labels)
+        }
+        self.logger.info(f"List lengths: {list_lengths}")
+        if not all(length == list_lengths["cases"] for length in list_lengths.values()):
+            raise ValueError(f"Mismatch in list lengths: {list_lengths}")
+        
         # Stack tensors
         self.logger.info(f"Stacking {len(self.transformations)} transformation tensors")
-        self.transformations = torch.stack(self.transformations)
-        self.activity_labels = torch.stack(self.activity_labels)
-        self.transform_types = torch.stack(self.transform_types)
-        self.param_activity_labels = torch.stack(self.param_activity_labels)
+        try:
+            self.transformations = torch.stack(self.transformations)
+            self.activity_labels = torch.stack(self.activity_labels)
+            self.transform_types = torch.stack(self.transform_types)
+            self.param_activity_labels = torch.stack(self.param_activity_labels)
+        except Exception as e:
+            self.logger.error(f"Error stacking tensors: {e}")
+            raise
         
         # Stop memory tracking
         tracemalloc.stop()
         
         self.logger.info(f"Dataset initialized with {len(self.cases)} cases (including {len(self.cases)-len(original_cases)} augmented)")
-
     def _load_transformations(self, transform_df, jaw_id):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
