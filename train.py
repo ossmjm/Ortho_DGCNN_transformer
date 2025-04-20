@@ -26,53 +26,99 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def log_cosh_loss(pred, target, amplify_threshold=0.5, amplify_factor=10.0):
-    diff = pred - target
-    loss = torch.log(torch.cosh(diff + 1e-12))
-    # Amplify small errors
-    small_error_mask = (torch.abs(diff) < amplify_threshold).float()
-    amplified_loss = loss * (1 + amplify_factor * small_error_mask)
-    return torch.mean(amplified_loss)
+class WeightedSmoothL1Loss(nn.Module):
+    def __init__(self, beta=0.5, alpha=10.0, gamma=0.05, epsilon=1e-6, max_value=100.0):
+        super(WeightedSmoothL1Loss, self).__init__()
+        self.beta = beta
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.max_value = max_value
+    
+    def forward(self, pred, target, activity_mask=None, stage_weights=None):
+        # Clip predictions and targets
+        pred = torch.clamp(pred, -self.max_value, self.max_value)
+        target = torch.clamp(target, -self.max_value, self.max_value)
+        
+        # Compute absolute error
+        diff = torch.abs(pred - target)
+        
+        # Smooth L1 loss
+        smooth_l1 = torch.where(
+            diff < self.beta,
+            0.5 * diff ** 2 / self.beta,
+            diff - 0.5 * self.beta
+        )
+        
+        # Exponential weights for small errors
+        weights = torch.exp(-self.alpha * torch.clamp(diff, min=self.epsilon)) + self.gamma
+        
+        # Apply activity and stage masks
+        if activity_mask is not None:
+            smooth_l1 = smooth_l1 * activity_mask
+            weights = weights * activity_mask
+        if stage_weights is not None:
+            smooth_l1 = smooth_l1 * stage_weights.unsqueeze(-1)
+            weights = weights * stage_weights.unsqueeze(-1)
+        
+        # Compute weighted loss
+        num_active = (activity_mask * stage_weights.unsqueeze(-1)).sum() if activity_mask is not None else smooth_l1.numel()
+        num_active = num_active.clamp(min=self.epsilon)
+        loss = (weights * smooth_l1).sum() / num_active
+        
+        return loss
 
-def zero_prediction_loss(pred, target, threshold=0.1):
-    zero_mask = (target == 0).float()
+def zero_prediction_loss(pred, target, activity_mask, stage_weights, threshold=0.1):
+    zero_mask = (target == 0).float() * activity_mask
     non_zero_pred = torch.abs(pred) * zero_mask
-    return torch.mean(torch.relu(non_zero_pred - threshold) ** 2)
+    loss = torch.relu(non_zero_pred - threshold) ** 2
+    num_active = (zero_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1e-6)
+    return (loss * stage_weights.unsqueeze(-1)).sum() / num_active
 
 def compute_loss(transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, type_labels, param_activity_labels, true_num_stages, max_stages, device, logger):
-    # Log-cosh loss for translations and rotations
-    loss_trans = log_cosh_loss(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
-    loss_rot = log_cosh_loss(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
-    
-    # Zero-prediction loss
-    zero_trans_loss = zero_prediction_loss(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
-    zero_rot_loss = zero_prediction_loss(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
-    
-    # Activity loss
+    # Initialize loss functions
+    trans_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=5.0, gamma=0.1)  # Less aggressive for translations
+    rot_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=10.0, gamma=0.05)  # Stronger penalty for rotations
     bce = nn.BCEWithLogitsLoss(reduction='none')
-    loss_activity = bce(activity_logits, activity_labels)
-    loss_param_activity = bce(param_activity_logits, param_activity_labels)
-    
-    # Transformation type loss
     ce = nn.CrossEntropyLoss(reduction='none')
-    type_logits_flat = type_logits.view(-1, 4)
-    type_labels_flat = type_labels.view(-1)
-    loss_type = ce(type_logits_flat, type_labels_flat)
     
+    # Split transformations
+    pred_trans = transforms_sequence[:, :, :, :3]  # [batch_size, max_stages, num_teeth, 3]
+    pred_rot = transforms_sequence[:, :, :, 3:]   # [batch_size, max_stages, num_teeth, 3]
+    target_trans = targets[:, :, :, :3]
+    target_rot = targets[:, :, :, 3:]
+    trans_activity = param_activity_labels[:, :, :, :3]
+    rot_activity = param_activity_labels[:, :, :, 3:]
+    
+    # Stage weights
     batch_size = transforms_sequence.size(0)
     stage_weights = torch.zeros(batch_size, max_stages, device=device)
     for b in range(batch_size):
         stage_weights[b, :true_num_stages[b]] = 1.0
     
-    active_mask = activity_labels
-    loss_trans = (loss_trans * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
-    loss_rot = (loss_rot * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
-    zero_trans_loss = (zero_trans_loss * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
-    zero_rot_loss = (zero_rot_loss * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
-    loss_activity = (loss_activity * stage_weights.unsqueeze(-1)).mean()
-    loss_param_activity = (loss_param_activity * stage_weights.unsqueeze(-1).unsqueeze(-1)).mean()
-    loss_type = (loss_type.view(batch_size, max_stages, -1) * stage_weights.unsqueeze(-1)).mean()
+    # Compute transformation losses
+    loss_trans = trans_loss_fn(pred_trans, target_trans, trans_activity, stage_weights)
+    loss_rot = rot_loss_fn(pred_rot, target_rot, rot_activity, stage_weights)
     
+    # Zero-prediction losses
+    zero_trans_loss = zero_prediction_loss(pred_trans, target_trans, trans_activity, stage_weights)
+    zero_rot_loss = zero_prediction_loss(pred_rot, target_rot, rot_activity, stage_weights)
+    
+    # Activity loss
+    loss_activity = bce(activity_logits, activity_labels)
+    loss_activity = (loss_activity * stage_weights.unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).sum().clamp(min=1e-6)
+    
+    # Parameter activity loss
+    loss_param_activity = bce(param_activity_logits, param_activity_labels)
+    loss_param_activity = (loss_param_activity * stage_weights.unsqueeze(-1).unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).unsqueeze(-1).sum().clamp(min=1e-6)
+    
+    # Transformation type loss
+    type_logits_flat = type_logits.view(-1, 4)
+    type_labels_flat = type_labels.view(-1)
+    loss_type = ce(type_logits_flat, type_labels_flat)
+    loss_type = (loss_type.view(batch_size, max_stages, -1) * stage_weights.unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).sum().clamp(min=1e-6)
+    
+    # Padded loss
     padded_loss = 0.0
     for b in range(batch_size):
         true_stages = true_num_stages[b].item()
@@ -80,9 +126,11 @@ def compute_loss(transforms_sequence, activity_logits, type_logits, param_activi
             padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
     padded_loss = padded_loss / batch_size if batch_size > 0 else 0.0
     
+    # Sparsity loss
     sparsity_loss = torch.mean((transforms_sequence * (1 - param_activity_labels))**2)
     
-    tooth_errors = torch.mean(torch.abs(transforms_sequence - targets) * active_mask.unsqueeze(-1), dim=(0, 1, 3))
+    # Logging
+    tooth_errors = torch.mean(torch.abs(transforms_sequence - targets) * activity_labels.unsqueeze(-1), dim=(0, 1, 3))
     for tooth_idx in range(14):
         logger.debug(f"Tooth {tooth_idx+31}: Mean Absolute Error = {tooth_errors[tooth_idx]:.4f}")
     
@@ -96,12 +144,13 @@ def compute_loss(transforms_sequence, activity_logits, type_logits, param_activi
     logger.debug(f"Type prediction accuracy: {type_accuracy:.4f}")
     logger.debug(f"Param activity prediction accuracy: {param_activity_accuracy:.4f}")
     
+    # Combine losses
     alpha, beta, gamma, delta, epsilon, zeta, eta, theta = 10.0, 50.0, 0.1, 30.0, 10.0, 20.0, 5.0, 20.0
     total_loss = (alpha * loss_trans + beta * loss_rot + gamma * padded_loss + 
                   delta * sparsity_loss + epsilon * loss_activity + zeta * (zero_trans_loss + zero_rot_loss) + 
                   eta * loss_type + theta * loss_param_activity)
     
-    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, loss_activity, loss_type, zero_trans_loss, zero_rot_loss, loss_param_activity
+    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, activity_loss, type_loss, zero_trans_loss, zero_rot_loss, loss_param_activity
 
 def train_model(args):
     logger = setup_logging(args.log_file)

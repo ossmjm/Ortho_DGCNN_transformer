@@ -167,6 +167,9 @@ class JawTeethDataset(Dataset):
         
         transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+        rotation_columns = transform_columns[3:]  # Rotation columns
+        
+        # Log invalid values
         for col in transform_columns:
             nan_count = jaw_data[col].isna().sum()
             if nan_count > 0:
@@ -175,6 +178,13 @@ class JawTeethDataset(Dataset):
             if inf_count > 0:
                 self.logger.info(f"Jaw_ID {jaw_id}, Column {col} has {inf_count} inf values")
         
+        # Log specific invalid rotation values
+        for col in rotation_columns:
+            invalid_rows = jaw_data[jaw_data[col].isna() | jaw_data[col].isin([float('inf'), -float('inf')])]
+            if not invalid_rows.empty:
+                self.logger.warning(f"Jaw_ID {jaw_id}, Column {col} invalid values at rows: {invalid_rows.index.tolist()}")
+        
+        # Replace NaN/inf with 0
         for col in transform_columns:
             if jaw_data[col].isna().any() or jaw_data[col].isin([float('inf'), -float('inf')]).any():
                 self.logger.warning(f"Column {col} for Jaw_ID {jaw_id} contains nan/inf. Replacing with 0.")
@@ -251,7 +261,8 @@ class JawTeethDataset(Dataset):
                 ], dtype=torch.float32)
                 
                 if torch.isnan(transform_values).any() or torch.isinf(transform_values).any():
-                    self.logger.info(f"Jaw_ID {jaw_id}, Stage {stage}, Tooth_ID {tooth_id}: transform_values contains nan/inf: {transform_values.tolist()}")
+                    self.logger.warning(f"Jaw_ID {jaw_id}, Stage {stage}, Tooth_ID {tooth_id}: transform_values contains nan/inf: {transform_values.tolist()}")
+                    transform_values = torch.nan_to_num(transform_values, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 transformations[stage - 1, tooth_idx] = transform_values
         return transformations
