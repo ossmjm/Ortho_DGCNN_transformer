@@ -58,11 +58,13 @@ class WeightedSmoothL1Loss(nn.Module):
             smooth_l1 = smooth_l1 * activity_mask
             weights = weights * activity_mask
         if stage_weights is not None:
-            smooth_l1 = smooth_l1 * stage_weights.unsqueeze(-1)
-            weights = weights * stage_weights.unsqueeze(-1)
+            # Expand stage_weights to [batch_size, max_stages, 1, 1] to broadcast to [batch_size, max_stages, num_teeth, 3]
+            stage_weights_expanded = stage_weights.unsqueeze(-1).unsqueeze(-1)
+            smooth_l1 = smooth_l1 * stage_weights_expanded
+            weights = weights * stage_weights_expanded
         
         # Compute weighted loss
-        num_active = (activity_mask * stage_weights.unsqueeze(-1)).sum() if activity_mask is not None else smooth_l1.numel()
+        num_active = (activity_mask * stage_weights_expanded).sum() if activity_mask is not None and stage_weights is not None else smooth_l1.numel()
         num_active = num_active.clamp(min=self.epsilon)
         loss = (weights * smooth_l1).sum() / num_active
         
@@ -72,13 +74,14 @@ def zero_prediction_loss(pred, target, activity_mask, stage_weights, threshold=0
     zero_mask = (target == 0).float() * activity_mask
     non_zero_pred = torch.abs(pred) * zero_mask
     loss = torch.relu(non_zero_pred - threshold) ** 2
-    num_active = (zero_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1e-6)
-    return (loss * stage_weights.unsqueeze(-1)).sum() / num_active
+    stage_weights_expanded = stage_weights.unsqueeze(-1).unsqueeze(-1)
+    num_active = (zero_mask * stage_weights_expanded).sum().clamp(min=1e-6)
+    return (loss * stage_weights_expanded).sum() / num_active
 
 def compute_loss(transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, type_labels, param_activity_labels, true_num_stages, max_stages, device, logger):
     # Initialize loss functions
-    trans_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=5.0, gamma=0.1)  # Less aggressive for translations
-    rot_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=10.0, gamma=0.05)  # Stronger penalty for rotations
+    trans_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=5.0, gamma=0.1)
+    rot_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=10.0, gamma=0.05)
     bce = nn.BCEWithLogitsLoss(reduction='none')
     ce = nn.CrossEntropyLoss(reduction='none')
     
@@ -132,7 +135,7 @@ def compute_loss(transforms_sequence, activity_logits, type_logits, param_activi
     # Logging
     tooth_errors = torch.mean(torch.abs(transforms_sequence - targets) * activity_labels.unsqueeze(-1), dim=(0, 1, 3))
     for tooth_idx in range(14):
-        logger.debug(f"Tooth {tooth_idx+31}: Mean Absolute Error = {tooth_errors[tooth_idx]:.4f}")
+        logger.debug(f"Tooth {tooth_idx+31}: Mean Absolute Error = {tooth_idx+31}:.4f")
     
     activity_preds = (torch.sigmoid(activity_logits) > 0.5).float()
     activity_accuracy = (activity_preds == activity_labels).float().mean()
@@ -306,7 +309,7 @@ def train_model(args):
             
             train_loss += loss.item() * accumulation_steps
             train_trans_loss += trans_loss.item()
-            train_rot_loss += rot_loss.item()
+            train_rot_loss += trans_loss.item()
             train_padded_loss += padded_loss.item()
             train_sparsity_loss += sparsity_loss.item()
             train_activity_loss += activity_loss.item()
