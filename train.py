@@ -153,7 +153,7 @@ def compute_loss(transforms_sequence, activity_logits, type_logits, param_activi
                   delta * sparsity_loss + epsilon * loss_activity + zeta * (zero_trans_loss + zero_rot_loss) + 
                   eta * loss_type + theta * loss_param_activity)
     
-    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, activity_loss, type_loss, zero_trans_loss, zero_rot_loss, loss_param_activity
+    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, loss_activity, loss_type, zero_trans_loss, zero_rot_loss, loss_param_activity
 
 def train_model(args):
     logger = setup_logging(args.log_file)
