@@ -28,8 +28,6 @@ class JawTeethDataset(Dataset):
         self.channels = channels
         self.num_teeth = 14
         self.inference = inference
-        self.max_trans = 2.0  # Max ±2 mm
-        self.max_rot = 30.0   # Max ±30°
         
         self.logger = setup_logging(log_file)
         
@@ -46,18 +44,23 @@ class JawTeethDataset(Dataset):
         self.json_files = []
         self.transformations = []
         self.activity_labels = []
+        self.transform_types = []
+        self.param_activity_labels = []  # New: Activity labels for each transformation parameter
         for case in self.cases:
             case_dir = os.path.join(data_dir, case)
             json_file = os.path.join(case_dir, "ori", "before_treatment.json")
             transform_file = os.path.join(case_dir, "Transformations.xlsx")
             self.json_files.append(json_file)
             transformations = self._load_transformations(transform_file, case)
-            # Normalize transformations
-            transformations[:, :, :3] /= self.max_trans  # Translations
-            transformations[:, :, 3:] /= self.max_rot    # Rotations
-            # Compute activity labels (1 if any transformation is non-zero, 0 if all zeros)
             activity = torch.any(transformations != 0, dim=-1).float()  # Shape: [max_stages, num_teeth]
-            # Debug: Check for nan/inf and activity stats
+            param_activity = (transformations != 0).float()  # Shape: [max_stages, num_teeth, 6]
+            trans_only = torch.any(transformations[:, :, :3] != 0, dim=-1) & ~torch.any(transformations[:, :, 3:] != 0, dim=-1)
+            rot_only = ~torch.any(transformations[:, :, :3] != 0, dim=-1) & torch.any(transformations[:, :, 3:] != 0, dim=-1)
+            both = torch.any(transformations[:, :, :3] != 0, dim=-1) & torch.any(transformations[:, :, 3:] != 0, dim=-1)
+            transform_type = torch.zeros_like(activity, dtype=torch.long)
+            transform_type[trans_only] = 1
+            transform_type[rot_only] = 2
+            transform_type[both] = 3
             if torch.isnan(transformations).any() or torch.isinf(transformations).any():
                 self.logger.warning(f"transformations for Jaw_ID {case} contains nan/inf")
             zero_count = (activity == 0).sum().item()
@@ -66,8 +69,48 @@ class JawTeethDataset(Dataset):
             self.logger.info(f"Jaw_ID {case}: {zero_count}/{total_entries} tooth-stages are inactive ({zero_percentage:.2f}%)")
             self.transformations.append(transformations)
             self.activity_labels.append(activity)
+            self.transform_types.append(transform_type)
+            self.param_activity_labels.append(param_activity)
+            # Data augmentation: Add synthetic stages with partial transformations
+            if not inference and split == 'train':
+                active_teeth = torch.any(activity, dim=0).nonzero(as_tuple=True)[0]
+                for tooth_idx in active_teeth:
+                    active_stages = activity[:, tooth_idx].nonzero(as_tuple=True)[0]
+                    if len(active_stages) < max_stages:
+                        num_synthetic = min(5, max_stages - len(active_stages))
+                        for _ in range(num_synthetic):
+                            synthetic_transforms = torch.zeros(transformations.shape[-1])
+                            # Randomly select 1-3 parameters to be non-zero
+                            num_active_params = np.random.randint(1, 4)
+                            active_params = np.random.choice(6, num_active_params, replace=False)
+                            for param_idx in active_params:
+                                if param_idx < 3:  # Translation
+                                    synthetic_transforms[param_idx] = np.random.uniform(-15, 15)
+                                else:  # Rotation
+                                    synthetic_transforms[param_idx] = np.random.uniform(-45, 45)
+                            synthetic_activity = torch.any(synthetic_transforms != 0).float()
+                            synthetic_param_activity = (synthetic_transforms != 0).float()
+                            synthetic_type = 0
+                            if torch.any(synthetic_transforms[:3] != 0) and torch.any(synthetic_transforms[3:] != 0):
+                                synthetic_type = 3
+                            elif torch.any(synthetic_transforms[:3] != 0):
+                                synthetic_type = 1
+                            elif torch.any(synthetic_transforms[3:] != 0):
+                                synthetic_type = 2
+                            synthetic_transforms = synthetic_transforms.unsqueeze(0)
+                            synthetic_activity = synthetic_activity.unsqueeze(0)
+                            synthetic_param_activity = synthetic_param_activity.unsqueeze(0)
+                            synthetic_type = torch.tensor([synthetic_type], dtype=torch.long)
+                            self.transformations.append(torch.cat([transformations, synthetic_transforms], dim=0)[:max_stages])
+                            self.activity_labels.append(torch.cat([activity, synthetic_activity], dim=0)[:max_stages])
+                            self.transform_types.append(torch.cat([transform_type, synthetic_type], dim=0)[:max_stages])
+                            self.param_activity_labels.append(torch.cat([param_activity, synthetic_param_activity], dim=0)[:max_stages])
+                            self.json_files.append(json_file)
+                            self.cases.append(case)
         self.transformations = torch.stack(self.transformations)
         self.activity_labels = torch.stack(self.activity_labels)
+        self.transform_types = torch.stack(self.transform_types)
+        self.param_activity_labels = torch.stack(self.param_activity_labels)
 
     def _load_transformations(self, transform_file, jaw_id):
         transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
@@ -80,7 +123,7 @@ class JawTeethDataset(Dataset):
             self.logger.warning(f"No data found for Jaw_ID {jaw_id} in {transform_file}")
             return transformations
         
-        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         for col in transform_columns:
             nan_count = jaw_data[col].isna().sum()
@@ -157,7 +200,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm"]), 
+                    clean_and_convert(row["Left/Right (mm)"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
@@ -208,9 +251,13 @@ class JawTeethDataset(Dataset):
         
         transformations = self.transformations[idx]
         activity = self.activity_labels[idx]
+        transform_type = self.transform_types[idx]
+        param_activity = self.param_activity_labels[idx]
         
         self.logger.debug(f"Jaw_ID: {jaw_id}, feats shape: {np.stack(feats_list).shape}, "
-                         f"transformations shape: {transformations.shape}, activity shape: {activity.shape}, num_stages: {num_stages}")
+                         f"transformations shape: {transformations.shape}, activity shape: {activity.shape}, "
+                         f"transform_type shape: {transform_type.shape}, param_activity shape: {param_activity.shape}, "
+                         f"num_stages: {num_stages}")
         
         if self.inference:
             return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
@@ -223,7 +270,9 @@ class JawTeethDataset(Dataset):
             return (torch.tensor(np.stack(feats_list), dtype=torch.float32),
                     transformations,
                     torch.tensor(num_stages, dtype=torch.int),
-                    activity)
+                    activity,
+                    transform_type,
+                    param_activity)
     
     def preprocess_tooth_points(self, vertices, faces):
         vertices = np.array(vertices)

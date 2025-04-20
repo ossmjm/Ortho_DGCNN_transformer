@@ -24,8 +24,20 @@ class TransformHead(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(128, self.num_teeth)
         )
-        self.trans_scale = 2.0
-        self.rot_scale = 30.0
+        self.type_layers = nn.Sequential(
+            nn.Linear(self.in_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, self.num_teeth * 4)
+        )
+        self.param_activity_layers = nn.Sequential(
+            nn.Linear(self.in_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, self.num_teeth * 6)
+        )
+        self.trans_scale = nn.Parameter(torch.tensor(15.0))
+        self.rot_scale = nn.Parameter(torch.tensor(45.0))
         self._init_weights()
 
     def _init_weights(self):
@@ -34,22 +46,36 @@ class TransformHead(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Parameter):
+                nn.init.constant_(m, 1.0)
 
     def forward(self, x):
         batch_size = x.size(0)
         x = x.view(batch_size * self.max_stages, self.in_dim)
         transforms = self.transform_layers(x)
         transforms = transforms.view(batch_size, self.max_stages, self.num_teeth, 6)
-        transforms[:, :, :, :3] *= self.trans_scale
-        transforms[:, :, :, 3:] *= self.rot_scale
+        transforms[:, :, :, :3] *= self.trans_scale.abs()
+        transforms[:, :, :, 3:] *= self.rot_scale.abs()
         activity_logits = self.activity_layers(x)
         activity_logits = activity_logits.view(batch_size, self.max_stages, self.num_teeth)
+        type_logits = self.type_layers(x)
+        type_logits = type_logits.view(batch_size, self.max_stages, self.num_teeth, 4)
+        param_activity_logits = self.param_activity_layers(x)
+        param_activity_logits = param_activity_logits.view(batch_size, self.max_stages, self.num_teeth, 6)
+        
+        activity_probs = torch.sigmoid(activity_logits)
+        active_mask = (activity_probs > 0.5).float().unsqueeze(-1)
+        param_activity_probs = torch.sigmoid(param_activity_logits)
+        param_active_mask = (param_activity_probs > 0.5).float()
+        transforms = transforms * active_mask * param_active_mask
         
         logger = logging.getLogger('TrainLogger')
         logger.debug(f"TransformHead: transforms min={transforms.min().item():.4f}, max={transforms.max().item():.4f}")
         logger.debug(f"TransformHead: activity_logits min={activity_logits.min().item():.4f}, max={activity_logits.max().item():.4f}")
+        logger.debug(f"TransformHead: type_logits min={type_logits.min().item():.4f}, max={type_logits.max().item():.4f}")
+        logger.debug(f"TransformHead: param_activity_logits min={param_activity_logits.min().item():.4f}, max={param_activity_logits.max().item():.4f}")
         
-        return transforms, activity_logits
+        return transforms, activity_logits, type_logits, param_activity_logits
 
 class OrthoDGCNNModel(nn.Module):
     def __init__(self, dgcnn, transformer, max_stages, num_teeth, embed_dim, teacher_forcing=False):
@@ -79,5 +105,5 @@ class OrthoDGCNNModel(nn.Module):
             epoch=epoch, 
             total_epochs=total_epochs
         )
-        transforms_sequence, activity_logits = self.transform_head(transformer_out)
-        return transforms_sequence, activity_logits
+        transforms_sequence, activity_logits, type_logits, param_activity_logits = self.transform_head(transformer_out)
+        return transforms_sequence, activity_logits, type_logits, param_activity_logits

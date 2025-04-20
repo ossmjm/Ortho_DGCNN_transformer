@@ -26,30 +26,52 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def compute_loss(transforms_sequence, activity_logits, targets, activity_labels, true_num_stages, max_stages, device, logger):
-    transforms_sequence = torch.clamp(transforms_sequence, -45.0, 45.0)
-    targets = torch.clamp(targets, -45.0, 45.0)
+def log_cosh_loss(pred, target, amplify_threshold=0.5, amplify_factor=10.0):
+    diff = pred - target
+    loss = torch.log(torch.cosh(diff + 1e-12))
+    # Amplify small errors
+    small_error_mask = (torch.abs(diff) < amplify_threshold).float()
+    amplified_loss = loss * (1 + amplify_factor * small_error_mask)
+    return torch.mean(amplified_loss)
 
-    huber = nn.HuberLoss(reduction='none', delta=0.5)
-    loss_trans = huber(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])  # Shape: [batch_size, max_stages, num_teeth, 3]
-    loss_trans = loss_trans.mean(dim=3)  # Shape: [batch_size, max_stages, num_teeth]
+def zero_prediction_loss(pred, target, threshold=0.1):
+    zero_mask = (target == 0).float()
+    non_zero_pred = torch.abs(pred) * zero_mask
+    return torch.mean(torch.relu(non_zero_pred - threshold) ** 2)
+
+def compute_loss(transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, type_labels, param_activity_labels, true_num_stages, max_stages, device, logger):
+    # Log-cosh loss for translations and rotations
+    loss_trans = log_cosh_loss(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
+    loss_rot = log_cosh_loss(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
     
-    loss_rot = huber(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])  # Shape: [batch_size, max_stages, num_teeth, 3]
-    loss_rot = loss_rot.mean(dim=3)  # Shape: [batch_size, max_stages, num_teeth]
+    # Zero-prediction loss
+    zero_trans_loss = zero_prediction_loss(transforms_sequence[:, :, :, :3], targets[:, :, :, :3])
+    zero_rot_loss = zero_prediction_loss(transforms_sequence[:, :, :, 3:], targets[:, :, :, 3:])
     
+    # Activity loss
     bce = nn.BCEWithLogitsLoss(reduction='none')
-    loss_activity = bce(activity_logits, activity_labels)  # Shape: [batch_size, max_stages, num_teeth]
+    loss_activity = bce(activity_logits, activity_labels)
+    loss_param_activity = bce(param_activity_logits, param_activity_labels)
+    
+    # Transformation type loss
+    ce = nn.CrossEntropyLoss(reduction='none')
+    type_logits_flat = type_logits.view(-1, 4)
+    type_labels_flat = type_labels.view(-1)
+    loss_type = ce(type_logits_flat, type_labels_flat)
     
     batch_size = transforms_sequence.size(0)
     stage_weights = torch.zeros(batch_size, max_stages, device=device)
     for b in range(batch_size):
         stage_weights[b, :true_num_stages[b]] = 1.0
     
-    # Mask losses for inactive teeth
-    active_mask = activity_labels  # Shape: [batch_size, max_stages, num_teeth]
+    active_mask = activity_labels
     loss_trans = (loss_trans * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
     loss_rot = (loss_rot * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
+    zero_trans_loss = (zero_trans_loss * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
+    zero_rot_loss = (zero_rot_loss * active_mask * stage_weights.unsqueeze(-1)).sum() / (active_mask * stage_weights.unsqueeze(-1)).sum().clamp(min=1)
     loss_activity = (loss_activity * stage_weights.unsqueeze(-1)).mean()
+    loss_param_activity = (loss_param_activity * stage_weights.unsqueeze(-1).unsqueeze(-1)).mean()
+    loss_type = (loss_type.view(batch_size, max_stages, -1) * stage_weights.unsqueeze(-1)).mean()
     
     padded_loss = 0.0
     for b in range(batch_size):
@@ -58,7 +80,7 @@ def compute_loss(transforms_sequence, activity_logits, targets, activity_labels,
             padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
     padded_loss = padded_loss / batch_size if batch_size > 0 else 0.0
     
-    sparsity_loss = torch.mean((transforms_sequence * (1 - activity_labels).unsqueeze(-1))**2)  # Penalize non-zero predictions for inactive teeth
+    sparsity_loss = torch.mean((transforms_sequence * (1 - param_activity_labels))**2)
     
     tooth_errors = torch.mean(torch.abs(transforms_sequence - targets) * active_mask.unsqueeze(-1), dim=(0, 1, 3))
     for tooth_idx in range(14):
@@ -66,12 +88,20 @@ def compute_loss(transforms_sequence, activity_logits, targets, activity_labels,
     
     activity_preds = (torch.sigmoid(activity_logits) > 0.5).float()
     activity_accuracy = (activity_preds == activity_labels).float().mean()
+    type_preds = torch.argmax(type_logits, dim=-1)
+    type_accuracy = (type_preds == type_labels).float().mean()
+    param_activity_preds = (torch.sigmoid(param_activity_logits) > 0.5).float()
+    param_activity_accuracy = (param_activity_preds == param_activity_labels).float().mean()
     logger.debug(f"Activity prediction accuracy: {activity_accuracy:.4f}")
+    logger.debug(f"Type prediction accuracy: {type_accuracy:.4f}")
+    logger.debug(f"Param activity prediction accuracy: {param_activity_accuracy:.4f}")
     
-    alpha, beta, gamma, delta, epsilon = 10.0, 50.0, 0.1, 10.0, 2.0
-    total_loss = alpha * loss_trans + beta * loss_rot + gamma * padded_loss + delta * sparsity_loss + epsilon * loss_activity
+    alpha, beta, gamma, delta, epsilon, zeta, eta, theta = 10.0, 50.0, 0.1, 30.0, 10.0, 20.0, 5.0, 20.0
+    total_loss = (alpha * loss_trans + beta * loss_rot + gamma * padded_loss + 
+                  delta * sparsity_loss + epsilon * loss_activity + zeta * (zero_trans_loss + zero_rot_loss) + 
+                  eta * loss_type + theta * loss_param_activity)
     
-    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, loss_activity
+    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, loss_activity, loss_type, zero_trans_loss, zero_rot_loss, loss_param_activity
 
 def train_model(args):
     logger = setup_logging(args.log_file)
@@ -124,9 +154,9 @@ def train_model(args):
     model = OrthoDGCNNModel(
         dgcnn, 
         transformer, 
-        max_stages=args.max_stages, 
-        num_teeth=14, 
-        embed_dim=args.embed_dim, 
+        max_stages=args.max_stages,
+        num_teeth=14,
+        embed_dim=args.embed_dim,
         teacher_forcing=args.teacher_forcing
     ).to(device)
     
@@ -161,12 +191,19 @@ def train_model(args):
         train_padded_loss = 0
         train_sparsity_loss = 0
         train_activity_loss = 0
+        train_type_loss = 0
+        train_zero_trans_loss = 0
+        train_zero_rot_loss = 0
+        train_param_activity_loss = 0
         optimizer.zero_grad(set_to_none=True)
         
         tf_prob = max(0.0, 1.0 - epoch / (args.epochs * 0.75)) if args.teacher_forcing else 0.0
         
-        for batch_idx, (cordinates, targets, true_num_stages, activity_labels) in enumerate(train_loader):
-            cordinates, targets, true_num_stages, activity_labels = cordinates.to(device), targets.to(device), true_num_stages.to(device), activity_labels.to(device)
+        for batch_idx, (cordinates, targets, true_num_stages, activity_labels, type_labels, param_activity_labels) in enumerate(train_loader):
+            cordinates, targets, true_num_stages, activity_labels, type_labels, param_activity_labels = (
+                cordinates.to(device), targets.to(device), true_num_stages.to(device), 
+                activity_labels.to(device), type_labels.to(device), param_activity_labels.to(device)
+            )
             
             if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
                 logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
@@ -176,9 +213,15 @@ def train_model(args):
             if torch.isnan(activity_labels).any() or torch.isinf(activity_labels).any():
                 logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: activity_labels contains nan/inf")
                 activity_labels = torch.nan_to_num(activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
+            if torch.isnan(type_labels).any() or torch.isinf(type_labels).any():
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: type_labels contains nan/inf")
+                type_labels = torch.nan_to_num(type_labels, nan=0, posinf=0, neginf=0)
+            if torch.isnan(param_activity_labels).any() or torch.isinf(param_activity_labels).any():
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_labels contains nan/inf")
+                param_activity_labels = torch.nan_to_num(param_activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
             
             with torch.amp.autocast('cuda'):
-                transforms_sequence, activity_logits = model(
+                transforms_sequence, activity_logits, type_logits, param_activity_logits = model(
                     cordinates, 
                     targets=targets if torch.rand(1).item() < tf_prob else None,
                     epoch=epoch, 
@@ -191,9 +234,16 @@ def train_model(args):
                 if torch.isnan(activity_logits).any() or torch.isinf(activity_logits).any():
                     logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: activity_logits contains nan/inf")
                     continue
+                if torch.isnan(type_logits).any() or torch.isinf(type_logits).any():
+                    logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: type_logits contains nan/inf")
+                    continue
+                if torch.isnan(param_activity_logits).any() or torch.isinf(param_activity_logits).any():
+                    logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_logits contains nan/inf")
+                    continue
                 
-                loss, trans_loss, rot_loss, padded_loss, sparsity_loss, activity_loss = compute_loss(
-                    transforms_sequence, activity_logits, targets, activity_labels, true_num_stages, args.max_stages, device, logger
+                loss, trans_loss, rot_loss, padded_loss, sparsity_loss, activity_loss, type_loss, zero_trans_loss, zero_rot_loss, param_activity_loss = compute_loss(
+                    transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, 
+                    type_labels, param_activity_labels, true_num_stages, args.max_stages, device, logger
                 )
                 loss = loss / accumulation_steps
             
@@ -211,11 +261,17 @@ def train_model(args):
             train_padded_loss += padded_loss.item()
             train_sparsity_loss += sparsity_loss.item()
             train_activity_loss += activity_loss.item()
+            train_type_loss += type_loss.item()
+            train_zero_trans_loss += zero_trans_loss.item()
+            train_zero_rot_loss += zero_rot_loss.item()
+            train_param_activity_loss += param_activity_loss.item()
             
             logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: Total Loss = {loss.item() * accumulation_steps:.6f}, "
                        f"Translation Loss = {trans_loss.item():.6f}, Rotation Loss = {rot_loss.item():.6f}, "
+                       f"Zero Translation Loss = {zero_trans_loss.item():.6f}, Zero Rotation Loss = {zero_rot_loss.item():.6f}, "
                        f"Padded Loss = {padded_loss.item():.6f}, Sparsity Loss = {sparsity_loss.item():.6f}, "
-                       f"Activity Loss = {activity_loss.item():.6f}, TF Prob = {tf_prob:.2f}")
+                       f"Activity Loss = {activity_loss.item():.6f}, Type Loss = {type_loss.item():.6f}, "
+                       f"Param Activity Loss = {param_activity_loss.item():.6f}, TF Prob = {tf_prob:.2f}")
         
         avg_train_loss = train_loss / len(train_loader)
         avg_trans_loss = train_trans_loss / len(train_loader)
@@ -223,10 +279,16 @@ def train_model(args):
         avg_padded_loss = train_padded_loss / len(train_loader)
         avg_sparsity_loss = train_sparsity_loss / len(train_loader)
         avg_activity_loss = train_activity_loss / len(train_loader)
+        avg_type_loss = train_type_loss / len(train_loader)
+        avg_zero_trans_loss = train_zero_trans_loss / len(train_loader)
+        avg_zero_rot_loss = train_zero_rot_loss / len(train_loader)
+        avg_param_activity_loss = train_param_activity_loss / len(train_loader)
         logger.info(f"Epoch {epoch+1}/{args.epochs}, Train Total Loss: {avg_train_loss:.4f}, "
                    f"Train Translation Loss: {avg_trans_loss:.4f}, Train Rotation Loss: {avg_rot_loss:.4f}, "
+                   f"Train Zero Translation Loss: {avg_zero_trans_loss:.4f}, Train Zero Rotation Loss: {avg_zero_rot_loss:.4f}, "
                    f"Train Padded Loss: {avg_padded_loss:.4f}, Train Sparsity Loss: {avg_sparsity_loss:.4f}, "
-                   f"Train Activity Loss: {avg_activity_loss:.4f}")
+                   f"Train Activity Loss: {avg_activity_loss:.4f}, Train Type Loss: {avg_type_loss:.4f}, "
+                   f"Train Param Activity Loss: {avg_param_activity_loss:.4f}")
         
         model.eval()
         test_loss = 0
@@ -235,9 +297,16 @@ def train_model(args):
         test_padded_loss = 0
         test_sparsity_loss = 0
         test_activity_loss = 0
+        test_type_loss = 0
+        test_zero_trans_loss = 0
+        test_zero_rot_loss = 0
+        test_param_activity_loss = 0
         with torch.no_grad():
-            for batch_idx, (cordinates, targets, true_num_stages, activity_labels) in enumerate(test_loader):
-                cordinates, targets, true_num_stages, activity_labels = cordinates.to(device), targets.to(device), true_num_stages.to(device), activity_labels.to(device)
+            for batch_idx, (cordinates, targets, true_num_stages, activity_labels, type_labels, param_activity_labels) in enumerate(test_loader):
+                cordinates, targets, true_num_stages, activity_labels, type_labels, param_activity_labels = (
+                    cordinates.to(device), targets.to(device), true_num_stages.to(device), 
+                    activity_labels.to(device), type_labels.to(device), param_activity_labels.to(device)
+                )
                 
                 if torch.isnan(cordinates).any() or torch.isinf(cordinates).any():
                     logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: cordinates contains nan/inf")
@@ -247,9 +316,15 @@ def train_model(args):
                 if torch.isnan(activity_labels).any() or torch.isinf(activity_labels).any():
                     logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: activity_labels contains nan/inf")
                     activity_labels = torch.nan_to_num(activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
+                if torch.isnan(type_labels).any() or torch.isinf(type_labels).any():
+                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: type_labels contains nan/inf")
+                    type_labels = torch.nan_to_num(type_labels, nan=0, posinf=0, neginf=0)
+                if torch.isnan(param_activity_labels).any() or torch.isinf(param_activity_labels).any():
+                    logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_labels contains nan/inf")
+                    param_activity_labels = torch.nan_to_num(param_activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 with torch.amp.autocast('cuda'):
-                    transforms_sequence, activity_logits = model(cordinates)
+                    transforms_sequence, activity_logits, type_logits, param_activity_logits = model(cordinates)
                     
                     if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
                         logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
@@ -257,9 +332,16 @@ def train_model(args):
                     if torch.isnan(activity_logits).any() or torch.isinf(activity_logits).any():
                         logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: activity_logits contains nan/inf")
                         continue
+                    if torch.isnan(type_logits).any() or torch.isinf(type_logits).any():
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: type_logits contains nan/inf")
+                        continue
+                    if torch.isnan(param_activity_logits).any() or torch.isinf(param_activity_logits).any():
+                        logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_logits contains nan/inf")
+                        continue
                     
-                    loss, trans_loss, rot_loss, padded_loss, sparsity_loss, activity_loss = compute_loss(
-                        transforms_sequence, activity_logits, targets, activity_labels, true_num_stages, args.max_stages, device, logger
+                    loss, trans_loss, rot_loss, padded_loss, sparsity_loss, activity_loss, type_loss, zero_trans_loss, zero_rot_loss, param_activity_loss = compute_loss(
+                        transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, 
+                        type_labels, param_activity_labels, true_num_stages, args.max_stages, device, logger
                     )
                 
                 test_loss += loss.item()
@@ -268,6 +350,10 @@ def train_model(args):
                 test_padded_loss += padded_loss.item()
                 test_sparsity_loss += sparsity_loss.item()
                 test_activity_loss += activity_loss.item()
+                test_type_loss += type_loss.item()
+                test_zero_trans_loss += zero_trans_loss.item()
+                test_zero_rot_loss += zero_rot_loss.item()
+                test_param_activity_loss += param_activity_loss.item()
         
         avg_test_loss = test_loss / len(test_loader)
         avg_test_trans_loss = test_trans_loss / len(test_loader)
@@ -275,10 +361,16 @@ def train_model(args):
         avg_test_padded_loss = test_padded_loss / len(test_loader)
         avg_test_sparsity_loss = test_sparsity_loss / len(test_loader)
         avg_test_activity_loss = test_activity_loss / len(test_loader)
+        avg_test_type_loss = test_type_loss / len(test_loader)
+        avg_test_zero_trans_loss = test_zero_trans_loss / len(test_loader)
+        avg_test_zero_rot_loss = test_zero_rot_loss / len(test_loader)
+        avg_test_param_activity_loss = test_param_activity_loss / len(test_loader)
         logger.info(f"Epoch {epoch+1}/{args.epochs}, Test Total Loss: {avg_test_loss:.4f}, "
                    f"Test Translation Loss: {avg_test_trans_loss:.4f}, Test Rotation Loss: {avg_test_rot_loss:.4f}, "
+                   f"Test Zero Translation Loss: {avg_test_zero_trans_loss:.4f}, Test Zero Rotation Loss: {avg_test_zero_rot_loss:.4f}, "
                    f"Test Padded Loss: {avg_test_padded_loss:.4f}, Test Sparsity Loss: {avg_test_sparsity_loss:.4f}, "
-                   f"Test Activity Loss: {avg_test_activity_loss:.4f}")
+                   f"Test Activity Loss: {avg_test_activity_loss:.4f}, Test Type Loss: {avg_test_type_loss:.4f}, "
+                   f"Test Param Activity Loss: {avg_test_param_activity_loss:.4f}")
         
         if args.early_stopping:
             if avg_test_loss < best_test_loss:

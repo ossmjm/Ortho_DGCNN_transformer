@@ -28,7 +28,7 @@ class StageTransformer(nn.Module):
             nn.Dropout(0.3)
         )
         self.out_layer = nn.Linear(d_model, self.num_teeth * 6)
-        self.positional_encoding = nn.Parameter(torch.zeros(1, max_stages, d_model))  # Zero-initialized
+        self.positional_encoding = nn.Parameter(torch.zeros(1, max_stages, d_model))
         self._init_weights()
 
     def _init_weights(self):
@@ -84,7 +84,6 @@ class StageTransformer(nn.Module):
             
             transformer_out = torch.cat(outputs, dim=1)
         
-        transformer_out = torch.clamp(transformer_out, -1.0, 1.0)  # Match normalized input range
         logger.debug(f"Transformer output range: min={transformer_out.min().item():.4f}, max={transformer_out.max().item():.4f}")
         
         return transformer_out
