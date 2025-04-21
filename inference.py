@@ -1,317 +1,265 @@
-import argparse
-import trimesh
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
 import os
 import logging
+import argparse
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from dataset import JawTeethDataset
+from models.OrthoDGCNN import OrthoDGCNNModel
 from models.DGCNN import DGCNN
 from models.StageTransformer import StageTransformer
-from models.OrthoDGCNN import OrthoDGCNNModel
+from train import compute_loss, WeightedSmoothL1Loss, setup_logging
+import trimesh
+from scipy.spatial.transform import Rotation
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Custom collate function to handle variable-sized vertices_list and faces_list
+def custom_collate_fn(batch):
+    # batch is a list of tuples from JawTeethDataset.__getitem__
+    # Each tuple: (cordinates, transformations, vertices_list, faces_list, num_stages, jaw_id)
+    
+    cordinates = [item[0] for item in batch]
+    transformations = [item[1] for item in batch]
+    vertices_list = [item[2] for item in batch]  # Keep as list
+    faces_list = [item[3] for item in batch]    # Keep as list
+    num_stages = [item[4] for item in batch]
+    jaw_ids = [item[5] for item in batch]
+    
+    # Use default_collate for tensors
+    cordinates = default_collate(cordinates)
+    transformations = default_collate(transformations)
+    num_stages = default_collate(num_stages)
+    
+    # jaw_ids remains a list of strings
+    return (cordinates, transformations, vertices_list, faces_list, num_stages, jaw_ids)
 
-def setup_logging(log_file):
-    logger = logging.getLogger('InferenceLogger')
-    logger.setLevel(logging.INFO)
-    file_handler = logging.FileHandler(log_file)
-    console_handler = logging.StreamHandler()
-    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(log_format)
-    console_handler.setFormatter(log_format)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
-
-class WeightedSmoothL1Loss(nn.Module):
-    def __init__(self, beta=0.5, alpha=10.0, gamma=0.05, epsilon=1e-6, max_value=100.0):
-        super(WeightedSmoothL1Loss, self).__init__()
-        self.beta = beta
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.max_value = max_value
+def rotation_matrix_from_euler(angles, order='xyz'):
+    """
+    Convert Euler angles to rotation matrix.
     
-    def forward(self, pred, target, activity_mask=None, stage_weights=None):
-        pred = torch.clamp(pred, -self.max_value, self.max_value)
-        target = torch.clamp(target, -self.max_value, self.max_value)
+    Args:
+        angles (torch.Tensor): Euler angles in degrees of shape (..., 3)
+        order (str): Order of rotation axes, e.g., 'xyz'
+    
+    Returns:
+        torch.Tensor: Rotation matrix of shape (..., 3, 3)
+    """
+    angles = torch.deg2rad(angles)
+    c = torch.cos(angles)
+    s = torch.sin(angles)
+    
+    if order == 'xyz':
+        Rx = torch.stack([
+            torch.stack([torch.ones_like(c[..., 0]), torch.zeros_like(c[..., 0]), torch.zeros_like(c[..., 0])], dim=-1),
+            torch.stack([torch.zeros_like(c[..., 0]), c[..., 0], -s[..., 0]], dim=-1),
+            torch.stack([torch.zeros_like(c[..., 0]), s[..., 0], c[..., 0]], dim=-1)
+        ], dim=-2)
         
-        diff = torch.abs(pred - target)
-        smooth_l1 = torch.where(
-            diff < self.beta,
-            0.5 * diff ** 2 / self.beta,
-            diff - 0.5 * self.beta
-        )
+        Ry = torch.stack([
+            torch.stack([c[..., 1], torch.zeros_like(c[..., 1]), s[..., 1]], dim=-1),
+            torch.stack([torch.zeros_like(c[..., 1]), torch.ones_like(c[..., 1]), torch.zeros_like(c[..., 1])], dim=-1),
+            torch.stack([-s[..., 1], torch.zeros_like(c[..., 1]), c[..., 1]], dim=-1)
+        ], dim=-2)
         
-        weights = torch.exp(-self.alpha * torch.clamp(diff, min=self.epsilon)) + self.gamma
+        Rz = torch.stack([
+            torch.stack([c[..., 2], -s[..., 2], torch.zeros_like(c[..., 2])], dim=-1),
+            torch.stack([s[..., 2], c[..., 2], torch.zeros_like(c[..., 2])], dim=-1),
+            torch.stack([torch.zeros_like(c[..., 2]), torch.zeros_like(c[..., 2]), torch.ones_like(c[..., 2])], dim=-1)
+        ], dim=-2)
         
-        if activity_mask is not None:
-            smooth_l1 = smooth_l1 * activity_mask
-            weights = weights * activity_mask
-        if stage_weights is not None:
-            stage_weights_expanded = stage_weights.unsqueeze(-1).unsqueeze(-1)
-            smooth_l1 = smooth_l1 * stage_weights_expanded
-            weights = weights * stage_weights_expanded
-        
-        num_active = (activity_mask * stage_weights_expanded).sum() if activity_mask is not None and stage_weights is not None else smooth_l1.numel()
-        num_active = num_active.clamp(min=self.epsilon)
-        loss = (weights * smooth_l1).sum() / num_active
-        
-        return loss
-
-def zero_prediction_loss(pred, target, activity_mask, stage_weights, threshold=0.1):
-    zero_mask = (target == 0).float() * activity_mask
-    non_zero_pred = torch.abs(pred) * zero_mask
-    loss = torch.relu(non_zero_pred - threshold) ** 2
-    stage_weights_expanded = stage_weights.unsqueeze(-1).unsqueeze(-1)
-    num_active = (zero_mask * stage_weights_expanded).sum().clamp(min=1e-6)
-    return (loss * stage_weights_expanded).sum() / num_active
-
-def compute_loss(transforms_sequence, activity_logits, type_logits, param_activity_logits, targets, activity_labels, type_labels, param_activity_labels, true_num_stages, max_stages, device, logger):
-    trans_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=5.0, gamma=0.1)
-    rot_loss_fn = WeightedSmoothL1Loss(beta=0.5, alpha=10.0, gamma=0.05)
-    bce = nn.BCEWithLogitsLoss(reduction='none')
-    ce = nn.CrossEntropyLoss(reduction='none')
+        R = torch.matmul(torch.matmul(Rx, Ry), Rz)
     
-    pred_trans = transforms_sequence[:, :, :, :3]
-    pred_rot = transforms_sequence[:, :, :, 3:]
-    target_trans = targets[:, :, :, :3]
-    target_rot = targets[:, :, :, 3:]
-    trans_activity = param_activity_labels[:, :, :, :3]
-    rot_activity = param_activity_labels[:, :, :, 3:]
-    
-    batch_size = transforms_sequence.size(0)
-    stage_weights = torch.zeros(batch_size, max_stages, device=device)
-    for b in range(batch_size):
-        stage_weights[b, :true_num_stages[b]] = 1.0
-    
-    loss_trans = trans_loss_fn(pred_trans, target_trans, trans_activity, stage_weights)
-    loss_rot = rot_loss_fn(pred_rot, target_rot, rot_activity, stage_weights)
-    
-    zero_trans_loss = zero_prediction_loss(pred_trans, target_trans, trans_activity, stage_weights)
-    zero_rot_loss = zero_prediction_loss(pred_rot, target_rot, rot_activity, stage_weights)
-    
-    loss_activity = bce(activity_logits, activity_labels)
-    loss_activity = (loss_activity * stage_weights.unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).sum().clamp(min=1e-6)
-    
-    loss_param_activity = bce(param_activity_logits, param_activity_labels)
-    loss_param_activity = (loss_param_activity * stage_weights.unsqueeze(-1).unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).unsqueeze(-1).sum().clamp(min=1e-6)
-    
-    type_logits_flat = type_logits.view(-1, 4)
-    type_labels_flat = type_labels.view(-1)
-    loss_type = ce(type_logits_flat, type_labels_flat)
-    loss_type = (loss_type.view(batch_size, max_stages, -1) * stage_weights.unsqueeze(-1)).sum() / stage_weights.unsqueeze(-1).sum().clamp(min=1e-6)
-    
-    padded_loss = 0.0
-    for b in range(batch_size):
-        true_stages = true_num_stages[b].item()
-        if true_stages < max_stages:
-            padded_loss += torch.mean(transforms_sequence[b, true_stages:, :, :]**2)
-    padded_loss = padded_loss / batch_size if batch_size > 0 else 0.0
-    
-    sparsity_loss = torch.mean((transforms_sequence * (1 - param_activity_labels))**2)
-    
-    tooth_errors = torch.mean(torch.abs(transforms_sequence - targets) * activity_labels.unsqueeze(-1), dim=(0, 1, 3))
-    for tooth_idx in range(14):
-        logger.debug(f"Tooth {tooth_idx+31}: Mean Absolute Error = {tooth_errors[tooth_idx]:.4f}")
-    
-    activity_preds = (torch.sigmoid(activity_logits) > 0.5).float()
-    activity_accuracy = (activity_preds == activity_labels).float().mean()
-    type_preds = torch.argmax(type_logits, dim=-1)
-    type_accuracy = (type_preds == type_labels).float().mean()
-    param_activity_preds = (torch.sigmoid(param_activity_logits) > 0.5).float()
-    param_activity_accuracy = (param_activity_preds == param_activity_labels).float().mean()
-    logger.debug(f"Batch Activity prediction accuracy: {activity_accuracy:.4f}")
-    logger.debug(f"Batch Type prediction accuracy: {type_accuracy:.4f}")
-    logger.debug(f"Batch Param Activity prediction accuracy: {param_activity_accuracy:.4f}")
-    
-    alpha, beta, gamma, delta, epsilon, zeta, eta, theta = 10.0, 50.0, 0.1, 30.0, 10.0, 20.0, 5.0, 20.0
-    total_loss = (alpha * loss_trans + beta * loss_rot + gamma * padded_loss + 
-                  delta * sparsity_loss + epsilon * loss_activity + zeta * (zero_trans_loss + zero_rot_loss) + 
-                  eta * loss_type + theta * loss_param_activity)
-    
-    return total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, loss_activity, type_loss, zero_trans_loss, zero_rot_loss, loss_param_activity
+    return R
 
 def apply_transformations(vertices_list, transforms_sequence, activity_logits, param_activity_logits, logger):
-    activity_probs = torch.sigmoid(activity_logits).cpu().numpy()
-    param_activity_probs = torch.sigmoid(param_activity_logits).cpu().numpy()
-    transforms_sequence = transforms_sequence.cpu().numpy()
-    inactive_mask = activity_probs < 0.5
-    param_inactive_mask = param_activity_probs < 0.5
-    transforms_sequence[inactive_mask] = 0
-    transforms_sequence[param_inactive_mask] = 0
+    """
+    Apply predicted transformations to the vertices for each tooth and stage.
     
-    stages_vertices = []
-    batch_size = transforms_sequence.shape[0]
-    num_teeth = 14
-    FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
-                    "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
-    INDEX_TO_FDI = {v: k for k, v in FDI_TO_INDEX.items()}
+    Args:
+        vertices_list (list): List of vertex arrays for each batch and tooth
+        transforms_sequence (torch.Tensor): Predicted transformations of shape (batch_size, max_stages, num_teeth, 6)
+        activity_logits (torch.Tensor): Activity logits of shape (batch_size, max_stages, num_teeth)
+        param_activity_logits (torch.Tensor): Parameter activity logits of shape (batch_size, max_stages, num_teeth, 6)
+        logger (logging.Logger): Logger for debugging
+    
+    Returns:
+        list: List of transformed vertices for each batch, stage, and tooth
+    """
+    batch_size, max_stages, num_teeth, _ = transforms_sequence.shape
+    activity_probs = torch.sigmoid(activity_logits) > 0.5
+    param_activity_probs = torch.sigmoid(param_activity_logits) > 0.5
+    
+    all_stages_vertices = []
     
     for batch_idx in range(batch_size):
-        jaw_stages = []
-        current_vertices = [None] * num_teeth
-        for tooth_idx in range(num_teeth):
-            try:
-                vertices = vertices_list[batch_idx][tooth_idx]
-                if vertices is not None and len(vertices) > 0:
-                    current_vertices[tooth_idx] = np.array(vertices)
-                else:
-                    current_vertices[tooth_idx] = np.zeros((4096, 3))
-                    logger.warning(f"Batch {batch_idx}, Tooth {INDEX_TO_FDI[tooth_idx]}: Missing vertices, using zero placeholder")
-            except (IndexError, TypeError):
-                current_vertices[tooth_idx] = np.zeros((4096, 3))
-                logger.warning(f"Batch {batch_idx}, Tooth {INDEX_TO_FDI[tooth_idx]}: Missing vertices, using zero placeholder")
-        
-        for stage_idx in range(transforms_sequence.shape[1]):
+        batch_vertices = []
+        for stage_idx in range(max_stages):
             stage_vertices = []
-            stage_transforms = np.round(transforms_sequence[batch_idx][stage_idx], 2)
             for tooth_idx in range(num_teeth):
-                if current_vertices[tooth_idx].sum() == 0:
-                    stage_vertices.append(current_vertices[tooth_idx])
+                if not activity_probs[batch_idx, stage_idx, tooth_idx]:
+                    stage_vertices.append(vertices_list[batch_idx][tooth_idx])
                     continue
-                verts = current_vertices[tooth_idx].copy()
-                transform = stage_transforms[tooth_idx]
-                centroid = np.mean(verts, axis=0)
-                translation = transform[:3]
-                verts += translation
-                rotations = np.radians(transform[3:])
-                if rotations[0] != 0:
-                    rot_x = trimesh.transformations.rotation_matrix(rotations[0], [1, 0, 0], point=centroid)
-                    verts = trimesh.transformations.transform_points(verts, rot_x)
-                if rotations[1] != 0:
-                    rot_y = trimesh.transformations.rotation_matrix(rotations[1], [0, 1, 0], point=centroid)
-                    verts = trimesh.transformations.transform_points(verts, rot_y)
-                if rotations[2] != 0:
-                    rot_z = trimesh.transformations.rotation_matrix(rotations[2], [0, 0, 1], point=centroid)
-                    verts = trimesh.transformations.transform_points(verts, rot_z)
-                stage_vertices.append(verts)
-                current_vertices[tooth_idx] = verts
-            jaw_stages.append(stage_vertices)
-        stages_vertices.append(jaw_stages)
-    return stages_vertices
-
-def save_transformations(transforms_sequence, activity_logits, param_activity_logits, output_dir, logger):
-    os.makedirs(output_dir, exist_ok=True)
-    activity_probs = torch.sigmoid(activity_logits).cpu().numpy()
-    param_activity_probs = torch.sigmoid(param_activity_logits).cpu().numpy()
-    transforms_sequence = transforms_sequence.cpu().numpy()
-    inactive_mask = activity_probs < 0.5
-    param_inactive_mask = param_activity_probs < 0.5
-    transforms_sequence[inactive_mask] = 0
-    transforms_sequence[param_inactive_mask] = 0
+                
+                vertices = torch.tensor(vertices_list[batch_idx][tooth_idx], dtype=torch.float32, device=transforms_sequence.device)
+                trans = transforms_sequence[batch_idx, stage_idx, tooth_idx, :3]
+                rot = transforms_sequence[batch_idx, stage_idx, tooth_idx, 3:]
+                
+                for param_idx in range(6):
+                    if not param_activity_probs[batch_idx, stage_idx, tooth_idx, param_idx]:
+                        if param_idx < 3:
+                            trans[param_idx] = 0.0
+                        else:
+                            rot[param_idx - 3] = 0.0
+                
+                R = rotation_matrix_from_euler(rot, order='xyz')
+                transformed_vertices = vertices @ R.transpose(-1, -2) + trans
+                stage_vertices.append(transformed_vertices.cpu().numpy())
+            
+            batch_vertices.append(stage_vertices)
+        all_stages_vertices.append(batch_vertices)
     
-    batch_size = transforms_sequence.shape[0]
-    for batch_idx in range(batch_size):
-        for stage_idx in range(transforms_sequence.shape[1]):
-            transform_matrix = np.round(transforms_sequence[batch_idx][stage_idx], 2)
-            output_path = f"{output_dir}/jaw_{batch_idx}_stage_{stage_idx+1}_transform.txt"
-            np.savetxt(output_path, transform_matrix)
-            logger.info(f"Saved transformation matrix to {output_path}")
+    return all_stages_vertices
 
 def generate_stl_files(stages_vertices, faces_list, true_num_stages, output_dir, logger):
-    os.makedirs(output_dir, exist_ok=True)
-    num_teeth = 14
-    FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
-                    "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
-    INDEX_TO_FDI = {v: k for k, v in FDI_TO_INDEX.items()}
+    """
+    Generate STL files for each stage, tooth, and batch.
     
-    for batch_idx, jaw_stages in enumerate(stages_vertices):
-        batch_faces = faces_list[batch_idx]
-        true_stages = true_num_stages[batch_idx].item()
-        for stage_idx in range(true_stages):
-            all_vertices = []
-            all_faces = []
-            vertex_offset = 0
-            for tooth_idx in range(num_teeth):
-                tooth_vertices = jaw_stages[stage_idx][tooth_idx]
-                try:
-                    tooth_faces = batch_faces[tooth_idx]
-                    if tooth_faces is None or len(tooth_faces) == 0 or tooth_vertices.sum() == 0:
-                        logger.warning(f"Batch {batch_idx}, Tooth {INDEX_TO_FDI[tooth_idx]}, Stage {stage_idx+1}: Skipping STL due to missing faces or vertices")
-                        continue
-                except (IndexError, TypeError):
-                    logger.warning(f"Batch {batch_idx}, Tooth {INDEX_TO_FDI[tooth_idx]}, Stage {stage_idx+1}: Skipping STL due to missing faces")
+    Args:
+        stages_vertices (list): List of transformed vertices for each batch, stage, and tooth
+        faces_list (list): List of face arrays for each batch and tooth
+        true_num_stages (list): List of true number of stages for each batch
+        output_dir (str): Directory to save STL files
+        logger (logging.Logger): Logger for debugging
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for batch_idx, (batch_vertices, batch_faces, num_stages) in enumerate(zip(stages_vertices, faces_list, true_num_stages)):
+        for stage_idx in range(num_stages.item()):
+            for tooth_idx in range(len(batch_vertices[stage_idx])):
+                vertices = batch_vertices[stage_idx][tooth_idx]
+                faces = batch_faces[tooth_idx]
+                
+                if len(faces) == 0 or len(vertices) == 0:
+                    logger.warning(f"Batch {batch_idx+1}, Stage {stage_idx+1}, Tooth {tooth_idx+31}: Empty vertices or faces")
                     continue
-                all_vertices.append(tooth_vertices)
-                adjusted_faces = tooth_faces + vertex_offset
-                all_faces.append(adjusted_faces)
-                vertex_offset += len(tooth_vertices)
-            
-            if not all_vertices or not all_faces:
-                logger.warning(f"Batch {batch_idx}, Stage {stage_idx+1}: No valid vertices or faces, skipping STL")
-                continue
-            
-            all_vertices = np.concatenate(all_vertices, axis=0)
-            all_faces = np.concatenate(all_faces, axis=0)
-            
-            stage_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces)
-            output_path = f"{output_dir}/jaw_{batch_idx}_stage_{stage_idx+1}.stl"
-            stage_mesh.export(output_path)
-            logger.info(f"Saved STL file to {output_path}")
+                
+                mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                output_path = os.path.join(output_dir, f'jaw_{batch_idx}_stage_{stage_idx+1}_tooth_{tooth_idx+31}.stl')
+                mesh.export(output_path)
+                logger.info(f"Saved STL file: {output_path}")
 
-def save_transformations_excel(transforms_sequence, activity_logits, type_logits, param_activity_logits, output_dir, jaw_ids=None, true_num_stages=None, logger=None):
+def save_transformations(transforms_sequence, activity_logits, param_activity_logits, output_dir, logger):
+    """
+    Save transformation matrices for each stage and tooth.
+    
+    Args:
+        transforms_sequence (torch.Tensor): Predicted transformations of shape (batch_size, max_stages, num_teeth, 6)
+        activity_logits (torch.Tensor): Activity logits of shape (batch_size, max_stages, num_teeth)
+        param_activity_logits (torch.Tensor): Parameter activity logits of shape (batch_size, max_stages, num_teeth, 6)
+        output_dir (str): Directory to save transformation files
+        logger (logging.Logger): Logger for debugging
+    """
     os.makedirs(output_dir, exist_ok=True)
-    FDI_TO_INDEX = {"31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
-                    "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13}
-    INDEX_TO_FDI = {v: k for k, v in FDI_TO_INDEX.items()}
-    TYPE_TO_STR = {0: "None", 1: "Translation", 2: "Rotation", 3: "Both"}
-    
-    activity_probs = torch.sigmoid(activity_logits).cpu().numpy()
-    param_activity_probs = torch.sigmoid(param_activity_logits).cpu().numpy()
-    transforms_sequence = transforms_sequence.cpu().numpy()
-    type_preds = torch.argmax(type_logits, dim=-1).cpu().numpy()
-    inactive_mask = activity_probs < 0.5
-    param_inactive_mask = param_activity_probs < 0.5
-    transforms_sequence[inactive_mask] = 0
-    transforms_sequence[param_inactive_mask] = 0
-    
-    batch_size = transforms_sequence.shape[0]
-    output_paths = []
+    batch_size, max_stages, num_teeth, _ = transforms_sequence.shape
+    activity_probs = torch.sigmoid(activity_logits) > 0.5
+    param_activity_probs = torch.sigmoid(param_activity_logits) > 0.5
     
     for batch_idx in range(batch_size):
-        all_data = []
-        jaw_id = jaw_ids[batch_idx] if jaw_ids else f"Jaw_{batch_idx:03d}"
-        true_stages = true_num_stages[batch_idx].item() if true_num_stages is not None else transforms_sequence.shape[1]
-        
-        for stage_idx in range(true_stages):
-            stage_transforms = np.round(transforms_sequence[batch_idx][stage_idx], 2)
-            stage_activity = activity_probs[batch_idx][stage_idx]
-            stage_types = type_preds[batch_idx][stage_idx]
-            stage_param_activity = param_activity_probs[batch_idx][stage_idx]
-            
-            for tooth_idx in range(transforms_sequence.shape[2]):
-                tooth_id = INDEX_TO_FDI[tooth_idx]
-                transform = stage_transforms[tooth_idx]
-                is_active = stage_activity[tooth_idx] >= 0.5
-                transform_type = TYPE_TO_STR[stage_types[tooth_idx]]
-                param_active = stage_param_activity[tooth_idx] >= 0.5
-                
-                data_row = {
-                    "Jaw_ID": jaw_id,
-                    "Stage": stage_idx + 1,
-                    "Tooth_ID": tooth_id,
-                    "Left/Right (mm)": transform[0] if param_active[0] else 0,
-                    "Forward/Backward (mm)": transform[1] if param_active[1] else 0,
-                    "Extrude/Intrude (mm)": transform[2] if param_active[2] else 0,
-                    "Buccal/Lingual (degrees)": transform[3] if param_active[3] else 0,
-                    "Mesial/Distal (degrees)": transform[4] if param_active[4] else 0,
-                    "Rotation (degrees)": transform[5] if param_active[5] else 0,
-                    "Is_Active": is_active,
-                    "Transform_Type": transform_type
-                }
-                all_data.append(data_row)
-        
-        df = pd.DataFrame(all_data)
-        output_path = os.path.join(output_dir, f"{jaw_id}_transformations.xlsx")
-        df.to_excel(output_path, index=False)
-        output_paths.append(output_path)
-        logger.info(f"Saved transformations to {output_path}")
+        for stage_idx in range(max_stages):
+            output_path = os.path.join(output_dir, f'jaw_{batch_idx}_stage_{stage_idx+1}_transform.txt')
+            with open(output_path, 'w') as f:
+                for tooth_idx in range(num_teeth):
+                    if not activity_probs[batch_idx, stage_idx, tooth_idx]:
+                        f.write(f"Tooth {tooth_idx+31}: Inactive\n")
+                        continue
+                    
+                    trans = transforms_sequence[batch_idx, stage_idx, tooth_idx, :3]
+                    rot = transforms_sequence[batch_idx, stage_idx, tooth_idx, 3:]
+                    
+                    for param_idx in range(6):
+                        if not param_activity_probs[batch_idx, stage_idx, tooth_idx, param_idx]:
+                            if param_idx < 3:
+                                trans[param_idx] = 0.0
+                            else:
+                                rot[param_idx - 3] = 0.0
+                    
+                    R = rotation_matrix_from_euler(rot, order='xyz')
+                    T = torch.eye(4, device=R.device)
+                    T[:3, :3] = R
+                    T[:3, 3] = trans
+                    
+                    f.write(f"Tooth {tooth_idx+31}:\n")
+                    np.savetxt(f, T.cpu().numpy(), fmt='%.6f')
+                    f.write("\n")
+            logger.info(f"Saved transformations: {output_path}")
+
+def save_transformations_excel(transforms_sequence, activity_logits, type_logits, param_activity_logits, output_dir, jaw_ids, true_num_stages, logger):
+    """
+    Save transformations to Excel files for each jaw.
     
-    return output_paths
+    Args:
+        transforms_sequence (torch.Tensor): Predicted transformations of shape (batch_size, max_stages, num_teeth, 6)
+        activity_logits (torch.Tensor): Activity logits of shape (batch_size, max_stages, num_teeth)
+        type_logits (torch.Tensor): Type logits of shape (batch_size, max_stages, num_teeth, 4)
+        param_activity_logits (torch.Tensor): Parameter activity logits of shape (batch_size, max_stages, num_teeth, 6)
+        output_dir (str): Directory to save Excel files
+        jaw_ids (list): List of jaw IDs
+        true_num_stages (torch.Tensor): True number of stages for each batch
+        logger (logging.Logger): Logger for debugging
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    batch_size, max_stages, num_teeth, _ = transforms_sequence.shape
+    activity_probs = torch.sigmoid(activity_logits) > 0.5
+    type_probs = torch.softmax(type_logits, dim=-1)
+    type_predictions = torch.argmax(type_probs, dim=-1)
+    param_activity_probs = torch.sigmoid(param_activity_logits) > 0.5
+    
+    type_map = {0: 'None', 1: 'Translation', 2: 'Rotation', 3: 'Both'}
+    
+    for batch_idx in range(batch_size):
+        jaw_id = jaw_ids[batch_idx]
+        num_stages = true_num_stages[batch_idx].item()
+        
+        data = []
+        for stage_idx in range(num_stages):
+            for tooth_idx in range(num_teeth):
+                if not activity_probs[batch_idx, stage_idx, tooth_idx]:
+                    trans = torch.zeros(3, device=transforms_sequence.device)
+                    rot = torch.zeros(3, device=transforms_sequence.device)
+                else:
+                    trans = transforms_sequence[batch_idx, stage_idx, tooth_idx, :3]
+                    rot = transforms_sequence[batch_idx, stage_idx, tooth_idx, 3:]
+                    
+                    for param_idx in range(6):
+                        if not param_activity_probs[batch_idx, stage_idx, tooth_idx, param_idx]:
+                            if param_idx < 3:
+                                trans[param_idx] = 0.0
+                            else:
+                                rot[param_idx - 3] = 0.0
+                
+                is_active = activity_probs[batch_idx, stage_idx, tooth_idx].item()
+                transform_type = type_map[type_predictions[batch_idx, stage_idx, tooth_idx].item()]
+                
+                data.append({
+                    'Jaw_ID': jaw_id,
+                    'Stage': stage_idx + 1,
+                    'Tooth_ID': tooth_idx + 31,
+                    'Left/Right (mm)': round(trans[0].item(), 2),
+                    'Forward/Backward (mm)': round(trans[1].item(), 2),
+                    'Extrude/Intrude (mm)': round(trans[2].item(), 2),
+                    'Buccal/Lingual (degrees)': round(rot[0].item(), 2),
+                    'Mesial/Distal (degrees)': round(rot[1].item(), 2),
+                    'Rotation (degrees)': round(rot[2].item(), 2),
+                    'Is_Active': is_active,
+                    'Transform_Type': transform_type
+                })
+        
+        df = pd.DataFrame(data)
+        output_path = os.path.join(output_dir, f'{jaw_id}_transformations.xlsx')
+        df.to_excel(output_path, index=False)
+        logger.info(f"Saved Excel file: {output_path}")
 
 def main(args):
     logger = setup_logging(args.log_file)
@@ -338,7 +286,7 @@ def main(args):
         inference=True,
         log_file=args.log_file
     )
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn)
     logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Number of batches: {len(data_loader)}")
     
@@ -477,23 +425,21 @@ def main(args):
                        f"Param Activity Loss: {avg_param_activity_loss:.4f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run inference with OrthoDGCNN model.")
-    parser.add_argument('--data_dir', type=str, required=True, help="Directory containing the dataset")
-    parser.add_argument('--model_path', type=str, required=True, help="Path to the trained model")
-    parser.add_argument('--output_dir', type=str, default="inference_output", help="Directory to save outputs")
-    parser.add_argument('--max_stages', type=int, default=25, help="Maximum number of stages")
-    parser.add_argument('--train_ratio', type=float, default=0.8, help="Train/test split ratio")
-    parser.add_argument('--batch_size', type=int, default=2, help="Batch size for inference")
-    parser.add_argument('--embed_dim', type=int, default=256, help="Embedding dimension")
-    parser.add_argument('--n_head', type=int, default=32, help="Number of attention heads")
-    parser.add_argument('--num_encoder_layers', type=int, default=6, help="Number of encoder layers")
-    parser.add_argument('--num_decoder_layers', type=int, default=6, help="Number of decoder layers")
-    parser.add_argument('--log_file', type=str, default="inference_log.txt", help="Path to log file")
+    parser = argparse.ArgumentParser(description="Inference for Orthodontic Transformation Prediction")
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing the dataset')
+    parser.add_argument('--model_path', type=str, default='/kaggle/working/Ortho_DGCNN_transformer/output/ortho_dgcnn.pth', help='Path to the trained model')
+    parser.add_argument('--output_dir', type=str, default='inference_output', help='Directory to save inference outputs')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for inference')
+    parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of treatment stages')
+    parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension for DGCNN')
+    parser.add_argument('--n_head', type=int, default=32, help='Number of attention heads in Transformer')
+    parser.add_argument('--num_encoder_layers', type=int, default=6, help='Number of encoder layers in Transformer')
+    parser.add_argument('--num_decoder_layers', type=int, default=6, help='Number of decoder layers in Transformer')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Ratio of data used for training')
+    parser.add_argument('--log_file', type=str, default='inference_log.txt', help='Path to the log file')
     
     args = parser.parse_args()
     
-    log_dir = os.path.dirname(args.log_file)
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
     main(args)
