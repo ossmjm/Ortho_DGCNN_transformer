@@ -159,7 +159,7 @@ class JawTeethDataset(Dataset):
                     continue
                 tooth_idx = FDI_to_idx[tooth_id]
                 transform = [
-                    row['Left/Right (mm)'], row['Forward/Backward (mm)'], row['Extrude/Intrude (mm)'],
+                    row['Left/Right (mm'], row['Forward/Backward (mm)'], row['Extrude/Intrude (mm)'],
                     row['Buccal/Lingual (degrees)'], row['Mesial/Distal (degrees)'], row['Rotation (degrees)']
                 ]
                 targets[stage - 1, tooth_idx] = torch.tensor(transform, dtype=torch.float32)
