@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import trimesh
 import logging
+import json
 from torch.utils.data import Dataset
 
 class JawTeethDataset(Dataset):
@@ -32,7 +33,15 @@ class JawTeethDataset(Dataset):
         self.data = []
         for jaw in self.jaw_list:
             jaw_path = os.path.join(data_dir, jaw)
+            json_file = os.path.join(jaw_path,'ori','before_treatment.json')
             transform_file = os.path.join(jaw_path, 'Transformations.xlsx')
+            
+            # Check for JSON file
+            if not os.path.exists(json_file):
+                self.logger.warning(f"JSON file not found for jaw {jaw}")
+                continue
+            
+            # Check for Transformations.xlsx (unless in inference mode)
             if not os.path.exists(transform_file) and not inference:
                 self.logger.warning(f"Transformations.xlsx not found for jaw {jaw}")
                 continue
@@ -43,28 +52,38 @@ class JawTeethDataset(Dataset):
                 stages = df['Stage'].unique()
                 num_stages = min(len(stages), max_stages)
             
+            # Load JSON data
+            try:
+                with open(json_file, 'r') as f:
+                    json_data = json.load(f)
+                teeth_data = json_data.get('teeth', {})
+            except Exception as e:
+                self.logger.error(f"Error loading JSON for jaw {jaw}: {e}")
+                continue
+            
             feats_list = []
             vertices_list = []
             faces_list = []
             for tooth_idx, fdi in enumerate(self.FDI_numbers):
-                stl_path = os.path.join(jaw_path, f'tooth_{fdi}.stl')
-                if not os.path.exists(stl_path):
-                    self.logger.warning(f"STL file for tooth {fdi} in jaw {jaw} not found")
+                fdi_str = str(fdi)
+                if fdi_str not in teeth_data:
+                    self.logger.warning(f"Tooth {fdi} data not found in JSON for jaw {jaw}")
                     feats_list.append(torch.zeros(2048, 13))
                     vertices_list.append(np.zeros((0, 3)))
                     faces_list.append(np.zeros((0, 3), dtype=np.int64))
                     continue
                 
                 try:
-                    mesh = trimesh.load(stl_path, force='mesh')
-                    vertices = np.array(mesh.vertices)
-                    faces = np.array(mesh.faces)
+                    tooth_data = teeth_data[fdi_str]
+                    vertices = np.array(tooth_data['v'], dtype=np.float32)
+                    faces = np.array(tooth_data['f'], dtype=np.int64) if 'f' in tooth_data else np.zeros((0, 3), dtype=np.int64)
+                    
                     feats = self.preprocess_tooth_points(vertices, tooth_idx)
                     feats_list.append(feats)
                     vertices_list.append(vertices)
                     faces_list.append(faces)
                 except Exception as e:
-                    self.logger.error(f"Error loading STL for tooth {fdi} in jaw {jaw}: {e}")
+                    self.logger.error(f"Error processing tooth {fdi} in jaw {jaw}: {e}")
                     feats_list.append(torch.zeros(2048, 13))
                     vertices_list.append(np.zeros((0, 3)))
                     faces_list.append(np.zeros((0, 3), dtype=np.int64))
@@ -140,7 +159,7 @@ class JawTeethDataset(Dataset):
                     continue
                 tooth_idx = FDI_to_idx[tooth_id]
                 transform = [
-                    row['Left/Right (mm'], row['Forward/Backward (mm)'], row['Extrude/Intrude (mm)'],
+                    row['Left/Right (mm)'], row['Forward/Backward (mm)'], row['Extrude/Intrude (mm)'],
                     row['Buccal/Lingual (degrees)'], row['Mesial/Distal (degrees)'], row['Rotation (degrees)']
                 ]
                 targets[stage - 1, tooth_idx] = torch.tensor(transform, dtype=torch.float32)
