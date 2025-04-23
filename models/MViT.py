@@ -12,8 +12,8 @@ import ast
 @dataclass
 class MultiScaleVitCfg:
     depths: Tuple[int, ...]
-    embed_dim: Tuple[int, ...] = None
     num_heads: Tuple[int, ...]
+    embed_dim: Tuple[int, ...] = None
     mlp_ratio: float = 4.0
     pool_first: bool = False
     expand_attn: bool = True
@@ -472,8 +472,8 @@ class MViTv2(nn.Module):
 
         cfg = MultiScaleVitCfg(
             depths=tuple(depths),
-            embed_dim=(embed_dim, embed_dim * 2, embed_dim * 4, embed_dim * 4),
             num_heads=tuple(num_heads),
+            embed_dim=(embed_dim, embed_dim * 2, embed_dim * 4, embed_dim * 4),
             mlp_ratio=mlp_ratio,
             use_abs_pos=True,
             use_cls_token=False
