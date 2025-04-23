@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 def knn(x, k):
     inner = -2 * torch.matmul(x.transpose(2, 1), x)
@@ -10,9 +11,11 @@ def knn(x, k):
     return idx
 
 def get_graph_feature(x, k=20, idx=None, dim9=False):
+    logger = logging.getLogger('TrainLogger')
     batch_size = x.size(0)
     num_points = x.size(2)
     x = x.view(batch_size, -1, num_points)
+    logger.debug(f"get_graph_feature: input shape={x.shape}")
     if idx is None:
         if dim9 == False:
             idx = knn(x, k=k)
@@ -28,6 +31,7 @@ def get_graph_feature(x, k=20, idx=None, dim9=False):
     feature = feature.view(batch_size, num_points, k, num_dims)
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
     feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+    logger.debug(f"get_graph_feature: output shape={feature.shape}, expected channels={2*num_dims}")
     return feature
 
 class DGCNN(nn.Module):
@@ -67,9 +71,22 @@ class DGCNN(nn.Module):
         )
 
     def forward(self, x):
+        logger = logging.getLogger('TrainLogger')
+        logger.debug(f"DGCNN input shape={x.shape}")
+        # Validate input shape
+        if len(x.shape) != 4:
+            raise ValueError(f"Expected 4D input [batch_size, num_teeth, num_points, num_dims], got shape {x.shape}")
         batch_size, num_teeth, num_points, num_dims = x.size()
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = get_graph_feature(x, k=self.k)
+        if num_teeth != 14 or num_dims != 13:
+            logger.warning(f"Unexpected input dimensions: num_teeth={num_teeth}, num_dims={num_dims}, expected num_teeth=14, num_dims=13")
+        
+        x = x.permute(0, 3, 1, 2).contiguous()  # [batch_size, num_dims, num_teeth, num_points]
+        logger.debug(f"After permute: shape={x.shape}")
+        x = get_graph_feature(x, k=self.k)  # [batch_size, 2*num_dims, num_teeth, k]
+        logger.debug(f"After get_graph_feature: shape={x.shape}")
+        if x.size(1) != 26:
+            raise ValueError(f"Expected 26 channels after get_graph_feature (2*num_dims=2*{num_dims}), got {x.size(1)} channels")
+        
         x = self.conv1(x)
         x1 = x.max(dim=-1, keepdim=False)[0]
         x = get_graph_feature(x1, k=self.k)
@@ -85,4 +102,5 @@ class DGCNN(nn.Module):
         x = self.conv5(x)
         x = x.view(batch_size, num_teeth, -1)
         x = x.view(batch_size, 2, 7, -1)
+        logger.debug(f"DGCNN output shape={x.shape}")
         return x
