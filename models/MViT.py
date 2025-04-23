@@ -202,8 +202,8 @@ class MultiScaleAttention(nn.Module):
 
         self.rel_pos_type = rel_pos_type
         if self.rel_pos_type == 'spatial':
-            q_size = feat_size[0] // stride_q[0] if len(stride_q) > 0 else feat_size[0]
-            kv_size = feat_size[0] // stride_kv[0] if len(stride_kv) > 0 else feat_size[0]
+            q_size = max(feat_size[0] // stride_q[0], 1) if len(stride_q) > 0 else feat_size[0]
+            kv_size = max(feat_size[0] // stride_kv[0], 1) if len(stride_kv) > 0 else feat_size[0]
             rel_sp_dim = 2 * max(q_size, kv_size) - 1
             self.rel_pos_h = nn.Parameter(torch.zeros(rel_sp_dim, self.head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(rel_sp_dim, self.head_dim))
