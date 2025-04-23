@@ -9,7 +9,6 @@ import logging
 import time
 import psutil
 import tracemalloc
-import trimesh
 
 def setup_logging(log_file):
     logger = logging.getLogger('TrainLogger' if 'training' in log_file else 'InferenceLogger')
@@ -168,7 +167,7 @@ class JawTeethDataset(Dataset):
         stages = jaw_data['Stage'].unique()
         num_stages = min(len(stages), self.max_stages)
         
-        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         rotation_columns = transform_columns[3:]  # Rotation columns
         
@@ -255,7 +254,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm"]), 
+                    clean_and_convert(row["Left/Right (mm)"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
@@ -284,20 +283,39 @@ class JawTeethDataset(Dataset):
         
         faces_list, feats_list, vertices_list = [None] * 14, [None] * 14, [None] * 14
         teeth_data = data["teeth"]
+        total_points = self.num_patches * self.patch_size  # Should be 2048
         
         for fdi in FDI_TO_INDEX.keys():
             tooth_idx = FDI_TO_INDEX[fdi]
             if fdi not in teeth_data:
                 self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
-                total_points = self.num_patches * self.patch_size
-                vertices = np.zeros((total_points, 3))
+                vertices = np.zeros((total_points, 3), dtype=np.float32)
                 faces = np.zeros((0, 3), dtype=np.int64)
-                feats = torch.zeros(2048, 13)
+                feats = torch.zeros(total_points, 13, dtype=torch.float32)
+                feats[:, 12] = tooth_idx  # Set tooth index
             else:
                 tooth_data = teeth_data[fdi]
                 vertices = np.array(tooth_data["v"], dtype=np.float32)
                 faces = np.array(tooth_data["f"], dtype=np.int64) if "f" in tooth_data else np.zeros((0, 3), dtype=np.int64)
-                feats, vertices, faces = self.preprocess_tooth_points(vertices, faces, tooth_idx)
+                
+                # Sample or pad vertices to total_points
+                np.random.seed(42)
+                if len(vertices) > total_points:
+                    indices = np.random.choice(len(vertices), total_points, replace=False)
+                    points = vertices[indices]
+                    vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
+                    faces = np.array([[vertex_mapping.get(idx, 0) for idx in face] for face in faces if all(idx in vertex_mapping for idx in face)], dtype=np.int64)
+                else:
+                    points = vertices
+                    while len(points) < total_points:
+                        points = np.concatenate([points, vertices[np.random.choice(len(vertices), min(len(vertices), total_points - len(points)))]])
+                    points = points[:total_points]
+                
+                # Create feature tensor: [x, y, z, cx, cy, cz, nx, ny, nz, tx, ty, tz, tooth_idx]
+                feats = torch.zeros(total_points, 13, dtype=torch.float32)
+                feats[:, :3] = torch.tensor(points, dtype=torch.float32)  # Coordinates
+                feats[:, 12] = tooth_idx  # Tooth index
+                # Centroid, normals, and tangents are left as zeros to avoid nan/inf issues
             
             faces_list[tooth_idx], feats_list[tooth_idx], vertices_list[tooth_idx] = faces, feats, vertices
         
@@ -332,37 +350,3 @@ class JawTeethDataset(Dataset):
         active_stages = torch.any(torch.any(transformations != 0, dim=-1), dim=-1)
         num_stages = torch.sum(active_stages).item()
         return min(num_stages, self.max_stages) if num_stages > 0 else 1
-    
-    def preprocess_tooth_points(self, vertices, faces, tooth_idx):
-        total_points = self.num_patches * self.patch_size  # Should be 2048 (e.g., 128 * 32)
-        if len(vertices) == 0:
-            return torch.zeros(2048, 13), np.zeros((total_points, 3)), np.zeros((0, 3), dtype=np.int64)
-        
-        np.random.seed(42)
-        if len(vertices) > total_points:
-            indices = np.random.choice(len(vertices), total_points, replace=False)
-            points = vertices[indices]
-            vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
-            faces = np.array([[vertex_mapping.get(idx, 0) for idx in face] for face in faces if all(idx in vertex_mapping for idx in face)], dtype=np.int64)
-        else:
-            points = vertices
-            while len(points) < total_points:
-                points = np.concatenate([points, vertices[np.random.choice(len(vertices), min(len(vertices), total_points - len(points)))]])
-            points = points[:total_points]
-        
-        centroid = np.mean(points, axis=0)
-        points = points - centroid
-        norms = np.linalg.norm(points, axis=1, keepdims=True)
-        points = points / norms.max() if norms.max() > 0 else points
-        
-        mesh = trimesh.Trimesh(vertices=points, faces=faces if len(faces) > 0 else None, process=False)
-        normals = mesh.vertex_normals
-        tangents = np.cross(normals, np.random.randn(*normals.shape))
-        tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
-        
-        tooth_idx_tensor = np.full((total_points, 1), tooth_idx)
-        feats = np.concatenate([points, centroid[np.newaxis, :].repeat(total_points, axis=0), 
-                              normals, tangents, tooth_idx_tensor], axis=1)
-        feats = torch.tensor(feats, dtype=torch.float32)
-        
-        return feats, points, faces

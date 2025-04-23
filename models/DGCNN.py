@@ -16,7 +16,7 @@ class EdgeConv(nn.Module):
         x = x.transpose(1, 2).contiguous()  # [B, num_dims, num_points]
         idx = self.get_knn_idx(x, k)  # [B, num_points, k]
         
-        x_knn = self.get_knn_features(x, idx)  # [B, num_dims, num_points, k]
+        x_knn = self.get_knn_features(x, idx, k)  # [B, num_dims, num_points, k]
         x = x.unsqueeze(-1).repeat(1, 1, 1, k)  # [B, num_dims, num_points, k]
         x = torch.cat((x_knn - x, x), dim=1)  # [B, num_dims*2, num_points, k]
         
@@ -30,7 +30,7 @@ class EdgeConv(nn.Module):
         pairwise_distance = -xx - inner - xx.transpose(2, 1)
         return pairwise_distance.topk(k=k, dim=-1)[1]
     
-    def get_knn_features(self, x, idx):
+    def get_knn_features(self, x, idx, k):
         batch_size, num_dims, num_points = x.size()
         idx_base = torch.arange(0, batch_size, device=x.device).view(-1, 1, 1) * num_points
         idx = idx + idx_base
