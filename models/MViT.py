@@ -502,6 +502,8 @@ class MViTv2(nn.Module):
     def forward(self, x, targets=None, epoch=None, total_epochs=None):
         logger = logging.getLogger('TrainLogger')
         B = x.size(0)
+        # Permute input to [batch_size, embed_dim, 2, 7] for Conv2d
+        x = x.permute(0, 3, 1, 2).contiguous()  # From [B, 2, 7, embed_dim] to [B, embed_dim, 2, 7]
         x = self.input_conv(x)
         x = x.permute(0, 2, 3, 1).contiguous()
         x = x.view(B, -1, self.embed_dim)
