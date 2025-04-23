@@ -12,14 +12,17 @@ def knn(x, k):
 
 def get_graph_feature(x, k=20, idx=None, dim9=False):
     logger = logging.getLogger('TrainLogger')
-    batch_size, num_dims, num_points = x.size()
-    logger.debug(f"get_graph_feature: input shape=[{batch_size}, {num_dims}, {num_points}], k={k}")
+    batch_size, num_dims, num_teeth, num_points = x.size()
+    logger.debug(f"get_graph_feature: input shape=[{batch_size}, {num_dims}, {num_teeth}, {num_points}], k={k}")
     
     # Validate input
-    if len(x.shape) != 3:
-        raise ValueError(f"Expected 3D input [batch_size, num_dims, num_points], got shape {x.shape}")
+    if len(x.shape) != 4:
+        raise ValueError(f"Expected 4D input [batch_size, num_dims, num_teeth, num_points], got shape {x.shape}")
     
-    x = x.view(batch_size, num_dims, num_points)
+    # Reshape to [batch_size, num_dims, num_teeth * num_points] for KNN
+    x = x.view(batch_size, num_dims, num_teeth * num_points)
+    total_points = num_teeth * num_points
+    
     if idx is None:
         if dim9:
             idx = knn(x[:, 6:], k=k)
@@ -27,15 +30,18 @@ def get_graph_feature(x, k=20, idx=None, dim9=False):
             idx = knn(x, k=k)
     
     device = x.device
-    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * total_points
     idx = idx + idx_base
     idx = idx.view(-1)
     
-    x = x.transpose(2, 1).contiguous()  # [batch_size, num_points, num_dims]
-    feature = x.view(batch_size * num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims)
-    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
-    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()  # [batch_size, 2*num_dims, num_points, k]
+    x = x.transpose(2, 1).contiguous()  # [batch_size, total_points, num_dims]
+    feature = x.view(batch_size * total_points, -1)[idx, :]
+    feature = feature.view(batch_size, total_points, k, num_dims)
+    x = x.view(batch_size, total_points, 1, num_dims).repeat(1, 1, k, 1)
+    feature = torch.cat((feature - x, x), dim=3)  # [batch_size, total_points, k, 2*num_dims]
+    feature = feature.view(batch_size, num_teeth, num_points, k, 2*num_dims)
+    feature = feature.permute(0, 4, 1, 2, 3).contiguous()  # [batch_size, 2*num_dims, num_teeth, num_points*k]
+    feature = feature.view(batch_size, 2*num_dims, num_teeth, num_points)  # [batch_size, 2*num_dims, num_teeth, num_points]
     
     logger.debug(f"get_graph_feature: output shape={feature.shape}, expected channels={2*num_dims}")
     if feature.size(1) != 2 * num_dims:
@@ -95,7 +101,7 @@ class DGCNN(nn.Module):
         
         x = x.permute(0, 3, 1, 2).contiguous()  # [batch_size, num_dims, num_teeth, num_points]
         logger.debug(f"After permute: shape={x.shape}")
-        x = get_graph_feature(x, k=self.k)  # [batch_size, 2*num_dims, num_teeth, k]
+        x = get_graph_feature(x, k=self.k)  # [batch_size, 2*num_dims, num_teeth, num_points]
         logger.debug(f"After get_graph_feature: shape={x.shape}")
         
         x = self.conv1(x)
