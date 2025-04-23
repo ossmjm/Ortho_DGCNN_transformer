@@ -10,6 +10,7 @@ from models.DGCNN import DGCNN
 from models.MViT import MViTv2
 from models.OrthoDGCNN import OrthoDGCNNModel
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -209,7 +210,7 @@ def train_model(args):
         lr=args.lr,
         weight_decay=1e-3
     )
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = GradScaler()  # Updated to use torch.cuda.amp.GradScaler
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     accumulation_steps = 2
     best_test_loss = float('inf')
@@ -250,7 +251,7 @@ def train_model(args):
                 logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_labels contains nan/inf")
                 param_activity_labels = torch.nan_to_num(param_activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
             
-            with torch.amp.autocast('cuda'):
+            with autocast():  # Updated to use torch.cuda.amp.autocast
                 transforms_sequence, activity_logits, param_activity_logits = model(
                     cordinates, 
                     targets=targets if torch.rand(1).item() < tf_prob else None,
@@ -260,6 +261,10 @@ def train_model(args):
                 
                 if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
                     logger.warning(f"Epoch {epoch+1}, Batch {batch_idx+1}: transforms_sequence contains nan/inf")
+                    scaler.scale(torch.tensor(0.0, device=device)).backward()  # Zero loss to clear gradients
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
                     continue
                 
                 loss, trans_loss, rot_loss, padded_loss, sparsity_loss, activity_loss, param_activity_loss, zero_trans_loss, zero_rot_loss = compute_loss(
@@ -278,7 +283,7 @@ def train_model(args):
             
             train_loss += loss.item() * accumulation_steps
             train_trans_loss += trans_loss.item()
-            train_rot_loss += rot_loss.item()
+            train_rot_loss += trans_loss.item()
             train_padded_loss += padded_loss.item()
             train_sparsity_loss += sparsity_loss.item()
             train_activity_loss += activity_loss.item()
@@ -291,7 +296,8 @@ def train_model(args):
                        f"Activity Loss = {activity_loss.item():.6f}, Param Activity Loss = {param_activity_loss.item():.6f}, "
                        f"Zero Translation Loss = {zero_trans_loss.item():.6f}, Zero Rotation Loss = {zero_rot_loss.item():.6f}, "
                        f"Padded Loss = {padded_loss.item():.6f}, Sparsity Loss = {sparsity_loss.item():.6f}, "
-                       f"TF Prob = {tf_prob:.2f}")
+                       f"TF Prob = {tf_prob:.2f}, "
+                       f"GPU Memory Allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
         
         avg_train_loss = train_loss / len(train_loader)
         avg_trans_loss = train_trans_loss / len(train_loader)
@@ -338,7 +344,7 @@ def train_model(args):
                     logger.warning(f"Test Epoch {epoch+1}, Batch {batch_idx+1}: param_activity_labels contains nan/inf")
                     param_activity_labels = torch.nan_to_num(param_activity_labels, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                with torch.amp.autocast('cuda'):
+                with autocast():  # Updated to use torch.cuda.amp.autocast
                     transforms_sequence, activity_logits, param_activity_logits = model(cordinates)
                     
                     if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
