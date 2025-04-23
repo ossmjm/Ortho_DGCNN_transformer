@@ -2,106 +2,87 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class EdgeConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(EdgeConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-    
-    def forward(self, x, k=10):
-        batch_size, num_points, num_dims = x.size()
-        x = x.transpose(1, 2).contiguous()  # [B, num_dims, num_points]
-        idx = self.get_knn_idx(x, k)  # [B, num_points, k]
-        
-        x_knn = self.get_knn_features(x, idx, k)  # [B, num_dims, num_points, k]
-        x = x.unsqueeze(-1).repeat(1, 1, 1, k)  # [B, num_dims, num_points, k]
-        x = torch.cat((x_knn - x, x), dim=1)  # [B, num_dims*2, num_points, k]
-        
-        x = self.conv(x)  # [B, out_channels, num_points, k]
-        x = x.max(dim=-1, keepdim=False)[0]  # [B, out_channels, num_points]
-        return x.transpose(1, 2).contiguous()  # [B, num_points, out_channels]
-    
-    def get_knn_idx(self, x, k):
-        inner = -2 * torch.matmul(x.transpose(2, 1), x)
-        xx = torch.sum(x ** 2, dim=1, keepdim=True)
-        pairwise_distance = -xx - inner - xx.transpose(2, 1)
-        return pairwise_distance.topk(k=k, dim=-1)[1]
-    
-    def get_knn_features(self, x, idx, k):
-        batch_size, num_dims, num_points = x.size()
-        idx_base = torch.arange(0, batch_size, device=x.device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-        x = x.transpose(2, 1).contiguous()  # [B, num_points, num_dims]
-        feature = x.view(batch_size * num_points, -1)[idx, :]
-        feature = feature.view(batch_size, num_points, k, num_dims)
-        return feature.permute(0, 3, 1, 2)  # [B, num_dims, num_points, k]
+def knn(x, k):
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]
+    return idx
+
+def get_graph_feature(x, k=20, idx=None, dim9=False):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        if dim9 == False:
+            idx = knn(x, k=k)
+        else:
+            idx = knn(x[:, 6:], k=k)
+    device = x.device
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+    idx = idx + idx_base
+    idx = idx.view(-1)
+    _, num_dims, _ = x.size()
+    x = x.transpose(2, 1).contiguous()
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+    return feature
 
 class DGCNN(nn.Module):
-    def __init__(self, in_channels=13, embed_dim=256, num_teeth=14, k=10):
+    def __init__(self, k=20, embed_dim=256):
         super(DGCNN, self).__init__()
         self.k = k
-        self.num_teeth = num_teeth
         self.embed_dim = embed_dim
-        
-        self.conv1 = EdgeConv(in_channels, 64)
-        self.conv2 = EdgeConv(64, 64)
-        self.conv3 = EdgeConv(64, 128)
-        self.conv4 = EdgeConv(128, 256)
-        
-        self.mlp = nn.Sequential(
-            nn.Conv1d(512, 512, 1, bias=False),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Conv1d(512, embed_dim, 1, bias=False),
-            nn.BatchNorm1d(embed_dim),
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(embed_dim)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(26, 64, kernel_size=1, bias=False),
+            self.bn1,
             nn.LeakyReLU(negative_slope=0.2)
         )
-        
-        self.grid_mapping = torch.zeros(2, 7, dtype=torch.long)
-        for idx in range(num_teeth):
-            row = idx // 7
-            col = idx % 7
-            self.grid_mapping[row, col] = idx
-    
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = x.view(-1, x.size(2), x.size(3))  # [B*num_teeth, 2048, in_channels]
-        
-        x = self.conv1(x, self.k)  # [B*num_teeth, 2048, 64]
-        x1 = x
-        x = self.conv2(x, self.k)  # [B*num_teeth, 2048, 64]
-        x2 = x
-        x = self.conv3(x, self.k)  # [B*num_teeth, 2048, 128]
-        x3 = x
-        x = self.conv4(x, self.k)  # [B*num_teeth, 2048, 256]
-        x4 = x
-        
-        x = torch.cat((x1, x2, x3, x4), dim=-1)  # [B*num_teeth, 2048, 512]
-        x = x.transpose(1, 2).contiguous()  # [B*num_teeth, 512, 2048]
-        x = self.mlp(x)  # [B*num_teeth, embed_dim, 2048]
-        x = x.max(dim=-1, keepdim=False)[0]  # [B*num_teeth, embed_dim]
-        
-        x = x.view(batch_size, self.num_teeth, self.embed_dim)  # [B, num_teeth, embed_dim]
-        
-        grid_output = torch.zeros(batch_size, 2, 7, self.embed_dim, device=x.device)
-        for row in range(2):
-            for col in range(7):
-                tooth_idx = self.grid_mapping[row, col].item()
-                if tooth_idx < self.num_teeth:
-                    grid_output[:, row, col] = x[:, tooth_idx]
-        
-        return grid_output  # [B, 2, 7, embed_dim]
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+            self.bn2,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
+            self.bn3,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
+            self.bn4,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(512, embed_dim, kernel_size=1, bias=False),
+            self.bn5,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.Conv2d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+    def forward(self, x):
+        batch_size, num_teeth, num_points, num_dims = x.size()
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = get_graph_feature(x, k=self.k)
+        x = self.conv1(x)
+        x1 = x.max(dim=-1, keepdim=False)[0]
+        x = get_graph_feature(x1, k=self.k)
+        x = self.conv2(x)
+        x2 = x.max(dim=-1, keepdim=False)[0]
+        x = get_graph_feature(x2, k=self.k)
+        x = self.conv3(x)
+        x3 = x.max(dim=-1, keepdim=False)[0]
+        x = get_graph_feature(x3, k=self.k)
+        x = self.conv4(x)
+        x4 = x.max(dim=-1, keepdim=False)[0]
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = self.conv5(x)
+        x = x.view(batch_size, num_teeth, -1)
+        x = x.view(batch_size, 2, 7, -1)
+        return x

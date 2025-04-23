@@ -7,12 +7,13 @@ from typing import Tuple, Optional, List
 import logging
 from operator import mul
 from functools import reduce
+import ast
 
 @dataclass
 class MultiScaleVitCfg:
-    depths: Tuple[int, ...] = (1, 2, 11, 2)
+    depths: Tuple[int, ...]
     embed_dim: Tuple[int, ...] = None
-    num_heads: Tuple[int, ...] = (4, 4, 8, 8)
+    num_heads: Tuple[int, ...]
     mlp_ratio: float = 4.0
     pool_first: bool = False
     expand_attn: bool = True
@@ -84,6 +85,7 @@ def cal_rel_pos_type(
     rel_pos_h: torch.Tensor,
     rel_pos_w: torch.Tensor,
 ):
+    logger = logging.getLogger('TrainLogger')
     sp_idx = 1 if has_cls_token else 0
     q_h, q_w = q_size
     k_h, k_w = k_size
@@ -103,8 +105,18 @@ def cal_rel_pos_type(
     )
     dist_w += (k_w - 1) * k_w_ratio
 
-    rel_h = rel_pos_h[dist_h.long()]
-    rel_w = rel_pos_w[dist_w.long()]
+    # Clamp indices to prevent out-of-bounds access
+    rel_sp_dim = rel_pos_h.size(0)
+    dist_h = torch.clamp(dist_h.long(), 0, rel_sp_dim - 1)
+    dist_w = torch.clamp(dist_w.long(), 0, rel_sp_dim - 1)
+
+    # Log for debugging
+    logger.debug(f"cal_rel_pos_type: q_size={q_size}, k_size={k_size}, rel_sp_dim={rel_sp_dim}")
+    logger.debug(f"dist_h range: min={dist_h.min().item()}, max={dist_h.max().item()}")
+    logger.debug(f"dist_w range: min={dist_w.min().item()}, max={dist_w.max().item()}")
+
+    rel_h = rel_pos_h[dist_h]
+    rel_w = rel_pos_w[dist_w]
 
     B, n_head, q_N, dim = q.shape
 
@@ -424,13 +436,25 @@ class MViTv2(nn.Module):
         embed_dim: int = 256,
         num_teeth: int = 14,
         max_stages: int = 25,
-        depths: List[int] = [1, 2, 11, 2],
-        num_heads: List[int] = [4, 4, 8, 8],
+        depths: str = '[1, 2, 11, 2]',
+        num_heads: str = '[4, 4, 8, 8]',
         mlp_ratio: float = 4.0,
         drop_path_rate: float = 0.2,
         teacher_forcing: bool = False
     ):
         super().__init__()
+        # Parse string arguments to lists
+        try:
+            depths = ast.literal_eval(depths)
+            num_heads = ast.literal_eval(num_heads)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Failed to parse depths or num_heads: {e}")
+
+        if not isinstance(depths, (list, tuple)) or not isinstance(num_heads, (list, tuple)):
+            raise ValueError("depths and num_heads must be lists or tuples")
+        if len(depths) != len(num_heads):
+            raise ValueError("depths and num_heads must have the same length")
+
         self.embed_dim = embed_dim
         self.num_teeth = num_teeth
         self.max_stages = max_stages
