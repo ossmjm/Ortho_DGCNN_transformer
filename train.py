@@ -108,24 +108,24 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, ta
                   delta * sparsity_loss + epsilon * activity_loss + zeta * param_activity_loss + 
                   zero_trans_loss + zero_rot_loss)
     
-    return (total_loss, loss_trans, rot_loss, padded_loss, sparsity_loss, 
+    return (total_loss, loss_trans, loss_rot, padded_loss, sparsity_loss, 
             activity_loss, param_activity_loss, zero_trans_loss, zero_rot_loss)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OrthoDGCNN Model")
-    parser.add_argument('--data-dir', type=str, default='./data', help='Path to dataset directory')
-    parser.add_argument('--batch-size', type=int, default=4, help='Batch size for training')
+    parser.add_argument('--data_dir', type=str, default='./data', help='Path to dataset directory')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--max-stages', type=int, default=25, help='Maximum number of stages')
-    parser.add_argument('--train-ratio', type=float, default=0.8, help='Ratio of data for training')
-    parser.add_argument('--log-file', type=str, default='training_log.txt', help='Log file path')
-    parser.add_argument('--teacher-forcing', action='store_true', help='Enable teacher forcing')
-    parser.add_argument('--embed-dim', type=int, default=256, help='Embedding dimension')
+    parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Ratio of data for training')
+    parser.add_argument('--log_file', type=str, default='training_log.txt', help='Log file path')
+    parser.add_argument('--teacher_forcing', action='store_true', help='Enable teacher forcing')
+    parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
     parser.add_argument('--depths', type=str, default='[1, 2, 11, 2]', help='Number of blocks per stage')
-    parser.add_argument('--num-heads', type=str, default='[4, 4, 8, 8]', help='Number of attention heads per stage')
-    parser.add_argument('--mlp-ratio', type=float, default=4.0, help='MLP expansion ratio')
-    parser.add_argument('--drop-path-rate', type=float, default=0.2, help='Drop path rate')
+    parser.add_argument('--num_heads', type=str, default='[4, 4, 8, 8]', help='Number of attention heads per stage')
+    parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP expansion ratio')
+    parser.add_argument('--drop_path_rate', type=float, default=0.2, help='Drop path rate')
     return parser.parse_args()
 
 def train_model(args):
