@@ -172,8 +172,8 @@ def train_model(args):
         embed_dim=args.embed_dim,
         num_teeth=14,
         max_stages=args.max_stages,
-        depths=depths,
-        num_heads=num_heads,
+        depths=args.depths,
+        num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         drop_path_rate=args.drop_path_rate,
         teacher_forcing=args.teacher_forcing
