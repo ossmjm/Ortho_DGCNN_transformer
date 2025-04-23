@@ -167,7 +167,7 @@ class JawTeethDataset(Dataset):
         stages = jaw_data['Stage'].unique()
         num_stages = min(len(stages), self.max_stages)
         
-        transform_columns = ["Left/Right (mm)", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+        transform_columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                             "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         rotation_columns = transform_columns[3:]  # Rotation columns
         
@@ -254,7 +254,7 @@ class JawTeethDataset(Dataset):
                         return 0.0
                 
                 transform_values = torch.tensor([
-                    clean_and_convert(row["Left/Right (mm)"]), 
+                    clean_and_convert(row["Left/Right (mm"]), 
                     clean_and_convert(row["Forward/Backward (mm)"]), 
                     clean_and_convert(row["Extrude/Intrude (mm)"]),
                     clean_and_convert(row["Buccal/Lingual (degrees)"]), 
