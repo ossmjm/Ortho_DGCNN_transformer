@@ -12,40 +12,50 @@ def knn(x, k):
 
 def get_graph_feature(x, k=20, idx=None, dim9=False):
     logger = logging.getLogger('TrainLogger')
-    batch_size = x.size(0)
-    num_points = x.size(2)
-    x = x.view(batch_size, -1, num_points)
-    logger.debug(f"get_graph_feature: input shape={x.shape}")
+    batch_size, num_dims, num_points = x.size()
+    logger.debug(f"get_graph_feature: input shape=[{batch_size}, {num_dims}, {num_points}], k={k}")
+    
+    # Validate input
+    if len(x.shape) != 3:
+        raise ValueError(f"Expected 3D input [batch_size, num_dims, num_points], got shape {x.shape}")
+    
+    x = x.view(batch_size, num_dims, num_points)
     if idx is None:
-        if dim9 == False:
-            idx = knn(x, k=k)
-        else:
+        if dim9:
             idx = knn(x[:, 6:], k=k)
+        else:
+            idx = knn(x, k=k)
+    
     device = x.device
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
     idx = idx + idx_base
     idx = idx.view(-1)
-    _, num_dims, _ = x.size()
-    x = x.transpose(2, 1).contiguous()
+    
+    x = x.transpose(2, 1).contiguous()  # [batch_size, num_points, num_dims]
     feature = x.view(batch_size * num_points, -1)[idx, :]
     feature = feature.view(batch_size, num_points, k, num_dims)
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
-    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()  # [batch_size, 2*num_dims, num_points, k]
+    
     logger.debug(f"get_graph_feature: output shape={feature.shape}, expected channels={2*num_dims}")
+    if feature.size(1) != 2 * num_dims:
+        raise ValueError(f"Expected {2*num_dims} channels, got {feature.size(1)}")
+    
     return feature
 
 class DGCNN(nn.Module):
-    def __init__(self, k=20, embed_dim=256):
+    def __init__(self, k=20, embed_dim=256, num_dims=13):
         super(DGCNN, self).__init__()
         self.k = k
         self.embed_dim = embed_dim
+        self.num_dims = num_dims
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
         self.bn4 = nn.BatchNorm2d(256)
         self.bn5 = nn.BatchNorm1d(embed_dim)
         self.conv1 = nn.Sequential(
-            nn.Conv2d(26, 64, kernel_size=1, bias=False),
+            nn.Conv2d(2 * num_dims, 64, kernel_size=1, bias=False),
             self.bn1,
             nn.LeakyReLU(negative_slope=0.2)
         )
@@ -73,19 +83,20 @@ class DGCNN(nn.Module):
     def forward(self, x):
         logger = logging.getLogger('TrainLogger')
         logger.debug(f"DGCNN input shape={x.shape}")
+        
         # Validate input shape
         if len(x.shape) != 4:
             raise ValueError(f"Expected 4D input [batch_size, num_teeth, num_points, num_dims], got shape {x.shape}")
         batch_size, num_teeth, num_points, num_dims = x.size()
-        if num_teeth != 14 or num_dims != 13:
-            logger.warning(f"Unexpected input dimensions: num_teeth={num_teeth}, num_dims={num_dims}, expected num_teeth=14, num_dims=13")
+        if num_teeth != 14:
+            logger.warning(f"Unexpected num_teeth={num_teeth}, expected 14")
+        if num_dims != self.num_dims:
+            logger.warning(f"Unexpected num_dims={num_dims}, expected {self.num_dims}")
         
         x = x.permute(0, 3, 1, 2).contiguous()  # [batch_size, num_dims, num_teeth, num_points]
         logger.debug(f"After permute: shape={x.shape}")
         x = get_graph_feature(x, k=self.k)  # [batch_size, 2*num_dims, num_teeth, k]
         logger.debug(f"After get_graph_feature: shape={x.shape}")
-        if x.size(1) != 26:
-            raise ValueError(f"Expected 26 channels after get_graph_feature (2*num_dims=2*{num_dims}), got {x.size(1)} channels")
         
         x = self.conv1(x)
         x1 = x.max(dim=-1, keepdim=False)[0]
