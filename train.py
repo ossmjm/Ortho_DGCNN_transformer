@@ -167,7 +167,7 @@ def train_model(args):
     logger.info(f"Number of training batches: {len(train_loader)}")
     logger.info(f"Number of test batches: {len(test_loader)}")
     
-    dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
+    dgcnn = DGCNN(embed_dim=args.embed_dim, k=10).to(device)
     mvit = MViTv2(
         embed_dim=args.embed_dim,
         num_teeth=14,
