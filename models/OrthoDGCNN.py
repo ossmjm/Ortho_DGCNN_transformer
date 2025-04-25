@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import logging
 from typing import List, Optional
-from CumulativeTransformationModel import CumulativeTransformationModel
+from models.CumulativeTransformationModel import CumulativeTransformationModel
 
 class OrthoDGCNNModel(nn.Module):
     def __init__(
