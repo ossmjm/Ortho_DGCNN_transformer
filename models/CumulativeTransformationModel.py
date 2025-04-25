@@ -28,7 +28,8 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N', K]
     
     # Gather neighbor features (full features)
-    neighbor_points = x_flat.gather(1, neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, channels))
+    neighbor_idx = neighbor_idx.unsqueeze(-1)  # [B*T, N', K, 1]
+    neighbor_points = x_flat.gather(1, neighbor_idx.expand(-1, -1, -1, channels))  # [B*T, N', K, C]
     neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)
     
     return sampled_points, neighbor_points
