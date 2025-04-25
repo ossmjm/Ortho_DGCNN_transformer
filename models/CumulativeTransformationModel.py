@@ -23,6 +23,7 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     
     # Group neighbors (KNN)
     x_trans = x_flat.transpose(1, 2).contiguous()  # [B*T, C, N]
+    # Use only XYZ coordinates for distance computation
     dists = torch.cdist(x_flat[:, :, :3], sampled_points[:, :, :3])  # Distance on XYZ
     _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N', K]
     
