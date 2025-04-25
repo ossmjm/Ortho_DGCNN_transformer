@@ -9,6 +9,9 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     device = x.device
     logger = logging.getLogger('TrainLogger')
     
+    # Log implementation
+    logger.info("Using advanced indexing for sample_and_group neighbor grouping")
+    
     # Flatten for FPS
     x_flat = x.view(batch_size * num_teeth, num_points, channels)  # [B*T, N, C]
     idx = torch.zeros(batch_size * num_teeth, npoint, dtype=torch.long, device=device)
@@ -26,7 +29,7 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     x_xyz = x_flat[:, :, :3]  # [B*T, N, 3]
     sampled_xyz = sampled_points.view(batch_size * num_teeth, npoint, channels)[:, :, :3]  # [B*T, N', 3]
     dists = torch.cdist(x_xyz, sampled_xyz)  # [B*T, N, N']
-    _, neighbor_idx = dists.topk(k=nsample, dim=1, largest=False)  # [B*T, N', K]
+    _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N, K]
     
     # Debug logging
     logger.debug(f"sample_and_group: x_flat shape={x_flat.shape}, neighbor_idx shape={neighbor_idx.shape}")
@@ -35,6 +38,7 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     
     # Select neighbor points using advanced indexing
     batch_idx = torch.arange(batch_size * num_teeth, device=device).view(-1, 1, 1).expand(-1, npoint, nsample)  # [B*T, N', K]
+    neighbor_idx = neighbor_idx[:, idx, :]  # [B*T, N', K]
     neighbor_points = x_flat[batch_idx, neighbor_idx, :]  # [B*T, N', K, C]
     neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)  # [B, T, N', K, C]
     
