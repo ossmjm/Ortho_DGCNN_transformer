@@ -17,17 +17,17 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
         perm = torch.randperm(num_points, device=device)[:npoint]
         idx[i] = perm
     
-    # Gather sampled points
+    # Gather sampled points (full features for later MLPs)
     sampled_points = x_flat.gather(1, idx.unsqueeze(-1).expand(-1, -1, channels))
     sampled_points = sampled_points.view(batch_size, num_teeth, npoint, channels)
     
-    # Group neighbors (KNN)
-    x_trans = x_flat.transpose(1, 2).contiguous()  # [B*T, C, N]
-    # Use only XYZ coordinates for distance computation
-    dists = torch.cdist(x_flat[:, :, :3], sampled_points[:, :, :3])  # Distance on XYZ
+    # Group neighbors (KNN) using only XYZ coordinates for distance
+    x_xyz = x_flat[:, :, :3]  # [B*T, N, 3]
+    sampled_xyz = sampled_points.view(batch_size * num_teeth, npoint, channels)[:, :, :3]  # [B*T, N', 3]
+    dists = torch.cdist(x_xyz, sampled_xyz)  # Distance on XYZ
     _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N', K]
     
-    # Gather neighbor features
+    # Gather neighbor features (full features)
     neighbor_points = x_flat.gather(1, neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, channels))
     neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)
     
