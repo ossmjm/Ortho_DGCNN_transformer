@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import trimesh
 from dataset import JawTeethDataset
-from models.DGCNN import DGCNN
 from models.MViT import MViTv2
 from models.OrthoDGCNN import OrthoDGCNNModel
 
@@ -57,16 +56,16 @@ def apply_transformations(vertices, translation, rotation):
 def parse_args():
     parser = argparse.ArgumentParser(description="Inference with OrthoDGCNN Model")
     parser.add_argument('--data-dir', type=str, default='./data', help='Path to dataset directory')
-    parser.add_argument('--batch-size', type=int, default=4, help='Batch size for inference')
+    parser.add_argument('--batch-size', type=int, default=2, help='Batch size for inference')
     parser.add_argument('--max-stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--log-file', type=str, default='inference_log.txt', help='Log file path')
     parser.add_argument('--model-path', type=str, default='best_model.pth', help='Path to trained model')
     parser.add_argument('--output-dir', type=str, default='./output', help='Output directory for STL files')
-    parser.add_argument('--embed-dim', type=int, default=256, help='Embedding dimension')
+    parser.add_argument('--embed-dim', type=int, default=96, help='Embedding dimension')
     parser.add_argument('--depths', type=str, default='[1, 2, 11, 2]', help='Number of blocks per stage')
-    parser.add_argument('--num-heads', type=str, default='[4, 4, 8, 8]', help='Number of attention heads per stage')
+    parser.add_argument('--num-heads', type=str, default='[3, 3, 3, 3]', help='Number of attention heads per stage')
     parser.add_argument('--mlp-ratio', type=float, default=4.0, help='MLP expansion ratio')
-    parser.add_argument('--drop-path-rate', type=float, default=0.2, help='Drop path rate')
+    parser.add_argument('--drop-path-rate', type=float, default=0.1, help='Drop path rate')
     return parser.parse_args()
 
 def infer_model(args):
@@ -89,6 +88,7 @@ def infer_model(args):
     dataset = JawTeethDataset(
         args.data_dir, 
         max_stages=args.max_stages, 
+        num_points=256,
         split='test', 
         train_ratio=0.8, 
         inference=True,
@@ -98,7 +98,6 @@ def infer_model(args):
     data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     logger.info(f"Number of batches: {len(data_loader)}")
     
-    dgcnn = DGCNN(in_channels=13, embed_dim=args.embed_dim, num_teeth=14, k=10).to(device)
     mvit = MViTv2(
         embed_dim=args.embed_dim,
         num_teeth=14,
@@ -110,7 +109,6 @@ def infer_model(args):
         teacher_forcing=False
     ).to(device)
     model = OrthoDGCNNModel(
-        dgcnn, 
         mvit, 
         max_stages=args.max_stages,
         num_teeth=14,

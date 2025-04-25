@@ -6,7 +6,6 @@ import argparse
 import logging
 import ast
 from dataset import JawTeethDataset
-from models.DGCNN import DGCNN
 from models.MViT import MViTv2
 from models.OrthoDGCNN import OrthoDGCNNModel
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -83,12 +82,14 @@ def main(args):
     train_dataset = JawTeethDataset(
         data_dir=args.data_dir,
         max_stages=args.max_stages,
+        num_points=256,
         split='train',
         log_file=args.log_file
     )
     val_dataset = JawTeethDataset(
         data_dir=args.data_dir,
         max_stages=args.max_stages,
+        num_points=256,
         split='val',
         log_file=args.log_file
     )
@@ -109,7 +110,6 @@ def main(args):
     )
     
     # Initialize models
-    dgcnn = DGCNN(k=args.dgcnn_k, embed_dim=args.embed_dim).to(device)
     mvit = MViTv2(
         embed_dim=args.embed_dim,
         num_teeth=args.num_teeth,
@@ -122,7 +122,6 @@ def main(args):
         teacher_forcing=args.teacher_forcing_prob > 0,
     ).to(device)
     model = OrthoDGCNNModel(
-        dgcnn=dgcnn,
         mvit=mvit,
         max_stages=args.max_stages,
         num_teeth=args.num_teeth,
@@ -142,7 +141,7 @@ def main(args):
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    # Loss functions
+    # LossFFD functions
     smooth_l1_loss = WeightedSmoothL1Loss().to(device)
     mae_loss = nn.L1Loss().to(device)
     bce_loss = nn.BCEWithLogitsLoss().to(device)
@@ -269,28 +268,21 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='./output', help='Path to save checkpoints')
     parser.add_argument('--log_file', type=str, default='training_log.txt', help='Path to log file')
     
-    # DGCNN hyperparameters
-    parser.add_argument('--dgcnn_k', type=int, default=20, help='Number of neighbors for DGCNN')
+    # Model hyperparameters
     parser.add_argument('--embed_dim', type=int, default=96, help='Embedding dimension')
-    
-    # CumulativeTransformationModel hyperparameters
     parser.add_argument('--cumulative_num_heads', type=int, default=4, help='Number of attention heads in CumulativeTransformationModel')
-    
-    # MViTv2 hyperparameters
     parser.add_argument('--mvit_depths', type=lambda s: ast.literal_eval(s), default="[1, 2, 11, 2]", help='Depths of MViTv2 stages')
     parser.add_argument('--mvit_num_heads', type=lambda s: ast.literal_eval(s), default="[3, 3, 3, 3]", help='Number of heads per stage')
     parser.add_argument('--mvit_mlp_ratio', type=float, default=4.0, help='MLP ratio in MViTv2')
     parser.add_argument('--mvit_drop_path_rate', type=float, default=0.1, help='Drop path rate in MViTv2')
     parser.add_argument('--mvit_decoder_layers', type=int, default=1, help='Number of decoder layers')
-    parser.add_argument('--mvit_pretrained_model', type=str, default='mvitv2_small', help='Pretrained MViTv2 model name')
     
     # Training hyperparameters
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
     parser.add_argument('--teacher_forcing_prob', type=float, default=0.5, help='Teacher forcing probability')
-    parser.add_argument('--cumulative_teacher_forcing_prob', type=float, default=0.5, help='Cumulative teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
     

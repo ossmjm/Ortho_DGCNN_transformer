@@ -23,11 +23,10 @@ def setup_logging(log_file):
     return logger
 
 class JawTeethDataset(Dataset):
-    def __init__(self, data_dir, max_stages=25, num_patches=128, patch_size=32, channels=13, split='train', train_ratio=0.8, inference=False, log_file='training_log.txt'):
+    def __init__(self, data_dir, max_stages=25, num_points=256, channels=13, split='train', train_ratio=0.8, inference=False, log_file='training_log.txt'):
         self.data_dir = data_dir
         self.max_stages = max_stages
-        self.num_patches = num_patches
-        self.patch_size = patch_size
+        self.num_points = num_points
         self.channels = channels
         self.num_teeth = 14
         self.inference = inference
@@ -357,7 +356,7 @@ class JawTeethDataset(Dataset):
         
         faces_list, feats_list, vertices_list = [None] * 14, [None] * 14, [None] * 14
         teeth_data = data["teeth"]
-        total_points = self.num_patches * self.patch_size  # Should be 2048
+        total_points = self.num_points
         
         for fdi in FDI_TO_INDEX.keys():
             tooth_idx = FDI_TO_INDEX[fdi]
@@ -372,7 +371,7 @@ class JawTeethDataset(Dataset):
                 vertices = np.array(tooth_data["v"], dtype=np.float32)
                 faces = np.array(tooth_data["f"], dtype=np.int64) if "f" in tooth_data else np.zeros((0, 3), dtype=np.int64)
                 
-                # Sample or pad vertices to total_points
+                # Sample or pad vertices to num_points
                 np.random.seed(42)
                 if len(vertices) > total_points:
                     indices = np.random.choice(len(vertices), total_points, replace=False)

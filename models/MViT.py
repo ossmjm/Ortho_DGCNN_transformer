@@ -24,7 +24,7 @@ class TransformerDecoder(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
-        # Output layer for transformations (outputs unnormalized values)
+        # Output layer for transformations
         self.out_layer = nn.Linear(embed_dim, 6)
         
         # Initialize weights
@@ -38,9 +38,9 @@ class TransformerDecoder(nn.Module):
         # Prepare target sequence
         tgt = torch.zeros(B, self.max_stages, self.num_teeth, self.embed_dim, device=device)
         if use_teacher_forcing and targets is not None:
-            targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)  # Normalize
-            targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)  # Scale by cumulative
-            tgt[:, :-1, :, :] = self.out_layer.weight.new_zeros(targets_scaled[:, :-1, :, :].shape)  # Dummy for simplicity
+            targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)
+            targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
+            tgt[:, :-1, :, :] = self.out_layer.weight.new_zeros(targets_scaled[:, :-1, :, :].shape)
         
         # Add positional encoding
         tgt = tgt + self.pos_embed.unsqueeze(2)  # [B, max_stages, num_teeth, embed_dim]
@@ -68,12 +68,12 @@ class TransformerDecoder(nn.Module):
             for i in range(B):
                 stage_mask[i, num_stages[i]:] = 0.0
             stage_sum = (transforms_sequence * stage_mask).sum(dim=1)  # [B, num_teeth, 6]
-            scale_factor = cumulative_transforms / (stage_sum + 1e-6)  # [B, num_teeth, 6]
+            scale_factor = cumulative_transforms / (stage_sum + 1e-6)
             scale_factor = torch.where(stage_sum.abs() < 1e-6, torch.ones_like(scale_factor), scale_factor)
             transforms_sequence = transforms_sequence * scale_factor.unsqueeze(1) * stage_mask
         else:
             stage_sum = transforms_sequence.sum(dim=1)  # [B, num_teeth, 6]
-            scale_factor = cumulative_transforms / (stage_sum + 1e-6)  # [B, num_teeth, 6]
+            scale_factor = cumulative_transforms / (stage_sum + 1e-6)
             scale_factor = torch.where(stage_sum.abs() < 1e-6, torch.ones_like(scale_factor), scale_factor)
             transforms_sequence = transforms_sequence * scale_factor.unsqueeze(1)
         
@@ -87,6 +87,8 @@ class MViTv2(nn.Module):
         embed_dim: int = 96,
         num_teeth: int = 14,
         max_stages: int = 25,
+        num_points: int = 256,
+        channels: int = 13,
         depths: list = [1, 2, 11, 2],
         num_heads: list = [3, 3, 3, 3],
         mlp_ratio: float = 4.0,
@@ -98,17 +100,25 @@ class MViTv2(nn.Module):
         self.embed_dim = embed_dim
         self.num_teeth = num_teeth
         self.max_stages = max_stages
+        self.num_points = num_points
+        self.channels = channels
         self.teacher_forcing = teacher_forcing
         
-        # Load pretrained MViTv2-small from torchvision
+        # Load pretrained MViTv2-small
         weights = MViT_V2_S_Weights.DEFAULT
         self.mvit = mvit_v2_s(weights=weights)
         self.mvit.head = nn.Identity()  # Remove classification head
         
-        # Input adapter to aggregate features
-        self.input_conv = nn.Conv3d(embed_dim, embed_dim, kernel_size=(2, 1, 4), stride=(2, 1, 4))  # Reduce a and b
-        self.feature_proj = nn.Linear(embed_dim, embed_dim * 4)  # Project to MViTv2 output dim
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim * 4))  # Adjusted for MViTv2 output (384)
+        # Input adapter for point clouds
+        self.input_adapter = nn.Sequential(
+            nn.Conv2d(channels, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU()
+        )
+        
+        # Feature projection
+        self.feature_proj = nn.Linear(768, embed_dim * 4)  # MViTv2 outputs 768-dim features
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim * 4))
         
         # Transformer decoder
         self.decoder = TransformerDecoder(
@@ -126,7 +136,7 @@ class MViTv2(nn.Module):
         self.apply(self._init_weights)
         
         logger = logging.getLogger('TrainLogger')
-        logger.info(f"Loaded pretrained MViTv2-small from torchvision with embed_dim={embed_dim}")
+        logger.info(f"Initialized MViTv2 with embed_dim={embed_dim}, num_points={num_points}")
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -140,17 +150,27 @@ class MViTv2(nn.Module):
         logger = logging.getLogger('TrainLogger')
         B = x.size(0)
         
-        # Process DGCNN features: [B, 2, 14, 4, embed_dim] -> [B, embed_dim, 2, 14, 4]
-        x = x.permute(0, 4, 1, 2, 3).contiguous()  # [B, embed_dim, 2, 14, 4]
-        x = self.input_conv(x)  # [B, embed_dim, 1, 14, 1]
-        x = x.squeeze(2).squeeze(4)  # [B, embed_dim, 14]
-        x = x.permute(0, 2, 1).contiguous()  # [B, 14, embed_dim]
+        # Input: [B, num_teeth, num_points, channels]
+        x = x.view(B, self.num_teeth * self.num_points, self.channels).permute(0, 2, 1)  # [B, channels, T*N]
+        x = x.view(B, self.channels, self.num_teeth, self.num_points)  # [B, channels, T, N]
         
-        # Project to MViTv2 feature space
-        x = self.feature_proj(x)  # [B, 14, embed_dim * 4]
-        x = x + self.pos_embed  # [B, 14, embed_dim * 4]
+        # Input adapter
+        x = self.input_adapter(x)  # [B, embed_dim, T, N]
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, T, N, embed_dim]
         
-        # Use cumulative transforms directly or apply teacher forcing
+        # Reshape for MViTv2: Treat teeth as frames
+        x = x.view(B, self.num_teeth, self.num_points, self.embed_dim).permute(0, 3, 1, 2)  # [B, embed_dim, T, N]
+        x = x.view(B, self.embed_dim, 1, self.num_teeth, self.num_points)  # [B, embed_dim, 1, T, N]
+        
+        # Pass through MViTv2
+        x = self.mvit(x)  # [B, 768]
+        x = x.view(B, self.num_teeth, 768)  # [B, T, 768]
+        
+        # Project features
+        x = self.feature_proj(x)  # [B, T, embed_dim * 4]
+        x = x + self.pos_embed  # [B, T, embed_dim * 4]
+        
+        # Use cumulative transforms
         cumulative_input = cumulative_transforms if not cumulative_teacher_forcing else targets
         
         # Decode stage-wise transformations
