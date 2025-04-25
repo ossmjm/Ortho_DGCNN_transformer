@@ -35,10 +35,13 @@ class CumulativeTransformationModel(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.Conv3d, nn.BatchNorm3d)):
+            elif isinstance(m, nn.Conv3d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.ones_(m.weight)  # Initialize scale to 1
+                nn.init.zeros_(m.bias)   # Initialize shift to 0
     
     def forward(self, x):
         logger = logging.getLogger('TrainLogger')
