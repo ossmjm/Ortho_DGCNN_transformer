@@ -33,9 +33,9 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     if torch.isnan(x_flat).any() or torch.isinf(x_flat).any():
         logger.warning("x_flat contains NaN or Inf")
     
-    # Select neighbor points using index_select
-    neighbor_points = torch.index_select(x_flat, 1, neighbor_idx.view(-1))  # [B*T, K*N', C]
-    neighbor_points = neighbor_points.view(batch_size * num_teeth, npoint, nsample, channels)  # [B*T, N', K, C]
+    # Select neighbor points using advanced indexing
+    batch_idx = torch.arange(batch_size * num_teeth, device=device).view(-1, 1, 1).expand(-1, npoint, nsample)  # [B*T, N', K]
+    neighbor_points = x_flat[batch_idx, neighbor_idx, :]  # [B*T, N', K, C]
     neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)  # [B, T, N', K, C]
     
     return sampled_points, neighbor_points
