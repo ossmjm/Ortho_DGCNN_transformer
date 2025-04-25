@@ -120,7 +120,6 @@ def main(args):
         drop_path_rate=args.mvit_drop_path_rate,
         decoder_layers=args.mvit_decoder_layers,
         teacher_forcing=args.teacher_forcing_prob > 0,
-        pretrained_model_name=args.mvit_pretrained_model
     ).to(device)
     model = OrthoDGCNNModel(
         dgcnn=dgcnn,
