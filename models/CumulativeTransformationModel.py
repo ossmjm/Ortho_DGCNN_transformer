@@ -3,45 +3,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
+
 def sample_and_group(x, npoint, nsample, radius=None, k=16):
-    """Sample npoint points using farthest point sampling and group nsample neighbors."""
+    """
+    Sample npoint points using farthest point sampling and group nsample neighbors.
+    Args:
+        x: Input tensor of shape [B, T, N, C]
+        npoint: Number of points to sample
+        nsample: Number of neighbors to group
+        radius: Not used in this implementation
+        k: Not used in this implementation
+    Returns:
+        sampled_points: Tensor of shape [B, T, npoint, C]
+        neighbor_points: Tensor of shape [B, T, npoint, nsample, C]
+    """
     batch_size, num_teeth, num_points, channels = x.size()
     device = x.device
     logger = logging.getLogger('TrainLogger')
-    
-    # Log implementation
-    logger.info("Using advanced indexing for sample_and_group neighbor grouping")
-    
-    # Flatten for FPS
+
+    # Flatten for processing
     x_flat = x.view(batch_size * num_teeth, num_points, channels)  # [B*T, N, C]
-    idx = torch.zeros(batch_size * num_teeth, npoint, dtype=torch.long, device=device)
-    
-    # Simple FPS: Select random points (approximation for speed)
-    for i in range(batch_size * num_teeth):
-        perm = torch.randperm(num_points, device=device)[:npoint]
-        idx[i] = perm
-    
-    # Gather sampled points (full features for later MLPs)
-    sampled_points = x_flat.gather(1, idx.unsqueeze(-1).expand(-1, -1, channels))  # [B*T, N', C]
-    sampled_points = sampled_points.view(batch_size, num_teeth, npoint, channels)  # [B, T, N', C]
-    
-    # Group neighbors (KNN) using only XYZ coordinates for distance
+
+    # Random sampling (as a placeholder for FPS)
+    idx = torch.randint(0, num_points, (batch_size * num_teeth, npoint), device=device)  # [B*T, npoint]
+
+    # Gather sampled points
+    sampled_points = torch.gather(x_flat, 1, idx.unsqueeze(-1).expand(-1, -1, channels))  # [B*T, npoint, C]
+    sampled_points = sampled_points.view(batch_size, num_teeth, npoint, channels)  # [B, T, npoint, C]
+
+    # Compute pairwise distances
     x_xyz = x_flat[:, :, :3]  # [B*T, N, 3]
-    sampled_xyz = sampled_points.view(batch_size * num_teeth, npoint, channels)[:, :, :3]  # [B*T, N', 3]
-    dists = torch.cdist(x_xyz, sampled_xyz)  # [B*T, N, N']
-    _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N, K]
-    
-    # Debug logging
-    logger.debug(f"sample_and_group: x_flat shape={x_flat.shape}, neighbor_idx shape={neighbor_idx.shape}")
-    if torch.isnan(x_flat).any() or torch.isinf(x_flat).any():
-        logger.warning("x_flat contains NaN or Inf")
-    
-    # Select neighbor points using advanced indexing
-    batch_idx = torch.arange(batch_size * num_teeth, device=device).view(-1, 1, 1).expand(-1, npoint, nsample)  # [B*T, N', K]
-    neighbor_idx = neighbor_idx[:, idx, :]  # [B*T, N', K]
-    neighbor_points = x_flat[batch_idx, neighbor_idx, :]  # [B*T, N', K, C]
-    neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)  # [B, T, N', K, C]
-    
+    sampled_xyz = sampled_points.view(batch_size * num_teeth, npoint, channels)[:, :, :3]  # [B*T, npoint, 3]
+    dists = torch.cdist(sampled_xyz, x_xyz)  # [B*T, npoint, N]
+
+    # Find nsample nearest neighbors
+    _, neighbor_idx = dists.topk(k=nsample, dim=-1, largest=False)  # [B*T, npoint, nsample]
+
+    # Gather neighbor points
+    batch_idx = torch.arange(batch_size * num_teeth, device=device).view(-1, 1, 1).expand(-1, npoint, nsample)
+    neighbor_points = x_flat[batch_idx, neighbor_idx, :]  # [B*T, npoint, nsample, C]
+    neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)  # [B, T, npoint, nsample, C]
+
     return sampled_points, neighbor_points
 
 class PointNetSetAbstraction(nn.Module):
