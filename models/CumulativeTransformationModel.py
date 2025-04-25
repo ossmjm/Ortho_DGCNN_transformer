@@ -7,6 +7,7 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     """Sample npoint points using farthest point sampling and group nsample neighbors."""
     batch_size, num_teeth, num_points, channels = x.size()
     device = x.device
+    logger = logging.getLogger('TrainLogger')
     
     # Flatten for FPS
     x_flat = x.view(batch_size * num_teeth, num_points, channels)
@@ -27,9 +28,16 @@ def sample_and_group(x, npoint, nsample, radius=None, k=16):
     dists = torch.cdist(x_xyz, sampled_xyz)  # Distance on XYZ
     _, neighbor_idx = dists.topk(k=nsample, dim=2, largest=False)  # [B*T, N', K]
     
+    # Debug logging
+    logger.debug(f"sample_and_group: x_flat shape={x_flat.shape}, neighbor_idx shape={neighbor_idx.shape}")
+    logger.debug(f"neighbor_idx after unsqueeze shape={neighbor_idx.unsqueeze(-1).shape}")
+    if torch.isnan(x_flat).any() or torch.isinf(x_flat).any():
+        logger.warning("x_flat contains NaN or Inf")
+    
     # Gather neighbor features (full features)
     neighbor_idx = neighbor_idx.unsqueeze(-1)  # [B*T, N', K, 1]
-    neighbor_points = x_flat.gather(1, neighbor_idx.expand(-1, -1, -1, channels))  # [B*T, N', K, C]
+    neighbor_idx = neighbor_idx.expand(-1, -1, -1, channels)  # [B*T, N', K, C]
+    neighbor_points = x_flat.gather(1, neighbor_idx)  # [B*T, N', K, C]
     neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)
     
     return sampled_points, neighbor_points

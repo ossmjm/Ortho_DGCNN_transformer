@@ -9,7 +9,7 @@ from dataset import JawTeethDataset
 from models.MViT import MViTv2
 from models.OrthoDGCNN import OrthoDGCNNModel
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch import amp
 import pandas as pd
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -141,13 +141,13 @@ def main(args):
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    # LossFFD functions
+    # Loss functions
     smooth_l1_loss = WeightedSmoothL1Loss().to(device)
     mae_loss = nn.L1Loss().to(device)
     bce_loss = nn.BCEWithLogitsLoss().to(device)
     
     # Mixed precision scaler
-    scaler = GradScaler()
+    scaler = amp.GradScaler()
     
     best_val_loss = float('inf')
     
@@ -158,7 +158,7 @@ def main(args):
             feats, transformations, cumulative_transforms, num_stages, activity, param_activity = [x.to(device) for x in batch]
             
             optimizer.zero_grad()
-            with autocast():
+            with amp.autocast('cuda'):
                 pred_transforms, activity_logits, param_activity_logits, pred_cumulative = model(
                     feats,
                     targets=transformations,
@@ -212,7 +212,7 @@ def main(args):
             for batch in val_loader:
                 feats, transformations, cumulative_transforms, num_stages, activity, param_activity = [x.to(device) for x in batch]
                 
-                with autocast():
+                with amp.autocast('cuda'):
                     pred_transforms, activity_logits, param_activity_logits, pred_cumulative = model(
                         feats,
                         targets=transformations,
