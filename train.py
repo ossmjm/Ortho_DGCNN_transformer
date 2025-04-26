@@ -59,6 +59,7 @@ class WeightedSmoothL1Loss(nn.Module):
         return loss
 
 def zero_prediction_loss(pred, target, activity_mask, stage_weights, threshold=0.1):
+    activity_mask = activity_mask.unsqueeze(-1)  # Add dimension for matching
     zero_mask = (target == 0).float() * activity_mask
     non_zero_pred = torch.abs(pred) * zero_mask
     loss = torch.relu(non_zero_pred - threshold) ** 2
