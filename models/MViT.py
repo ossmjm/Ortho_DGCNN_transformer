@@ -185,9 +185,10 @@ class MViTv2(nn.Module):
         x = self.channel_proj(x)  # [B, 3, T, 224, 224]
         
         logger.debug(f"Input to mvit: {x.shape}")  # [B, 3, T, 224, 224]
-        
+        print(f"MViT input {x.shape}")
         # Pass through MViTv2
         x = self.mvit(x)  # x: [B, N, 768]
+        print(f"After mvit: {x.shape}")
         x = x.mean(dim=1)  # Global average pooling over tokens -> [B, 768]
         x = x.unsqueeze(1).expand(-1, self.num_teeth, -1)  # [B, num_teeth, 768]
 
