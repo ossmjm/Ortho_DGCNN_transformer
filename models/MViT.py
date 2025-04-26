@@ -181,15 +181,15 @@ class MViTv2(nn.Module):
         
         # Log input shape
         logger.debug(f"Input to mvit: shape={x.shape}")
-        
         # Pass through MViTv2
-        x = self.mvit(x)  # [B, 768]
-        x = x.view(B, self.num_teeth, 768)  # [B, T, 768]
-        
+        x = self.mvit(x)   # [B, N, 768]
+        x = x.mean(dim=1)  # [B, 768]   # Global average pooling
+        x = x.unsqueeze(1).expand(-1, self.num_teeth, -1)  # [B, num_teeth, 768]
+
         # Project features
-        x = self.feature_proj(x)  # [B, T, embed_dim * 4]
-        x = x + self.pos_embed  # [B, T, embed_dim * 4]
-        
+        x = self.feature_proj(x)  # [B, num_teeth, embed_dim * 4]
+        x = x + self.pos_embed    # [B, num_teeth, embed_dim * 4]
+
         # Use cumulative transforms
         cumulative_input = cumulative_transforms if not cumulative_teacher_forcing else targets
         
