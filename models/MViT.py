@@ -35,14 +35,19 @@ class TransformerDecoder(nn.Module):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
         device = memory.device
-        
+
         # Prepare target sequence
         tgt = torch.zeros(B, self.max_stages, self.num_teeth, self.embed_dim, device=device)
         if use_teacher_forcing and targets is not None:
             targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)
             targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
-            tgt[:, :-1, :, :] = self.target_embed(targets_scaled[:, :-1, :, :])  # <<< Fix: project targets to embed_dim
-        
+            
+            embedded_targets = self.target_embed(targets_scaled[:, :-1, :, :]).contiguous()  # [B, max_stages-1, num_teeth, embed_dim]
+            print(f"tgt shape: {tgt.shape}")
+            print(f"targets_scaled shape: {targets_scaled.shape}")
+            print(f"embedded_targets shape: {embedded_targets.shape}")
+
+            tgt[:, :-1, :, :] = embedded_targets 
         # Add positional encoding
         tgt = tgt + self.pos_embed.unsqueeze(2)  # [B, max_stages, num_teeth, embed_dim]
         
