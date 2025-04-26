@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
 import logging
 
