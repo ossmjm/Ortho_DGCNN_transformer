@@ -189,7 +189,7 @@ class MViTv2(nn.Module):
         # Pass through MViTv2
         x = self.mvit(x)  # x: [B, N, 768]
         print(f"After mvit: {x.shape}")
-        x = x.mean(dim=1)  # Global average pooling over tokens -> [B, 768]
+        # x = x.mean(dim=1)  # Global average pooling over tokens -> [B, 768]
         x = x.unsqueeze(1).expand(-1, self.num_teeth, -1)  # [B, num_teeth, 768]
 
         # Project features
