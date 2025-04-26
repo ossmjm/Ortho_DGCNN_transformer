@@ -116,6 +116,10 @@ class MViTv2(nn.Module):
             nn.ReLU()
         )
         
+        # Channel projection to match MViTv2 input (96 -> 3 channels)
+        self.channel_proj = nn.Conv3d(embed_dim, 3, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.channel_proj.weight, mode='fan_out', nonlinearity='relu')
+        
         # Feature projection
         self.feature_proj = nn.Linear(768, embed_dim * 4)  # MViTv2 outputs 768-dim features
         self.pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim * 4))
@@ -161,6 +165,9 @@ class MViTv2(nn.Module):
         # Reshape for MViTv2: Treat teeth as frames
         x = x.view(B, self.num_teeth, self.num_points, self.embed_dim).permute(0, 3, 1, 2)  # [B, embed_dim, T, N]
         x = x.view(B, self.embed_dim, 1, self.num_teeth, self.num_points)  # [B, embed_dim, 1, T, N]
+        
+        # Project channels to match MViTv2 input
+        x = self.channel_proj(x)  # [B, 3, 1, T, N]
         
         # Pass through MViTv2
         x = self.mvit(x)  # [B, 768]
