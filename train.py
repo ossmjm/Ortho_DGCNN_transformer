@@ -45,8 +45,10 @@ class WeightedSmoothL1Loss(nn.Module):
         )
         weights = torch.exp(-self.alpha * torch.clamp(diff, min=self.epsilon)) + self.gamma
         if activity_mask is not None:
+            activity_mask = activity_mask.unsqueeze(-1)  # Make sure it has a 4th dimension
             smooth_l1 = smooth_l1 * activity_mask
             weights = weights * activity_mask
+
         if stage_weights is not None:
             stage_weights_expanded = stage_weights.unsqueeze(-1).unsqueeze(-1)
             smooth_l1 = smooth_l1 * stage_weights_expanded
