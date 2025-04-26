@@ -27,7 +27,7 @@ class TransformerDecoder(nn.Module):
         
         # Output layer for transformations
         self.out_layer = nn.Linear(embed_dim, 6)
-        
+        self.target_embed = nn.Linear(6, embed_dim)  # <<< New line
         # Initialize weights
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
     
@@ -41,7 +41,7 @@ class TransformerDecoder(nn.Module):
         if use_teacher_forcing and targets is not None:
             targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)
             targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
-            tgt[:, :-1, :, :] = self.out_layer.weight.new_zeros(targets_scaled[:, :-1, :, :].shape)
+            tgt[:, :-1, :, :] = self.target_embed(targets_scaled[:, :-1, :, :])  # <<< Fix: project targets to embed_dim
         
         # Add positional encoding
         tgt = tgt + self.pos_embed.unsqueeze(2)  # [B, max_stages, num_teeth, embed_dim]
@@ -184,11 +184,11 @@ class MViTv2(nn.Module):
         # Project channels to 3 for MViT
         x = self.channel_proj(x)  # [B, 3, T, 224, 224]
         
-        logger.debug(f"Input to mvit: {x.shape}")  # [B, 3, T, 224, 224]
-        print(f"MViT input {x.shape}")
+        # logger.debug(f"Input to mvit: {x.shape}")  # [B, 3, T, 224, 224]
+        # print(f"MViT input {x.shape}")
         # Pass through MViTv2
         x = self.mvit(x)  # x: [B, N, 768]
-        print(f"After mvit: {x.shape}")
+        # print(f"After mvit: {x.shape}")
         # x = x.mean(dim=1)  # Global average pooling over tokens -> [B, 768]
         x = x.unsqueeze(1).expand(-1, self.num_teeth, -1)  # [B, num_teeth, 768]
 
