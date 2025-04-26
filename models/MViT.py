@@ -162,12 +162,24 @@ class MViTv2(nn.Module):
         x = self.input_adapter(x)  # [B, embed_dim, T, N]
         x = x.permute(0, 2, 3, 1).contiguous()  # [B, T, N, embed_dim]
         
-        # Reshape for MViTv2: Treat teeth as frames
-        x = x.view(B, self.num_teeth, self.num_points, self.embed_dim).permute(0, 3, 1, 2)  # [B, embed_dim, T, N]
-        x = x.view(B, self.embed_dim, 1, self.num_teeth, self.num_points)  # [B, embed_dim, 1, T, N]
+        # Reshape for MViTv2: Treat num_teeth as temporal dimension, num_points as spatial
+        spatial_dim = int(self.num_points ** 0.5)  # e.g., sqrt(256) = 16
+        x = x.view(B, self.num_teeth, spatial_dim, spatial_dim, self.embed_dim)  # [B, T, H, W, embed_dim]
+        x = x.permute(0, 4, 1, 2, 3).contiguous()  # [B, embed_dim, T, H, W]
+        
+        # Pad spatial dimensions to match expected input size (e.g., 224x224)
+        target_h = target_w = 224
+        h, w = x.size(3), x.size(4)
+        pad_h = target_h - h
+        pad_w = target_w - w
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0, 0, 0, 0, 0))  # [B, embed_dim, T, 224, 224]
         
         # Project channels to match MViTv2 input
-        x = self.channel_proj(x)  # [B, 3, 1, T, N]
+        x = self.channel_proj(x)  # [B, 3, T, 224, 224]
+        
+        # Log input shape
+        logger.debug(f"Input to mvit: shape={x.shape}")
         
         # Pass through MViTv2
         x = self.mvit(x)  # [B, 768]
