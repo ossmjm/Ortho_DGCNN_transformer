@@ -43,7 +43,7 @@ class TransformerDecoder(nn.Module):
             targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
             
             embedded_targets = self.target_embed(targets_scaled[:, :-1, :, :]).contiguous()
-            print(f"tgt shape: {tgt.shape}")
+            print(f"tgt shape: {targets.shape}")
             print(f"targets_scaled shape: {targets_scaled.shape}")
             print(f"embedded_targets shape: {embedded_targets.shape}")
 
