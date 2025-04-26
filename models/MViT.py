@@ -40,6 +40,7 @@ class TransformerDecoder(nn.Module):
         tgt = torch.zeros(B, self.max_stages, self.num_teeth, self.embed_dim, device=device)
         if use_teacher_forcing and targets is not None:            
             targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)
+            print(f"targets_scaled shape: {targets_scaled.shape}")
             targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
             
             embedded_targets = self.target_embed(targets_scaled[:, :-1, :, :]).contiguous()
