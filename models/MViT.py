@@ -150,7 +150,7 @@ class MViTv2(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
         elif isinstance(m, (nn.Conv2d, nn.Conv3d)):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-    
+
     def forward(self, x, cumulative_transforms, num_stages=None, targets=None, epoch=None, total_epochs=None, cumulative_teacher_forcing=False):
         logger = logging.getLogger('TrainLogger')
         B = x.size(0)
@@ -168,32 +168,36 @@ class MViTv2(nn.Module):
         x = x.view(B, self.num_teeth, spatial_dim, spatial_dim, self.embed_dim)  # [B, T, H, W, embed_dim]
         x = x.permute(0, 4, 1, 2, 3).contiguous()  # [B, embed_dim, T, H, W]
         
-        # Pad spatial dimensions to match expected input size (e.g., 224x224)
+        # Pad spatial dimensions to 224x224 if necessary
         target_h = target_w = 224
         h, w = x.size(3), x.size(4)
         pad_h = target_h - h
         pad_w = target_w - w
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0, 0, 0, 0, 0))  # [B, embed_dim, T, 224, 224]
+            x = F.pad(x, (0, pad_w, 0, pad_h))  # pad (left, right, top, bottom)
         
-        # Project channels to match MViTv2 input
+        # Pad temporal dimension to 16 frames if necessary
+        if x.size(2) < 16:
+            pad_t = 16 - x.size(2)
+            x = F.pad(x, (0, 0, 0, 0, 0, 0, 0, pad_t))  # pad T dimension
+
+        # Project channels to 3 for MViT
         x = self.channel_proj(x)  # [B, 3, T, 224, 224]
         
-        # Log input shape
-        logger.debug(f"Input to mvit: shape={x.shape}")
+        logger.debug(f"Input to mvit: {x.shape}")  # [B, 3, T, 224, 224]
+        
         # Pass through MViTv2
-        x = self.mvit(x)   # [B, N, 768]
-        x = x.mean(dim=1)  # [B, 768]   # Global average pooling
+        x = self.mvit(x)  # x: [B, N, 768]
+        x = x.mean(dim=1)  # Global average pooling over tokens -> [B, 768]
         x = x.unsqueeze(1).expand(-1, self.num_teeth, -1)  # [B, num_teeth, 768]
 
         # Project features
         x = self.feature_proj(x)  # [B, num_teeth, embed_dim * 4]
-        x = x + self.pos_embed    # [B, num_teeth, embed_dim * 4]
-
-        # Use cumulative transforms
+        x = x + self.pos_embed  # [B, num_teeth, embed_dim * 4]
+        
+        # Rest is the same: decoding
         cumulative_input = cumulative_transforms if not cumulative_teacher_forcing else targets
         
-        # Decode stage-wise transformations
         use_stage_teacher_forcing = self.training and self.teacher_forcing and targets is not None
         alpha = min(1.0, epoch / (total_epochs * 0.5)) if epoch is not None and total_epochs is not None else 1.0
         use_stage_teacher_forcing = use_stage_teacher_forcing and torch.rand(1).item() < alpha
@@ -205,7 +209,7 @@ class MViTv2(nn.Module):
             targets=targets,
             use_teacher_forcing=use_stage_teacher_forcing,
             training=self.training
-        )  # [B, max_stages, num_teeth, embed_dim * 4], [B, max_stages, num_teeth, 6]
+        )
         
         logger.debug(f"MViTv2 output range: min={transforms_sequence.min().item():.4f}, max={transforms_sequence.max().item():.4f}")
         return decoder_features, transforms_sequence
