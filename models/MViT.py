@@ -38,10 +38,7 @@ class TransformerDecoder(nn.Module):
 
         # Prepare target sequence
         tgt = torch.zeros(B, self.max_stages, self.num_teeth, self.embed_dim, device=device)
-        if use_teacher_forcing and targets is not None:
-            if targets.dim() == 5:
-                targets = targets[:, 0, :, :, :]  # Remove duplicate batch dimension
-            
+        if use_teacher_forcing and targets is not None:            
             targets_scaled = targets / (targets.abs().sum(dim=1, keepdim=True) + 1e-6)
             targets_scaled = targets_scaled * cumulative_transforms.unsqueeze(1)
             
@@ -211,7 +208,11 @@ class MViTv2(nn.Module):
         use_stage_teacher_forcing = self.training and self.teacher_forcing and targets is not None
         alpha = min(1.0, epoch / (total_epochs * 0.5)) if epoch is not None and total_epochs is not None else 1.0
         use_stage_teacher_forcing = use_stage_teacher_forcing and torch.rand(1).item() < alpha
-        
+        # Fix targets if extra dimension
+        if targets is not None and targets.dim() == 5:
+            targets = targets[:, 0]
+
+        # Call decoder
         decoder_features, transforms_sequence = self.decoder(
             memory=x,
             cumulative_transforms=cumulative_input,
@@ -220,6 +221,5 @@ class MViTv2(nn.Module):
             use_teacher_forcing=use_stage_teacher_forcing,
             training=self.training
         )
-        
         logger.debug(f"MViTv2 output range: min={transforms_sequence.min().item():.4f}, max={transforms_sequence.max().item():.4f}")
         return decoder_features, transforms_sequence
