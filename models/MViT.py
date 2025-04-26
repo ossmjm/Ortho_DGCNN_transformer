@@ -210,7 +210,9 @@ class MViTv2(nn.Module):
         use_stage_teacher_forcing = use_stage_teacher_forcing and torch.rand(1).item() < alpha
         # Fix targets if extra dimension
         if targets is not None and targets.dim() == 5:
+            print(f'Targets dim before:{targets.shape}')
             targets = targets[:, 0]
+            print(f'Targets dim after:{targets.shape}')
 
         # Call decoder
         decoder_features, transforms_sequence = self.decoder(
