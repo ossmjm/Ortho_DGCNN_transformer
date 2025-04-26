@@ -174,12 +174,12 @@ class MViTv2(nn.Module):
         pad_h = target_h - h
         pad_w = target_w - w
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))  # pad (left, right, top, bottom)
-        
-        # Pad temporal dimension to 16 frames if necessary
+            x = F.pad(x, (0, pad_w, 0, pad_h))  # pad width, then height
+
+        # Pad temporal dimension (T) up to 16 frames
         if x.size(2) < 16:
             pad_t = 16 - x.size(2)
-            x = F.pad(x, (0, 0, 0, 0, 0, 0, 0, pad_t))  # pad T dimension
+            x = torch.cat([x, torch.zeros(x.size(0), x.size(1), pad_t, x.size(3), x.size(4), device=x.device)], dim=2)
 
         # Project channels to 3 for MViT
         x = self.channel_proj(x)  # [B, 3, T, 224, 224]
