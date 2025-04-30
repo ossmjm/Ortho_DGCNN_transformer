@@ -1,124 +1,38 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import logging
 
-
-def sample_and_group(x, npoint, nsample, radius=None, k=16):
-    """
-    Sample npoint points using farthest point sampling and group nsample neighbors.
-    Args:
-        x: Input tensor of shape [B, T, N, C]
-        npoint: Number of points to sample
-        nsample: Number of neighbors to group
-        radius: Not used in this implementation
-        k: Not used in this implementation
-    Returns:
-        sampled_points: Tensor of shape [B, T, npoint, C]
-        neighbor_points: Tensor of shape [B, T, npoint, nsample, C]
-    """
-    batch_size, num_teeth, num_points, channels = x.size()
-    device = x.device
-    logger = logging.getLogger('TrainLogger')
-
-    # Flatten for processing
-    x_flat = x.view(batch_size * num_teeth, num_points, channels)  # [B*T, N, C]
-
-    # Random sampling (as a placeholder for FPS)
-    idx = torch.randint(0, num_points, (batch_size * num_teeth, npoint), device=device)  # [B*T, npoint]
-
-    # Gather sampled points
-    sampled_points = torch.gather(x_flat, 1, idx.unsqueeze(-1).expand(-1, -1, channels))  # [B*T, npoint, C]
-    sampled_points = sampled_points.view(batch_size, num_teeth, npoint, channels)  # [B, T, npoint, C]
-
-    # Compute pairwise distances
-    x_xyz = x_flat[:, :, :3]  # [B*T, N, 3]
-    sampled_xyz = sampled_points.view(batch_size * num_teeth, npoint, channels)[:, :, :3]  # [B*T, npoint, 3]
-    dists = torch.cdist(sampled_xyz, x_xyz)  # [B*T, npoint, N]
-
-    # Find nsample nearest neighbors
-    _, neighbor_idx = dists.topk(k=nsample, dim=-1, largest=False)  # [B*T, npoint, nsample]
-
-    # Gather neighbor points
-    batch_idx = torch.arange(batch_size * num_teeth, device=device).view(-1, 1, 1).expand(-1, npoint, nsample)
-    neighbor_points = x_flat[batch_idx, neighbor_idx, :]  # [B*T, npoint, nsample, C]
-    neighbor_points = neighbor_points.view(batch_size, num_teeth, npoint, nsample, channels)  # [B, T, npoint, nsample, C]
-
-    return sampled_points, neighbor_points
-
-class PointNetSetAbstraction(nn.Module):
-    def __init__(self, npoint, nsample, in_channels, mlp, k=16):
-        super().__init__()
-        self.npoint = npoint
-        self.nsample = nsample
-        self.k = k
-        self.mlp = nn.ModuleList()
-        last_channels = in_channels
-        for out_channels in mlp:
-            self.mlp.append(nn.Sequential(
-                nn.Conv2d(last_channels, out_channels, 1, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            ))
-            last_channels = out_channels
-    
-    def forward(self, x):
-        # x: [batch_size, num_teeth, num_points, channels]
-        sampled_points, grouped_points = sample_and_group(x, self.npoint, self.nsample, k=self.k)
-        # grouped_points: [batch_size, num_teeth, npoint, nsample, channels]
-        
-        # Center points
-        grouped_points = grouped_points - sampled_points.unsqueeze(3)  # [B, T, N', K, C]
-        grouped_points = grouped_points.permute(0, 1, 4, 2, 3).contiguous()  # [B, T, C, N', K]
-        grouped_points = grouped_points.view(-1, grouped_points.size(2), grouped_points.size(3), grouped_points.size(4))
-        
-        # Apply MLPs
-        for mlp_layer in self.mlp:
-            grouped_points = mlp_layer(grouped_points)
-        
-        # Max-pool over neighbors
-        features = grouped_points.max(dim=-1)[0]  # [B*T, C', N']
-        features = features.view(-1, x.size(1), features.size(1), features.size(2))  # [B, T, C', N']
-        features = features.permute(0, 1, 3, 2).contiguous()  # [B, T, N', C']
-        
-        return features
-
 class CumulativeTransformationModel(nn.Module):
-    def __init__(self, num_teeth=14, num_points=256, channels=13, embed_dim=256, num_heads=4):
+    def __init__(self, num_teeth=14, embed_dim=384):
         super().__init__()
         self.num_teeth = num_teeth
-        self.num_points = num_points
-        self.channels = channels
         self.embed_dim = embed_dim
-        self.num_heads = num_heads
+        self.logger = logging.getLogger('TrainLogger')
         
-        # PointNet++ Set Abstraction Layers
-        self.sa1 = PointNetSetAbstraction(
-            npoint=64, nsample=32, in_channels=channels, mlp=[64, 128], k=16
-        )
-        self.sa2 = PointNetSetAbstraction(
-            npoint=16, nsample=16, in_channels=128, mlp=[256, 512], k=8
-        )
-        
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=512, num_heads=num_heads, dropout=0.1, batch_first=True
-        )
-        
-        # Global pooling and MLP
         self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 512),
+            nn.BatchNorm1d(512, eps=1e-3),  # Increased eps
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.BatchNorm1d(256, eps=1e-3),  # Increased eps
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.BatchNorm1d(128, eps=1e-3),  # Increased eps
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(128, 6)
         )
+        self.activity_head = nn.Linear(embed_dim, 1)
+        self.param_activity_head = nn.Linear(embed_dim, 6)
         
         self._init_weights()
+        
+        # Freeze BatchNorm statistics during early training
+        for module in self.mlp:
+            if isinstance(module, nn.BatchNorm1d):
+                module.eval()
     
     def _init_weights(self):
         for m in self.modules():
@@ -126,42 +40,26 @@ class CumulativeTransformationModel(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.Conv2d, nn.Conv3d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        logger = logging.getLogger('TrainLogger')
-        logger.debug(f"CumulativeTransformationModel input shape={x.shape}")
+        batch_size, num_teeth, embed_dim = x.size()
+        assert num_teeth == self.num_teeth, f"Expected num_teeth={self.num_teeth}, got {num_teeth}"
+        assert embed_dim == self.embed_dim, f"Expected embed_dim={self.embed_dim}, got {embed_dim}"
         
-        # Input: [batch_size, num_teeth, num_points, channels]
-        batch_size, num_teeth, num_points, channels = x.size()
+        x = x.view(batch_size * num_teeth, embed_dim)
+        self.logger.debug(f"MLP input min: {x.min().item():.4f}, max: {x.max().item():.4f}, has_nan: {torch.isnan(x).any().item()}")
         
-        # Validate input
-        if num_teeth != self.num_teeth or num_points != self.num_points or channels != self.channels:
-            raise ValueError(f"Expected input [B, {self.num_teeth}, {self.num_points}, {self.channels}], got {x.shape}")
+        transforms = self.mlp(x)
+        transforms = torch.clamp(transforms, -100, 100)  # Clamp outputs
+        self.logger.debug(f"MLP output (transforms) min: {transforms.min().item():.4f}, max: {transforms.max().item():.4f}, has_nan: {torch.isnan(transforms).any().item()}")
         
-        # Set Abstraction
-        x = self.sa1(x)  # [batch_size, num_teeth, 64, 128]
-        x = self.sa2(x)  # [batch_size, num_teeth, 16, 512]
+        transforms = transforms.view(batch_size, num_teeth, 6)
+        activity_logits = self.activity_head(x).view(batch_size, num_teeth)
+        param_activity_logits = self.param_activity_head(x).view(batch_size, num_teeth, 6)
         
-        # Multi-head attention
-        x = x.view(batch_size * num_teeth, 16, 512)  # [B*T, 16, 512]
-        attn_output, _ = self.attention(x, x, x)  # [B*T, 16, 512]
-        x = x + attn_output  # Residual connection
-        x = x.view(batch_size, num_teeth, 16, 512)  # [B, T, 16, 512]
-        
-        # Global max-pooling
-        x = x.max(dim=2)[0]  # [batch_size, num_teeth, 512]
-        
-        # MLP for transformation prediction
-        x = x.view(-1, 512)  # [B*T, 512]
-        transforms = self.mlp(x)  # [B*T, 6]
-        transforms = transforms.view(batch_size, num_teeth, 6)  # [batch_size, num_teeth, 6]
-        
-        logger.debug(f"CumulativeTransformationModel output shape={transforms.shape}")
-        return transforms
+        self.logger.debug(f"CumulativeTransformationModel output shape: transforms={transforms.shape}, "
+                         f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}")
+        return transforms, activity_logits, param_activity_logits
