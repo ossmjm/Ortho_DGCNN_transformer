@@ -453,7 +453,6 @@ def train(args):
 
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
-            patience_counter = 0
             checkpoint = {
                 'epoch': epoch + 1,
                 'dgcnn_state_dict': model.dgcnn.state_dict(),
@@ -467,12 +466,28 @@ def train(args):
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'best_model.pth'))
             logger.info(f"Saved best model at epoch {epoch+1} with val_loss {best_val_loss:.4f}")
-        else:
-            patience_counter += 1
+        if epoch == (args.epochs - 1):
+            last_val_losses = val_losses['total']
+            checkpoint = {
+                'epoch': epoch + 1,
+                'dgcnn_state_dict': model.dgcnn.state_dict(),
+                'decoder_state_dict': model.decoder.state_dict(),
+                'cumulative_model_state_dict': model.cumulative_model.state_dict(),
+                'ortho_dgcnn_state_dict': model.state_dict(),
+                'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
+                'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
+                'optimizer_cumulative_state_dict': optimizer_cumulative.state_dict(),
+                'val_loss': last_val_losses
+            }
+            torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
+            logger.info(f"Saved best model at epoch {epoch+1} with val_loss {last_val_losses:.4f}")
 
-        if patience_counter >= args.patience:
-            logger.info(f"Early stopping at epoch {epoch+1}")
-            break
+        # else:
+        #     patience_counter += 1
+
+        # if patience_counter >= args.patience:
+        #     logger.info(f"Early stopping at epoch {epoch+1}")
+        #     break
 
     logger.info("Training completed")
 
