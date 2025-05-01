@@ -292,24 +292,50 @@ def train(args):
                 pred_transforms, activity_logits, type_logits, param_activity_logits, pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits,
                 transforms, activity, type_labels, param_activity, cumulative_transforms, cumulative_activity, cumulative_param_activity, num_stages, args.max_stages, device, logger, args
             )
-            # 4) Zero out all grads before the single backward
+            # 1. Zero all grads
             optimizer_decoder.zero_grad()
             optimizer_cumulative.zero_grad()
             optimizer_dgcnn.zero_grad()
-            # 5) Single backward pass
-            total_loss.backward()
-            # 6) (Optional) Clip each sub-module’s gradients independently
+
+            # 2. First backward pass (retain graph)
+            stagewise_loss.backward(retain_graph=True)
+
+            # 3. Second backward pass
+            cumulative_loss.backward()
+
+            # 4. Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
             torch.nn.utils.clip_grad_norm_(model.cumulative_model.parameters(), max_norm=0.5)
             torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
-            # 7) Step each optimizer (they only update their own parameters!)
+
+            # 5. Step each optimizer
             optimizer_decoder.step()
             optimizer_cumulative.step()
             optimizer_dgcnn.step()
-            # 8) Scheduler steps
+
+            # 6. Step schedulers
             scheduler_decoder.step()
             scheduler_cumulative.step()
             scheduler_dgcnn.step()
+
+            # # 4) Zero out all grads before the single backward
+            # optimizer_decoder.zero_grad()
+            # optimizer_cumulative.zero_grad()
+            # optimizer_dgcnn.zero_grad()
+            # # 5) Single backward pass
+            # total_loss.backward()
+            # # 6) (Optional) Clip each sub-module’s gradients independently
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
+            # torch.nn.utils.clip_grad_norm_(model.cumulative_model.parameters(), max_norm=0.5)
+            # torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
+            # # 7) Step each optimizer (they only update their own parameters!)
+            # optimizer_decoder.step()
+            # optimizer_cumulative.step()
+            # optimizer_dgcnn.step()
+            # # 8) Scheduler steps
+            # scheduler_decoder.step()
+            # scheduler_cumulative.step()
+            # scheduler_dgcnn.step()
 
             # check_gradients(model.decoder, logger, "before stagewise_loss")
             # stagewise_loss.backward(retain_graph=True)
