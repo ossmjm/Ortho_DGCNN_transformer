@@ -66,7 +66,7 @@ class OrthoDGCNNModel(nn.Module):
             features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
             
         features = self.feature_norm(features)
-        features = torch.clamp(features, -100, 100)
+     
         
         cumulative_features = features.detach()
         cumulative_transforms, cumulative_activity_logits, cumulative_param_activity_logits = self.cumulative_model(cumulative_features)
@@ -74,7 +74,6 @@ class OrthoDGCNNModel(nn.Module):
         if torch.isnan(cumulative_transforms).any():
             logger.error("NaN values detected in cumulative_transforms")
             cumulative_transforms = torch.nan_to_num(cumulative_transforms, nan=0.0, posinf=1.0, neginf=-1.0)
-            cumulative_transforms = torch.clamp(cumulative_transforms, -100.0, 100.0)
             
         alpha = max(0.0, 1.0 - (epoch / (total_epochs * 0.5))) if epoch is not None and total_epochs is not None else 0.0
         use_cumulative_teacher_forcing = self.training and self.teacher_forcing and cumulative_targets is not None and torch.rand(1).item() < alpha
@@ -83,7 +82,6 @@ class OrthoDGCNNModel(nn.Module):
         if use_cumulative_teacher_forcing and torch.isnan(cumulative_targets).any():
             logger.error("NaN values detected in cumulative_targets")
             cumulative_input = torch.nan_to_num(cumulative_targets, nan=0.0, posinf=1.0, neginf=-1.0)
-            cumulative_input = torch.clamp(cumulative_input, -100.0, 100.0)
         
         try:
             decoder_features, transforms_sequence = self.decoder(
@@ -108,12 +106,6 @@ class OrthoDGCNNModel(nn.Module):
             activity_logits = self.activity_head(decoder_features_detached).squeeze(-1)
             param_activity_logits = self.param_activity_head(decoder_features_detached)
             type_logits = self.type_head(decoder_features_detached)
-            
-            activity_logits = torch.clamp(activity_logits, -10.0, 10.0)
-            param_activity_logits = torch.clamp(param_activity_logits, -10.0, 10.0)
-            type_logits = torch.clamp(type_logits, -10.0, 10.0)
-            cumulative_activity_logits = torch.clamp(cumulative_activity_logits, -10.0, 10.0)
-            cumulative_param_activity_logits = torch.clamp(cumulative_param_activity_logits, -10.0, 10.0)
             
         except RuntimeError as e:
             logger.error(f"Runtime error in forward pass: {e}")

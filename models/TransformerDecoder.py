@@ -34,12 +34,6 @@ class TransformerDecoder(nn.Module):
         nn.init.xavier_uniform_(self.cumulative_embed.weight, gain=0.1)
         nn.init.zeros_(self.cumulative_embed.bias)
     
-    def _stabilize_gradient(self, x):
-        if self.training:
-            def clip_grad_hook(grad):
-                return torch.clamp(grad, -0.5, 0.5)
-            x.register_hook(clip_grad_hook)
-        return x
     
     def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, use_teacher_forcing=False, training=False):
         logger = logging.getLogger('TrainLogger')
@@ -49,26 +43,24 @@ class TransformerDecoder(nn.Module):
         assert memory.shape == (B, self.num_teeth, self.embed_dim)
         assert cumulative_transforms.shape == (B, self.num_teeth, 6)
         
-        memory = torch.nan_to_num(memory, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-100, 100)
-        cumulative_transforms = torch.nan_to_num(cumulative_transforms, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-100, 100)
-        
+        memory = torch.nan_to_num(memory, nan=0.0, posinf=1.0, neginf=-1.0)
+        cumulative_transforms = torch.nan_to_num(cumulative_transforms, nan=0.0, posinf=1.0, neginf=-1.0)
+
         logger.debug(f"Memory min: {memory.min().item():.4f}, max: {memory.max().item():.4f}, has_nan: {torch.isnan(memory).any().item()}")
         logger.debug(f"Cumulative transforms min: {cumulative_transforms.min().item():.4f}, max: {cumulative_transforms.max().item():.4f}, has_nan: {torch.isnan(cumulative_transforms).any().item()}")
 
         cumulative_embed = self.cumulative_embed(cumulative_transforms)
-        cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-100, 100)
-        cumulative_embed = self._stabilize_gradient(cumulative_embed)
+        cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
         cumulative_embed = cumulative_embed.unsqueeze(1).repeat(1, self.max_stages, 1, 1)
         logger.debug(f"Cumulative embed min: {cumulative_embed.min().item():.4f}, max: {cumulative_embed.max().item():.4f}, has_nan: {torch.isnan(cumulative_embed).any().item()}")
 
         if use_teacher_forcing and targets is not None:
             assert targets.shape == (B, self.max_stages, self.num_teeth, 6)
-            targets = torch.nan_to_num(targets, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-5, 5)
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=1.0, neginf=-1.0)
             logger.debug(f"Targets min: {targets.min().item():.4f}, max: {targets.max().item():.4f}, has_nan: {torch.isnan(targets).any().item()}")
             
             embedded_targets = self.target_embed(targets)
-            embedded_targets = torch.nan_to_num(embedded_targets, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-100, 100)
-            embedded_targets = self._stabilize_gradient(embedded_targets)
+            embedded_targets = torch.nan_to_num(embedded_targets, nan=0.0, posinf=1.0, neginf=-1.0)
             logger.debug(f"Embedded targets min: {embedded_targets.min().item():.4f}, max: {embedded_targets.max().item():.4f}, has_nan: {torch.isnan(embedded_targets).any().item()}")
             
             embedded_targets = embedded_targets + self.pos_embed.unsqueeze(2) + cumulative_embed
@@ -76,20 +68,19 @@ class TransformerDecoder(nn.Module):
         else:
             tgt = (self.pos_embed.unsqueeze(2) + cumulative_embed).view(B, self.max_stages * self.num_teeth, self.embed_dim)
         
-        tgt = self.pre_norm(tgt.clamp(-100, 100))
+        tgt = self.pre_norm(tgt)
         logger.debug(f"Tgt min: {tgt.min().item():.4f}, max: {tgt.max().item():.4f}, has_nan: {torch.isnan(tgt).any().item()}")
 
         cumulative_embed_avg = cumulative_embed.mean(dim=1)
         memory = memory + cumulative_embed_avg.contiguous()
-        memory = memory.clamp(-100, 100)
         
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.max_stages * self.num_teeth).to(device)
         
         try:
             output = self.decoder(tgt, memory, tgt_mask=tgt_mask)
-            output = self.final_norm(output.clamp(-100, 100))
+            output = self.final_norm(output)
             output = output.view(B, self.max_stages, self.num_teeth, self.embed_dim)
-            transforms_sequence = self.out_layer(output).clamp(-50, 50)
+            transforms_sequence = self.out_layer(output)
             
             logger.debug(f"Decoder output min: {output.min().item():.4f}, max: {output.max().item():.4f}, has_nan: {torch.isnan(output).any().item()}")
             logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
@@ -107,14 +98,14 @@ class TransformerDecoder(nn.Module):
                 stage_mask[i, num_stages[i]:] = 0.0
         
         pred_sum = (transforms_sequence * stage_mask).sum(dim=1)
-        residual = (cumulative_transforms - pred_sum).clamp(-2, 2)
+        residual = (cumulative_transforms - pred_sum)
         residual_expanded = residual.unsqueeze(1).repeat(1, self.max_stages, 1, 1).contiguous()
         active_stages = stage_mask.sum(dim=1).view(B, 1, 1, 1).contiguous() + 1e-4
         adjustment = (residual_expanded / active_stages) * stage_mask
         # Avoid inplace operation by creating a new tensor
         transforms_sequence_adjusted = transforms_sequence + adjustment.contiguous()
-        transforms_sequence = transforms_sequence_adjusted.clamp(-50, 50)
-        
+        transforms_sequence = transforms_sequence_adjusted
+
         logger.debug(f"Sum consistency: {((transforms_sequence * stage_mask).sum(dim=1) - cumulative_transforms).abs().mean().item():.4f}")
         logger.debug(f"Cumulative embed weight min: {self.cumulative_embed.weight.min().item():.4f}, max: {self.cumulative_embed.weight.max().item():.4f}")
         return output, transforms_sequence

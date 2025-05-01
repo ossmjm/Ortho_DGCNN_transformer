@@ -240,7 +240,8 @@ def train(args):
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         decoder_layers=args.decoder_layers,
-        k=args.k
+        k=args.k,
+        num_points= args.num_points
     ).to(device)
 
     optimizer_dgcnn = optim.AdamW(model.dgcnn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -291,35 +292,53 @@ def train(args):
                 pred_transforms, activity_logits, type_logits, param_activity_logits, pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits,
                 transforms, activity, type_labels, param_activity, cumulative_transforms, cumulative_activity, cumulative_param_activity, num_stages, args.max_stages, device, logger, args
             )
-
-            check_gradients(model.decoder, logger, "before stagewise_loss")
-            stagewise_loss.backward(retain_graph=True)
-            check_gradients(model.decoder, logger, "after stagewise_loss")
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
-            optimizer_decoder.step()
+            # 4) Zero out all grads before the single backward
             optimizer_decoder.zero_grad()
-            optimizer_dgcnn.zero_grad()  # Clear dgcnn gradients after decoder update
-
-            check_gradients(model.cumulative_model, logger, "before cumulative_loss")
-            cumulative_loss.backward(retain_graph=True)
-            check_gradients(model.cumulative_model, logger, "after cumulative_loss")
-            torch.nn.utils.clip_grad_norm_(model.cumulative_model.parameters(), max_norm=0.5)
-            optimizer_cumulative.step()
             optimizer_cumulative.zero_grad()
-            optimizer_dgcnn.zero_grad()  # Clear dgcnn gradients after cumulative update
-
-            check_gradients(model.dgcnn, logger, "before total_loss")
-            total_loss.backward()
-            check_gradients(model.dgcnn, logger, "after total_loss")
-            torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
-            optimizer_dgcnn.step()
             optimizer_dgcnn.zero_grad()
-            optimizer_decoder.zero_grad()
-            optimizer_cumulative.zero_grad()
-
-            scheduler_dgcnn.step()
+            # 5) Single backward pass
+            total_loss.backward()
+            # 6) (Optional) Clip each sub-module’s gradients independently
+            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.cumulative_model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
+            # 7) Step each optimizer (they only update their own parameters!)
+            optimizer_decoder.step()
+            optimizer_cumulative.step()
+            optimizer_dgcnn.step()
+            # 8) Scheduler steps
             scheduler_decoder.step()
             scheduler_cumulative.step()
+            scheduler_dgcnn.step()
+
+            # check_gradients(model.decoder, logger, "before stagewise_loss")
+            # stagewise_loss.backward(retain_graph=True)
+            # check_gradients(model.decoder, logger, "after stagewise_loss")
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
+            # optimizer_decoder.step()
+            # optimizer_decoder.zero_grad()
+            # optimizer_dgcnn.zero_grad()  # Clear dgcnn gradients after decoder update
+
+            # check_gradients(model.cumulative_model, logger, "before cumulative_loss")
+            # cumulative_loss.backward(retain_graph=True)
+            # check_gradients(model.cumulative_model, logger, "after cumulative_loss")
+            # torch.nn.utils.clip_grad_norm_(model.cumulative_model.parameters(), max_norm=0.5)
+            # optimizer_cumulative.step()
+            # optimizer_cumulative.zero_grad()
+            # optimizer_dgcnn.zero_grad()  # Clear dgcnn gradients after cumulative update
+
+            # check_gradients(model.dgcnn, logger, "before total_loss")
+            # total_loss.backward()
+            # check_gradients(model.dgcnn, logger, "after total_loss")
+            # torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
+            # optimizer_dgcnn.step()
+            # optimizer_dgcnn.zero_grad()
+            # optimizer_decoder.zero_grad()
+            # optimizer_cumulative.zero_grad()
+
+            # scheduler_dgcnn.step()
+            # scheduler_decoder.step()
+            # scheduler_cumulative.step()
 
             train_losses['total'] += total_loss.item()
             train_losses['stagewise'] += stagewise_loss.item()
@@ -353,7 +372,7 @@ def train(args):
                             f"Cumulative_Sparsity: {loss_cumulative_sparsity.item():.4f}, "
                             f"Cumulative_Activity: {loss_cumulative_activity.item():.4f}, "
                             f"Cumulative_Param_Activity: {loss_cumulative_param_activity.item():.4f}, "
-                            f"Consistency: {consistency_loss.item():.4f}, Smoothness: {loss_smoothness.item():.4f}")
+                            f"Consistency: {consistency_loss.item():.4f}, Smoothness: {smoothness_loss.item():.4f}")
 
         for key in train_losses:
             train_losses[key] /= len(train_loader)
@@ -478,7 +497,7 @@ if __name__ == "__main__":
     parser.add_argument('--teacher_forcing_prob', type=float, default=0.5, help='Teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
-    parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--patience', type=int, default=100, help='Patience for early stopping')
     parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for translation loss')
     parser.add_argument('--w_rot', type=float, default=2.0, help='Weight for rotation loss')
     parser.add_argument('--w_zero', type=float, default=1.0, help='Weight for zero prediction loss')
