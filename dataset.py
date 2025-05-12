@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import logging
 import re
 
@@ -41,7 +42,7 @@ class JawTeethDataset(Dataset):
         max_stages=25,
         num_teeth=14,
         num_points=256,
-        channels=13,
+        channels=4,
         split='train',
         train_ratio=0.8,
         inference=False,
@@ -62,6 +63,8 @@ class JawTeethDataset(Dataset):
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
+        self.scaler = StandardScaler()
+        self.cumulative_scaler = StandardScaler()
 
         if self.split not in ['train', 'val', 'test']:
             raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'test'.")
@@ -98,6 +101,19 @@ class JawTeethDataset(Dataset):
             df = df[df["Stage"] <= self.max_stages]
             if df["Stage"].isna().any():
                 raise ValueError(f"Stage column for Jaw_ID {jaw_id} contains NaN after imputation")
+
+        # Apply StandardScaler
+        if not self.inference and len(df) > 0:
+            data = df[columns].values
+            if is_cumulative:
+                if self.split == 'train':
+                    self.cumulative_scaler.fit(data)
+                scaled_data = self.cumulative_scaler.fit_transform(data)
+            else:
+                if self.split == 'train':
+                    self.scaler.fit(data)
+                scaled_data = self.scaler.fit_transform(data)
+            df[columns] = scaled_data
 
         return df
 
@@ -155,7 +171,7 @@ class JawTeethDataset(Dataset):
             if fdi not in teeth_data:
                 self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
                 feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
-                feats[:, 12] = tooth_idx
+                feats[:, 3] = tooth_idx
                 vertices = np.zeros((self.num_points, 3), dtype=np.float32)
                 faces = np.zeros((0, 3), dtype=np.int64)
             else:
@@ -177,7 +193,7 @@ class JawTeethDataset(Dataset):
                 
                 feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
                 feats[:, :3] = torch.tensor(points, dtype=torch.float32)
-                feats[:, 12] = tooth_idx
+                feats[:, 3] = tooth_idx
 
             feats_list[tooth_idx] = feats
             vertices_list[tooth_idx] = vertices
@@ -255,7 +271,7 @@ class JawTeethDataset(Dataset):
             param_activity = (transformations != 0).float()
             cumulative_activity = torch.any(cumulative_transformations != 0, dim=-1).float()
             cumulative_param_activity = (cumulative_transformations != 0).float()
-            print(f'cumulative activity: {cumulative_activity}, cumulative_param_activity: {cumulative_param_activity}')
+
             feats, vertices, faces = self._preprocess_json(json_file, case)
             if feats is None:
                 self.logger.warning(f"Skipping case {case}: Invalid JSON data")
@@ -311,4 +327,265 @@ class JawTeethDataset(Dataset):
             data['cumulative_activity'],
             data['cumulative_param_activity'],
             data['num_stages']
+        )
+    
+class CumulativeJawTeethDataset(Dataset):
+    def __init__(
+        self,
+        data_dir,
+        num_teeth=14,
+        num_points=256,
+        channels=4,
+        split='train',
+        train_ratio=0.8,
+        inference=False,
+        cache_dir='./cache',
+        log_file='dataset_log.txt'
+    ):
+        self.data_dir = data_dir
+        self.num_teeth = num_teeth
+        self.num_points = num_points
+        self.channels = channels
+        self.split = split
+        self.train_ratio = train_ratio
+        self.inference = inference
+        self.cache_dir = cache_dir
+        self.logger = setup_logging(log_file)
+        self.FDI_TO_INDEX = {
+            "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
+            "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
+        }
+        self.scaler = None
+
+        if self.split not in ['train', 'val', 'test']:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'test'.")
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._initialize_dataset()
+
+    def _preprocess_excel(self, df, jaw_id):
+        if df is None or df.empty:
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel")
+            return None
+
+        df = df[df["Jaw_ID"] == jaw_id].copy()
+        if df.empty:
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering")
+            return None
+
+        df["Tooth_ID"] = df["Tooth_ID"].astype(str).str.strip().str.replace(',', '.').str.split('.').str[0].str.extract(r'(\d+)')
+        df = df[df["Tooth_ID"].isin(self.FDI_TO_INDEX.keys())]
+        if df.empty:
+            self.logger.warning(f"No valid Tooth_ID for Jaw_ID {jaw_id} after cleaning")
+            return None
+
+        columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+                   "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+        for col in columns:
+            df[col] = df[col].apply(clean_numeric)
+            df[col] = df[col].replace([float('inf'), -float('inf')], 0)
+
+        # Apply StandardScaler if scaler is available
+        if self.scaler is not None:
+            try:
+                df[columns] = self.scaler.fit_transform(df[columns])
+                self.logger.debug(f"Applied StandardScaler to transformations for Jaw_ID {jaw_id}")
+            except Exception as e:
+                self.logger.error(f"Failed to apply StandardScaler for Jaw_ID {jaw_id}: {e}")
+                return None
+
+        return df
+
+    def _load_transformations(self, jaw_id, cumulative_df):
+        cumulative_transformations = torch.zeros(self.num_teeth, 6)
+        if cumulative_df is not None:
+            for _, row in cumulative_df.iterrows():
+                tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
+                cumulative_transformations[tooth_idx] = torch.tensor([
+                    row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
+                    row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
+                ], dtype=torch.float32)
+
+        cumulative_activity = torch.any(cumulative_transformations != 0, dim=-1).float()
+        cumulative_param_activity = (cumulative_transformations != 0).float()
+
+        return cumulative_transformations, cumulative_activity, cumulative_param_activity
+
+    def _preprocess_json(self, json_file, jaw_id):
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.logger.error(f"Failed to load JSON file {json_file}: {e}")
+            return None
+
+        feats_list = [None] * self.num_teeth
+        teeth_data = data.get("teeth", {})
+
+        for fdi, tooth_idx in self.FDI_TO_INDEX.items():
+            if fdi not in teeth_data:
+                self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
+                feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
+                feats[:, 3] = tooth_idx
+            else:
+                tooth_data = teeth_data[fdi]
+                vertices = np.array(tooth_data.get("v", []), dtype=np.float32)
+
+                np.random.seed(42)
+                if len(vertices) > self.num_points:
+                    indices = np.random.choice(len(vertices), self.num_points, replace=False)
+                    points = vertices[indices]
+                else:
+                    points = vertices
+                    if len(points) < self.num_points:
+                        points = np.pad(points, ((0, self.num_points - len(points)), (0, 0)), mode='wrap')[:self.num_points]
+                
+                feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
+                feats[:, :3] = torch.tensor(points, dtype=torch.float32)
+                feats[:, 3] = tooth_idx
+
+            feats_list[tooth_idx] = feats
+
+        return torch.stack(feats_list)
+
+    def _initialize_dataset(self):
+        self.logger.info(f"Initializing cumulative dataset for split '{self.split}'")
+
+        cases = [d for d in os.listdir(self.data_dir) if os.path.isdir(os.path.join(self.data_dir, d)) and d.isdigit()]
+        self.logger.info(f"Found {len(cases)} cases: {cases}")
+
+        train_val_cases, test_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
+        train_cases, val_cases = train_test_split(train_val_cases, train_size=self.train_ratio, random_state=42)
+        if self.split == 'train':
+            self.cases = train_cases
+        elif self.split == 'val':
+            self.cases = val_cases
+        else:
+            self.cases = test_cases
+        if self.inference:
+            self.cases = cases
+        self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
+
+        # Initialize and fit scaler for training split
+        scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
+        if self.split == 'train' and not self.inference:
+            self.scaler = StandardScaler()
+            all_transforms = []
+            for case in train_cases:
+                cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
+                if os.path.exists(cumulative_file):
+                    try:
+                        df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        df = self._preprocess_excel(df, case)  # Clean without scaling
+                        if df is not None and not df.empty:
+                            columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+                                       "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+                            all_transforms.append(df[columns])
+                    except Exception as e:
+                        self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
+            if all_transforms:
+                all_transforms = pd.concat(all_transforms, ignore_index=True)
+                self.scaler.fit(all_transforms)
+                try:
+                    with open(scaler_file, 'wb') as f:
+                        pickle.dump(self.scaler, f)
+                    self.logger.info(f"Saved StandardScaler to {scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save StandardScaler: {e}")
+            else:
+                self.logger.warning("No valid transformation data to fit StandardScaler")
+                self.scaler = None
+        else:
+            # Load scaler for val, test, or inference
+            if os.path.exists(scaler_file):
+                try:
+                    with open(scaler_file, 'rb') as f:
+                        self.scaler = pickle.load(f)
+                    self.logger.info(f"Loaded StandardScaler from {scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load StandardScaler: {e}")
+                    self.scaler = None
+            else:
+                self.logger.warning("No StandardScaler found; proceeding without scaling")
+                self.scaler = None
+
+        self.data = []
+
+        for case in self.cases:
+            cache_file = os.path.join(self.cache_dir, f"{case}_{self.split}_cumulative_cache.pkl")
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'rb') as f:
+                        case_data = pickle.load(f)
+                    self.data.append(case_data)
+                    self.logger.info(f"Loaded cached data for case {case}")
+                    continue
+                except Exception as e:
+                    self.logger.warning(f"Failed to load cache for case {case}: {e}")
+
+            json_file = os.path.join(self.data_dir, case, "ori", "before_treatment.json")
+            cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
+
+            if not os.path.exists(json_file):
+                self.logger.warning(f"Skipping case {case}: Missing JSON file {json_file}")
+                continue
+
+            cumulative_df = None
+            if not self.inference:
+                try:
+                    cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str}) if os.path.exists(cumulative_file) else None
+                except Exception as e:
+                    self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
+
+            cumulative_data = self._preprocess_excel(cumulative_df, case) if not self.inference else None
+            cumulative_transformations, cumulative_activity, cumulative_param_activity = self._load_transformations(
+                case, cumulative_data
+            ) if not self.inference else (
+                torch.zeros(self.num_teeth, 6),
+                torch.zeros(self.num_teeth),
+                torch.zeros(self.num_teeth, 6)
+            )
+
+            feats = self._preprocess_json(json_file, case)
+            if feats is None:
+                self.logger.warning(f"Skipping case {case}: Invalid JSON data")
+                continue
+
+            case_data = {
+                'jaw_id': case,
+                'feats': feats,
+                'cumulative_transformations': cumulative_transformations,
+                'cumulative_activity': cumulative_activity,
+                'cumulative_param_activity': cumulative_param_activity
+            }
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(case_data, f)
+                self.logger.info(f"Processed and cached data for case {case}")
+            except Exception as e:
+                self.logger.error(f"Failed to cache data for case {case}: {e}")
+            self.data.append(case_data)
+
+        self.logger.info(f"Cumulative dataset initialized with {len(self.data)} cases")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        data = self.data[idx]
+        act = data['cumulative_activity']
+        param = data['cumulative_param_activity']
+        # print(f'cumulative_activity: {act},\n param_activity: {param}')
+        if self.inference:
+            return (
+                data['jaw_id'],
+                data['feats'],
+                data['cumulative_transformations']
+            )
+        return (
+            data['jaw_id'],
+            data['feats'],
+            data['cumulative_transformations'],
+            data['cumulative_activity'],
+            data['cumulative_param_activity']
         )
