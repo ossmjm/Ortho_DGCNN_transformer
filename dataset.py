@@ -72,7 +72,7 @@ class JawTeethDataset(Dataset):
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
 
-    def _preprocess_excel(self, df, jaw_id, is_cumulative=False):
+    def _preprocess_excel(self, df, jaw_id, is_cumulative=False, skip_scaling=False):
         if df is None or df.empty:
             self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel")
             return None
@@ -102,17 +102,19 @@ class JawTeethDataset(Dataset):
             if df["Stage"].isna().any():
                 raise ValueError(f"Stage column for Jaw_ID {jaw_id} contains NaN after imputation")
 
-        # Apply StandardScaler
-        if not self.inference and len(df) > 0:
-            data = df[columns].values
+        # Apply StandardScaler unless skip_scaling is True
+        if not self.inference and len(df) > 0 and not skip_scaling:
+            data = df[columns]  # Keep as DataFrame to preserve feature names
             if is_cumulative:
-                if self.split == 'train':
-                    self.cumulative_scaler.fit(data)
-                scaled_data = self.cumulative_scaler.fit_transform(data)
+                if self.split == 'train' and self.cumulative_scaler is not None:
+                    scaled_data = self.cumulative_scaler.fit_transform(data)
+                else:
+                    scaled_data = self.cumulative_scaler.transform(data) if self.cumulative_scaler is not None else data
             else:
-                if self.split == 'train':
-                    self.scaler.fit(data)
-                scaled_data = self.scaler.fit_transform(data)
+                if self.split == 'train' and self.scaler is not None:
+                    scaled_data = self.scaler.fit_transform(data)
+                else:
+                    scaled_data = self.scaler.transform(data) if self.scaler is not None else data
             df[columns] = scaled_data
 
         return df
@@ -222,6 +224,84 @@ class JawTeethDataset(Dataset):
             self.cases = cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
+        # Initialize and fit scalers for training split
+        scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
+        cumulative_scaler_file = os.path.join(self.cache_dir, 'cumulative_scaler.pkl')
+        if self.split == 'train' and not self.inference:
+            all_transforms = []
+            all_cumulative_transforms = []
+            for case in train_cases:
+                transform_file = os.path.join(self.data_dir, case, "Transformations.xlsx")
+                cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
+                if os.path.exists(transform_file):
+                    try:
+                        df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        df = self._preprocess_excel(df, case, is_cumulative=False, skip_scaling=True)  # Clean without scaling
+                        if df is not None and not df.empty:
+                            columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+                                       "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+                            all_transforms.append(df[columns])
+                    except Exception as e:
+                        self.logger.error(f"Failed to load Transformations.xlsx for case {case}: {e}")
+                if os.path.exists(cumulative_file):
+                    try:
+                        df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        df = self._preprocess_excel(df, case, is_cumulative=True, skip_scaling=True)  # Clean without scaling
+                        if df is not None and not df.empty:
+                            columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
+                                       "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
+                            all_cumulative_transforms.append(df[columns])
+                    except Exception as e:
+                        self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
+            if all_transforms:
+                all_transforms = pd.concat(all_transforms, ignore_index=True)
+                self.scaler.fit(all_transforms)
+                try:
+                    with open(scaler_file, 'wb') as f:
+                        pickle.dump(self.scaler, f)
+                    self.logger.info(f"Saved StandardScaler to {scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save StandardScaler: {e}")
+            else:
+                self.logger.warning("No valid transformation data to fit StandardScaler")
+                self.scaler = None
+            if all_cumulative_transforms:
+                all_cumulative_transforms = pd.concat(all_cumulative_transforms, ignore_index=True)
+                self.cumulative_scaler.fit(all_cumulative_transforms)
+                try:
+                    with open(cumulative_scaler_file, 'wb') as f:
+                        pickle.dump(self.cumulative_scaler, f)
+                    self.logger.info(f"Saved Cumulative StandardScaler to {cumulative_scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save Cumulative StandardScaler: {e}")
+            else:
+                self.logger.warning("No valid cumulative transformation data to fit Cumulative StandardScaler")
+                self.cumulative_scaler = None
+        else:
+            # Load scalers for val, test, or inference
+            if os.path.exists(scaler_file):
+                try:
+                    with open(scaler_file, 'rb') as f:
+                        self.scaler = pickle.load(f)
+                    self.logger.info(f"Loaded StandardScaler from {scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load StandardScaler: {e}")
+                    self.scaler = None
+            else:
+                self.logger.warning("No StandardScaler found; proceeding without scaling")
+                self.scaler = None
+            if os.path.exists(cumulative_scaler_file):
+                try:
+                    with open(cumulative_scaler_file, 'rb') as f:
+                        self.cumulative_scaler = pickle.load(f)
+                    self.logger.info(f"Loaded Cumulative StandardScaler from {cumulative_scaler_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load Cumulative StandardScaler: {e}")
+                    self.cumulative_scaler = None
+            else:
+                self.logger.warning("No Cumulative StandardScaler found; proceeding without scaling")
+                self.cumulative_scaler = None
+
         self.data = []
 
         for case in self.cases:
@@ -328,7 +408,7 @@ class JawTeethDataset(Dataset):
             data['cumulative_param_activity'],
             data['num_stages']
         )
-    
+
 class CumulativeJawTeethDataset(Dataset):
     def __init__(
         self,
@@ -363,7 +443,7 @@ class CumulativeJawTeethDataset(Dataset):
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
 
-    def _preprocess_excel(self, df, jaw_id):
+    def _preprocess_excel(self, df, jaw_id, skip_scaling=False):
         if df is None or df.empty:
             self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel")
             return None
@@ -385,10 +465,12 @@ class CumulativeJawTeethDataset(Dataset):
             df[col] = df[col].apply(clean_numeric)
             df[col] = df[col].replace([float('inf'), -float('inf')], 0)
 
-        # Apply StandardScaler if scaler is available
-        if self.scaler is not None:
+        # Apply StandardScaler if scaler is available and skip_scaling is False
+        if self.scaler is not None and not self.inference and not skip_scaling:
             try:
-                df[columns] = self.scaler.fit_transform(df[columns])
+                data = df[columns]  # Keep as DataFrame
+                scaled_data = self.scaler.transform(data)
+                df[columns] = scaled_data
                 self.logger.debug(f"Applied StandardScaler to transformations for Jaw_ID {jaw_id}")
             except Exception as e:
                 self.logger.error(f"Failed to apply StandardScaler for Jaw_ID {jaw_id}: {e}")
@@ -476,7 +558,7 @@ class CumulativeJawTeethDataset(Dataset):
                 if os.path.exists(cumulative_file):
                     try:
                         df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
-                        df = self._preprocess_excel(df, case)  # Clean without scaling
+                        df = self._preprocess_excel(df, case, skip_scaling=True)  # Clean without scaling
                         if df is not None and not df.empty:
                             columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                                        "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
@@ -575,7 +657,6 @@ class CumulativeJawTeethDataset(Dataset):
         data = self.data[idx]
         act = data['cumulative_activity']
         param = data['cumulative_param_activity']
-        # print(f'cumulative_activity: {act},\n param_activity: {param}')
         if self.inference:
             return (
                 data['jaw_id'],
