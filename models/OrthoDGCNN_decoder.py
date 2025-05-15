@@ -3,7 +3,6 @@ import torch.nn as nn
 import logging
 from models.DGCNN import DGCNN
 from models.TransformerDecoder import TransformerDecoder
-# In OrthoDGCNN_decoder.py
 from models.PerToothTransformer import PerToothTransformerDecoder
 
 class OrthoDGCNNModel(nn.Module):
@@ -19,7 +18,7 @@ class OrthoDGCNNModel(nn.Module):
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         k: int = 20,
-        decoder_type: str = 'per_tooth',  # New argument
+        decoder_type: str = 'per_tooth',
         per_tooth_layers: int = 4,
         per_tooth_heads: int = 8,
         per_tooth_mlp_ratio: float = 4.0
@@ -67,11 +66,11 @@ class OrthoDGCNNModel(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, coordinates, targets=None, cumulative_targets=None, num_stages=None, epoch=None, total_epochs=None):
+    def forward(self, coordinates, targets=None, cumulative_targets=None, activity_targets=None, param_activity_targets=None, num_stages=None, epoch=None, total_epochs=None):
         logger = logging.getLogger('TrainLogger')
         
         # Validate input coordinates shape
-        expected_shape = (-1, self.num_teeth, self.num_points,4)  # channels=4
+        expected_shape = (-1, self.num_teeth, self.num_points, 4)
         if coordinates.shape[1:] != torch.Size(expected_shape[1:]):
             logger.error(f"Invalid coordinates shape: got {coordinates.shape}, expected {expected_shape}")
             raise RuntimeError(f"Coordinates shape mismatch: got {coordinates.shape}, expected {expected_shape}")
@@ -79,6 +78,23 @@ class OrthoDGCNNModel(nn.Module):
         if torch.isnan(coordinates).any():
             logger.error("NaN values detected in input coordinates")
             coordinates = torch.nan_to_num(coordinates, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Validate target shapes
+        if targets is not None:
+            expected_targets_shape = (-1, self.max_stages, self.num_teeth, 6)
+            if targets.shape[1:] != torch.Size(expected_targets_shape[1:]):
+                logger.error(f"Invalid targets shape: got {targets.shape}, expected {expected_targets_shape}")
+                raise RuntimeError(f"Targets shape mismatch")
+        if activity_targets is not None:
+            expected_activity_shape = (-1, self.max_stages, self.num_teeth)
+            if activity_targets.shape[1:] != torch.Size(expected_activity_shape[1:]):
+                logger.error(f"Invalid activity_targets shape: got {activity_targets.shape}, expected {expected_activity_shape}")
+                raise RuntimeError(f"Activity_targets shape mismatch")
+        if param_activity_targets is not None:
+            expected_param_activity_shape = (-1, self.max_stages, self.num_teeth, 6)
+            if param_activity_targets.shape[1:] != torch.Size(expected_param_activity_shape[1:]):
+                logger.error(f"Invalid param_activity_targets shape: got {param_activity_targets.shape}, expected {expected_param_activity_shape}")
+                raise RuntimeError(f"Param_activity_targets shape mismatch")
             
         features = self.dgcnn(coordinates)
         
@@ -95,40 +111,25 @@ class OrthoDGCNNModel(nn.Module):
         features = self.feature_norm(features)
         
         alpha = max(0.0, 1.0 - (epoch / (total_epochs * 0.5))) if epoch is not None and total_epochs is not None else 0.0
-        use_teacher_forcing = self.training and self.teacher_forcing and targets is not None and torch.rand(1).item() < alpha
+        use_teacher_forcing = self.training and self.teacher_forcing and (targets is not None or activity_targets is not None or param_activity_targets is not None) and torch.rand(1).item() < alpha
         
-        # try:
         transforms_sequence, activity_logits, param_activity_logits = self.decoder(
             memory=features,
             cumulative_transforms=cumulative_targets,
             num_stages=num_stages,
             targets=targets,
+            activity_targets=activity_targets,
+            param_activity_targets=param_activity_targets,
             use_teacher_forcing=use_teacher_forcing,
             training=self.training
         )
         
-        # if torch.isnan(decoder_features).any():
-        #     logger.error("NaN values detected in decoder_features")
-        #     decoder_features = torch.nan_to_num(decoder_features, nan=0.0, posinf=1.0, neginf=-1.0)
-            
         if torch.isnan(transforms_sequence).any():
             logger.error("NaN values detected in transforms_sequence")
             transforms_sequence = torch.nan_to_num(transforms_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # decoder_features_detached = decoder_features.detach()
-        # type_logits = self.type_head(decoder_features_detached)
-        
-        # except RuntimeError as e:
-        #     logger.error(f"Runtime error in forward pass: {e}")
-        #     batch_size = features.size(0)
-        #     decoder_features = torch.zeros(batch_size, self.max_stages, self.num_teeth, self.embed_dim, device=features.device, requires_grad=True)
-        #     transforms_sequence = torch.zeros(batch_size, self.max_stages, self.num_teeth, 6, device=features.device, requires_grad=True)
-        #     activity_logits = torch.zeros(batch_size, self.max_stages, self.num_teeth, device=features.device, requires_grad=True)
-        #     param_activity_logits = torch.zeros(batch_size, self.max_stages, self.num_teeth, 6, device=features.device, requires_grad=True)
-        #     type_logits = torch.zeros(batch_size, self.max_stages, self.num_teeth, 4, device=features.device, requires_grad=True)
-            
         logger.debug(f"OrthoDGCNN output shape: transforms_sequence={transforms_sequence.shape}, "
-                    f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, ")
+                    f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}")
                      
         outputs = [transforms_sequence, activity_logits, param_activity_logits]
         
