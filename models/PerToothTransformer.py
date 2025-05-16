@@ -20,6 +20,9 @@ class PerToothTransformerDecoder(nn.Module):
         # Cross-tooth attention to aggregate memory
         self.cross_tooth_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
         
+        # Attention to aggregate previous stage embeddings
+        self.prev_targets_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
+        
         # Per-tooth transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
@@ -74,7 +77,25 @@ class PerToothTransformerDecoder(nn.Module):
             elif isinstance(m, nn.Parameter):
                 nn.init.trunc_normal_(m, std=0.01)
     
-    def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False):
+    def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx):
+        """Compute teacher forcing probability and number of previous stages based on epoch."""
+        # Teacher forcing probability: Linear decay from 0.9 to 0.3
+        progress = epoch / total_epochs
+        tf_prob = max(0.3, 0.9 - 0.6 * progress)  # From 0.9 to 0.3
+        
+        # Curriculum for number of previous stages
+        if progress < 0.1:  # First 10% of epochs
+            num_stages = min(2, stage_idx)  # At least 2 stages
+        elif progress < 0.3:  # 10–30%
+            num_stages = min(5, stage_idx)  # Up to 5 stages
+        elif progress < 0.6:  # 30–60%
+            num_stages = min(10, stage_idx)  # Up to 10 stages
+        else:  # 60–100%
+            num_stages = stage_idx  # All previous stages
+        
+        return tf_prob, num_stages
+
+    def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
         device = memory.device
@@ -131,34 +152,78 @@ class PerToothTransformerDecoder(nn.Module):
         param_activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         param_activity_masks = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
 
+        # Initialize sequences for predicted values
+        prev_transform_seq = torch.zeros(B, self.max_stages, 6, device=device)  # [B, max_stages, 6]
+        prev_activity_seq = torch.zeros(B, self.max_stages, 1, device=device)  # [B, max_stages, 1]
+        prev_param_activity_seq = torch.zeros(B, self.max_stages, 6, device=device)  # [B, max_stages, 6]
+
         # Process each tooth independently
         for tooth_idx in range(self.num_teeth):
-            # Initialize previous inputs
-            prev_transform = torch.zeros(B, 6, device=device)  # [B, 6]
-            prev_activity = torch.zeros(B, 1, device=device)  # [B, 1]
-            prev_param_activity = torch.zeros(B, 6, device=device)  # [B, 6]
-
             for stage_idx in range(self.max_stages):
-                # Prepare target embeddings
-                if use_teacher_forcing and targets is not None and training and stage_idx > 0:
-                    targets_prev = targets[:, stage_idx - 1, tooth_idx, :]  # [B, 6]
-                    embedded_target = self.target_embed(targets_prev)  # [B, embed_dim]
+                # Get teacher forcing probability and number of stages
+                tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx)
+                # Combine with use_teacher_forcing (treat as probability if float)
+                effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
+                # Check if stage_idx is within true_num_stages for each sample
+                if num_stages is not None:
+                    tf_mask = (stage_idx < num_stages).float()  # [B]
+                    use_tf = training and stage_idx > 0 and (torch.rand(B, device=device) < effective_tf_prob * tf_mask).any()
                 else:
-                    embedded_target = self.target_embed(prev_transform)  # [B, embed_dim]
+                    use_tf = training and stage_idx > 0 and torch.rand(1).item() < effective_tf_prob
+
+                # Prepare target embeddings
+                start_idx = max(0, stage_idx - num_stages_to_use)  # Use same start_idx for both cases
+                if use_tf and targets is not None:
+                    targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]  # [B, num_stages_to_use, 6]
+                    embedded_target = self.target_embed(targets_prev)  # [B, num_stages_to_use, embed_dim]
+                    # Aggregate using attention
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
+                    embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)  # [B, 1, embed_dim]
+                    embedded_target = embedded_target.squeeze(1)  # [B, embed_dim]
+                else:
+                    # Use accumulated predicted transforms, limited to num_stages_to_use
+                    targets_prev = prev_transform_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 6]
+                    if targets_prev.shape[1] == 0:  # Handle empty slice
+                        embedded_target = self.target_embed(torch.zeros(B, 6, device=device))  # [B, embed_dim]
+                    else:
+                        embedded_target = self.target_embed(targets_prev)  # [B, num_stages_to_use, embed_dim]
+                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
+                        embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)  # [B, 1, embed_dim]
+                        embedded_target = embedded_target.squeeze(1)  # [B, embed_dim]
 
                 # Prepare activity target embeddings
-                if use_teacher_forcing and activity_targets is not None and training and stage_idx > 0:
-                    activity_prev = activity_targets[:, stage_idx - 1, tooth_idx].unsqueeze(-1)  # [B, 1]
-                    embedded_activity = self.activity_target_embed(activity_prev)  # [B, embed_dim]
+                if use_tf and activity_targets is not None:
+                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)  # [B, num_stages_to_use, 1]
+                    embedded_activity = self.activity_target_embed(activity_prev)  # [B, num_stages_to_use, embed_dim]
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
+                    embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)  # [B, 1, embed_dim]
+                    embedded_activity = embedded_activity.squeeze(1)  # [B, embed_dim]
                 else:
-                    embedded_activity = self.activity_target_embed(prev_activity)  # [B, embed_dim]
+                    activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 1]
+                    if activity_prev.shape[1] == 0:  # Handle empty slice
+                        embedded_activity = self.activity_target_embed(torch.zeros(B, 1, device=device))  # [B, embed_dim]
+                    else:
+                        embedded_activity = self.activity_target_embed(activity_prev)  # [B, num_stages_to_use, embed_dim]
+                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)  # [B, 1, embed_dim]
+                        embedded_activity = embedded_activity.squeeze(1)  # [B, embed_dim]
 
                 # Prepare param activity target embeddings
-                if use_teacher_forcing and param_activity_targets is not None and training and stage_idx > 0:
-                    param_activity_prev = param_activity_targets[:, stage_idx - 1, tooth_idx, :]  # [B, 6]
-                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev)  # [B, embed_dim]
+                if use_tf and param_activity_targets is not None:
+                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]  # [B, num_stages_to_use, 6]
+                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev)  # [B, num_stages_to_use, embed_dim]
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
+                    embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)  # [B, 1, embed_dim]
+                    embedded_param_activity = embedded_param_activity.squeeze(1)  # [B, embed_dim]
                 else:
-                    embedded_param_activity = self.param_activity_target_embed(prev_param_activity)  # [B, embed_dim]
+                    param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 6]
+                    if param_activity_prev.shape[1] == 0:  # Handle empty slice
+                        embedded_param_activity = self.param_activity_target_embed(torch.zeros(B, 6, device=device))  # [B, embed_dim]
+                    else:
+                        embedded_param_activity = self.param_activity_target_embed(param_activity_prev)  # [B, num_stages_to_use, embed_dim]
+                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
+                        embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)  # [B, 1, embed_dim]
+                        embedded_param_activity = embedded_param_activity.squeeze(1)  # [B, embed_dim]
 
                 # Combine embeddings
                 pos_embed = self.pos_embed[:, stage_idx, :]  # [1, embed_dim]
@@ -192,17 +257,17 @@ class PerToothTransformerDecoder(nn.Module):
                 transforms = transforms * param_activity_mask  # Zero out inactive parameters
                 transforms_sequence[:, stage_idx, tooth_idx, :] = transforms
 
-                # Update previous inputs for next stage
-                prev_transform = transforms.detach()
-                prev_activity = activity_logit.detach().unsqueeze(-1)
-                prev_param_activity = param_activity_logit.detach()
-                if use_teacher_forcing and training and stage_idx < self.max_stages - 1:
+                # Update previous sequences
+                prev_transform_seq[:, stage_idx, :] = transforms.detach()
+                prev_activity_seq[:, stage_idx, :] = activity_logit.detach().unsqueeze(-1)
+                prev_param_activity_seq[:, stage_idx, :] = param_activity_logit.detach()
+                if use_tf and stage_idx < self.max_stages - 1:
                     if targets is not None:
-                        prev_transform = targets[:, stage_idx, tooth_idx, :]
+                        prev_transform_seq[:, stage_idx, :] = targets[:, stage_idx, tooth_idx, :]
                     if activity_targets is not None:
-                        prev_activity = activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1)
+                        prev_activity_seq[:, stage_idx, :] = activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1)
                     if param_activity_targets is not None:
-                        prev_param_activity = param_activity_targets[:, stage_idx, tooth_idx, :]
+                        prev_param_activity_seq[:, stage_idx, :] = param_activity_targets[:, stage_idx, tooth_idx, :]
 
         # Enforce zero stage-wise transforms if cumulative transform is zero
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)  # [B, 1, num_teeth, 6]

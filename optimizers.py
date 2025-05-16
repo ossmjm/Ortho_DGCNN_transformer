@@ -120,7 +120,6 @@ class LRSchedulers:
                 mode='min',
                 factor=self.kwargs.get('factor', 0.5),
                 patience=self.kwargs.get('patience', 5),
-                verbose=True
             )
         elif self.scheduler_name == 'linear':
             main_scheduler = lr_scheduler.LinearLR(

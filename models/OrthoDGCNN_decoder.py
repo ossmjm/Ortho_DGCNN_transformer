@@ -13,12 +13,12 @@ class OrthoDGCNNModel(nn.Module):
         num_points: int = 256,
         channels: int = 4,
         embed_dim: int = 384,
-        teacher_forcing: bool = False,
+        teacher_forcing_prob: float = 0.0,  # Changed to float
         decoder_layers: int = 1,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         k: int = 20,
-        decoder_type: str = 'per_tooth',
+        decoder_type: str = 'decoder',
         per_tooth_layers: int = 4,
         per_tooth_heads: int = 8,
         per_tooth_mlp_ratio: float = 4.0
@@ -46,7 +46,7 @@ class OrthoDGCNNModel(nn.Module):
         self.max_stages = max_stages
         self.num_teeth = num_teeth
         self.embed_dim = embed_dim
-        self.teacher_forcing = teacher_forcing
+        self.teacher_forcing_prob = teacher_forcing_prob  # Store as float
         self.num_points = num_points
         self.feature_norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
@@ -110,9 +110,7 @@ class OrthoDGCNNModel(nn.Module):
             
         features = self.feature_norm(features)
         
-        alpha = max(0.0, 1.0 - (epoch / (total_epochs * 0.5))) if epoch is not None and total_epochs is not None else 0.0
-        use_teacher_forcing = self.training and self.teacher_forcing and (targets is not None or activity_targets is not None or param_activity_targets is not None) and torch.rand(1).item() < alpha
-        
+        # Use teacher_forcing_prob directly
         transforms_sequence, activity_logits, param_activity_logits = self.decoder(
             memory=features,
             cumulative_transforms=cumulative_targets,
@@ -120,8 +118,10 @@ class OrthoDGCNNModel(nn.Module):
             targets=targets,
             activity_targets=activity_targets,
             param_activity_targets=param_activity_targets,
-            use_teacher_forcing=use_teacher_forcing,
-            training=self.training
+            use_teacher_forcing=self.teacher_forcing_prob,  # Pass float probability
+            training=self.training,
+            epoch=epoch,
+            total_epochs=total_epochs
         )
         
         if torch.isnan(transforms_sequence).any():

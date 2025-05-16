@@ -112,77 +112,57 @@ def train(args):
         num_points=args.num_points,
         channels=args.channels,
         embed_dim=args.embed_dim,
-        teacher_forcing=args.teacher_forcing_prob > 0,
+        teacher_forcing_prob=args.teacher_forcing_prob,  # Pass float probability
         decoder_layers=args.decoder_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
-        k=args.k
+        k=args.k,
+        decoder_type=args.decoder_type
     ).to(device)
 
-    # Load model weights
+    # Load model weights and initialize optimizers
+    optimizer_dgcnn = Optimizers(
+        optimizer_name=args.optimizer,
+        parameters=model.dgcnn.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=args.optimizer_betas
+    ).get_optimizer()
+    optimizer_decoder = Optimizers(
+        optimizer_name=args.optimizer,
+        parameters=model.decoder.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=args.optimizer_betas
+    ).get_optimizer()
+
     if args.checkpoint_path and os.path.exists(args.checkpoint_path):
         try:
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['ortho_dgcnn_state_dict'])
             logger.info(f"Loaded full model weights from {args.checkpoint_path}")
-            # Optionally load optimizer states
+            # Attempt to load optimizer states
             if 'optimizer_dgcnn_state_dict' in checkpoint and checkpoint['optimizer_dgcnn_state_dict'] is not None:
-                optimizer_dgcnn = Optimizers(
-                    optimizer_name=args.optimizer,
-                    parameters=model.dgcnn.parameters(),
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    betas=args.optimizer_betas
-                ).get_optimizer()
-                optimizer_dgcnn.load_state_dict(checkpoint['optimizer_dgcnn_state_dict'])
-                logger.info("Loaded optimizer_dgcnn state from checkpoint")
+                try:
+                    optimizer_dgcnn.load_state_dict(checkpoint['optimizer_dgcnn_state_dict'])
+                    logger.info("Loaded optimizer_dgcnn state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Failed to load optimizer_dgcnn state: {e}. Resetting optimizer state.")
+                    optimizer_dgcnn.state = {}  # Reset state to ensure clean initialization
             if 'optimizer_decoder_state_dict' in checkpoint and checkpoint['optimizer_decoder_state_dict'] is not None:
-                optimizer_decoder = Optimizers(
-                    optimizer_name=args.optimizer,
-                    parameters=model.decoder.parameters(),
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    betas=args.optimizer_betas
-                ).get_optimizer()
-                optimizer_decoder.load_state_dict(checkpoint['optimizer_decoder_state_dict'])
-                logger.info("Loaded optimizer_decoder state from checkpoint")
+                try:
+                    optimizer_decoder.load_state_dict(checkpoint['optimizer_decoder_state_dict'])
+                    logger.info("Loaded optimizer_decoder state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Failed to load optimizer_decoder state: {e}. Resetting optimizer state.")
+                    optimizer_decoder.state = {}  # Reset state to ensure clean initialization
         except Exception as e:
-            logger.warning(f"Failed to load checkpoint from {args.checkpoint_path}: {e}. Loading pretrained DGCNN weights instead.")
-            checkpoint = torch.load(args.pretrained_dgcnn_path, map_location=device)
-            model.dgcnn.load_state_dict(checkpoint['model_state_dict'])
-            logger.info(f"Loaded pretrained DGCNN weights from {args.pretrained_dgcnn_path}")
-            optimizer_dgcnn = Optimizers(
-                optimizer_name=args.optimizer,
-                parameters=model.dgcnn.parameters(),
-                lr=args.lr,
-                weight_decay=args.weight_decay,
-                betas=args.optimizer_betas
-            ).get_optimizer()
-            optimizer_decoder = Optimizers(
-                optimizer_name=args.optimizer,
-                parameters=model.decoder.parameters(),
-                lr=args.lr,
-                weight_decay=args.weight_decay,
-                betas=args.optimizer_betas
-            ).get_optimizer()
+            logger.error(f"Failed to load model weights from {args.checkpoint_path}: {e}")
+            raise
     else:
         checkpoint = torch.load(args.pretrained_dgcnn_path, map_location=device)
         model.dgcnn.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"Loaded pretrained DGCNN weights from {args.pretrained_dgcnn_path}")
-        optimizer_dgcnn = Optimizers(
-            optimizer_name=args.optimizer,
-            parameters=model.dgcnn.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            betas=args.optimizer_betas
-        ).get_optimizer()
-        optimizer_decoder = Optimizers(
-            optimizer_name=args.optimizer,
-            parameters=model.decoder.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            betas=args.optimizer_betas
-        ).get_optimizer()
 
     # Initialize schedulers only if use_scheduler is True
     scheduler_dgcnn = LRSchedulers(
@@ -213,11 +193,17 @@ def train(args):
         try:
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
             if 'scheduler_dgcnn_state_dict' in checkpoint and checkpoint['scheduler_dgcnn_state_dict'] is not None and scheduler_dgcnn is not None:
-                scheduler_dgcnn.load_state_dict(checkpoint['scheduler_dgcnn_state_dict'])
-                logger.info("Loaded scheduler_dgcnn state from checkpoint")
+                try:
+                    scheduler_dgcnn.load_state_dict(checkpoint['scheduler_dgcnn_state_dict'])
+                    logger.info("Loaded scheduler_dgcnn state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Failed to load scheduler_dgcnn state: {e}. Using new scheduler.")
             if 'scheduler_decoder_state_dict' in checkpoint and checkpoint['scheduler_decoder_state_dict'] is not None and scheduler_decoder is not None:
-                scheduler_decoder.load_state_dict(checkpoint['scheduler_decoder_state_dict'])
-                logger.info("Loaded scheduler_decoder state from checkpoint")
+                try:
+                    scheduler_decoder.load_state_dict(checkpoint['scheduler_decoder_state_dict'])
+                    logger.info("Loaded scheduler_decoder state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Failed to load scheduler_decoder state: {e}. Using new scheduler.")
         except Exception as e:
             logger.warning(f"Failed to load scheduler states from {args.checkpoint_path}: {e}")
 
@@ -395,6 +381,11 @@ def train(args):
             best_val_loss = val_losses['total']
             best_epoch = epoch + 1
             patience_counter = 0
+        else:
+            patience_counter += 1
+            logger.info(f"No improvement in val_loss, patience counter: {patience_counter}/{args.patience}")
+
+        if patience_counter >= args.patience:
             # Save DGCNN model separately
             dgcnn_checkpoint = {
                 'epoch': best_epoch,
@@ -420,11 +411,6 @@ def train(args):
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
             logger.info(f"Saved best full model at epoch {best_epoch} with val_loss {best_val_loss:.4f}")
-        else:
-            patience_counter += 1
-            logger.info(f"No improvement in val_loss, patience counter: {patience_counter}/{args.patience}")
-
-        if patience_counter >= args.patience:
             logger.info(f"Early stopping triggered at epoch {epoch+1} after {args.patience} epochs without improvement")
             break
 
@@ -450,7 +436,7 @@ def train(args):
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
                 'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
+                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
                 'val_loss': last_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
@@ -461,8 +447,8 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Orthodontic Treatment Prediction Model")
     parser.add_argument('--data_dir', type=str, default='./Data', help='Path to dataset')
-    parser.add_argument('--output_dir', type=str, default='./output_decoder', help='Path to save checkpoints')
-    parser.add_argument('--log_file', type=str, default='training_log_decoder.txt', help='Path to log file')
+    parser.add_argument('--output_dir', type=str, default='./output_decoder_l', help='Path to save checkpoints')
+    parser.add_argument('--log_file', type=str, default='training_log_decoder_l.txt', help='Path to log file')
     parser.add_argument('--cache_dir', type=str, default='./cache', help='Path to cache directory')
     parser.add_argument('--pretrained_dgcnn_path', type=str, default='./output/best_dgcnn.pth', help='Path to pretrained DGCNN weights')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model (optional)')
@@ -474,11 +460,12 @@ if __name__ == "__main__":
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
     parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers in Transformer')
+    parser.add_argument('--decoder_type', type=str, default='decoder', help='Type of used decoder model')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
-    parser.add_argument('--teacher_forcing_prob', type=float, default=0.5, help='Teacher forcing probability')
+    parser.add_argument('--teacher_forcing_prob', type=float, default=0.8, help='Teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
     parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for MSE loss')
@@ -487,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument('--w_padded', type=float, default=0.2, help='Weight for padded loss')
     parser.add_argument('--w_consistency', type=float, default=0.2, help='Weight for consistency loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
                         help='Optimizer type')
     parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizers')
     parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'],
@@ -497,7 +484,7 @@ if __name__ == "__main__":
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau')
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of warmup epochs')
     parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Starting factor for warmup')
-    parser.add_argument('--use_scheduler', type=bool, default=True, help='Whether to use a learning rate scheduler')
+    parser.add_argument('--use_scheduler', type=bool, default=False, help='Whether to use a learning rate scheduler')
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
