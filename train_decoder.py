@@ -228,6 +228,27 @@ def train(args):
         'mean_f1_activity': [],
         'mean_f1_param_activity': []
     }
+    train_array = {
+        'total': [],
+        'loss_mse': [],
+        'loss_activity': [],
+        'loss_param_activity': [],
+        'padded_loss': [],
+        'consistency_loss': [],
+        'mean_f1_activity': [],
+        'mean_f1_param_activity': []
+    }
+    val_array = {
+        'total': [],
+        'loss_mse': [],
+        'loss_activity': [],
+        'loss_param_activity': [],
+        'padded_loss': [],
+        'consistency_loss': [],
+        'mean_f1_activity': [],
+        'mean_f1_param_activity': []
+    }
+
 
     for epoch in range(args.epochs):
         model.train()
@@ -386,9 +407,9 @@ def train(args):
                     f"Padded: {val_losses['padded_loss']:.4f}, Consistency: {val_losses['consistency_loss']:.4f}, "
                     f"Val Mean F1 Activity: {mean_val_f1_activity:.4f}, Val Mean F1 Param Activity: {mean_val_f1_param_activity:.4f}")
 
-        if (epoch - 1) % 15 == 0 and epoch != 0:
+        if (epoch +1) % 15 == 0 and epoch != 0:
             checkpoint = {
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'dgcnn_state_dict': model.dgcnn.state_dict(),
                 'decoder_state_dict': model.decoder.state_dict(),
                 'ortho_dgcnn_state_dict': model.state_dict(),
@@ -398,17 +419,14 @@ def train(args):
                 'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
                 'val_loss': val_losses['total']
             }
-            torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch }.pth'))
+            torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
             logger.info(f"Saved full model at epoch {epoch} with val_loss {val_losses['total']:.4f}")
-                # Save training and validation loss history as NumPy arrays
+
             for key in train_loss_history:
-                train_loss_history[key] = np.array(train_loss_history[key])
-                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), train_loss_history[key])
+                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
                 logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
-            
             for key in val_loss_history:
-                val_loss_history[key] = np.array(val_loss_history[key])
-                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), val_loss_history[key])
+                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
                 logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
 
 
