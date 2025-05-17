@@ -400,6 +400,17 @@ def train(args):
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch }.pth'))
             logger.info(f"Saved full model at epoch {epoch} with val_loss {val_losses['total']:.4f}")
+                # Save training and validation loss history as NumPy arrays
+            for key in train_loss_history:
+                train_loss_history[key] = np.array(train_loss_history[key])
+                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), train_loss_history[key])
+                logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
+            
+            for key in val_loss_history:
+                val_loss_history[key] = np.array(val_loss_history[key])
+                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), val_loss_history[key])
+                logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
+
 
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
