@@ -69,7 +69,6 @@ class Optimizers:
                 self.parameters,
                 lr=self.lr,
                 weight_decay=self.weight_decay,
-                betas=self.kwargs.get('betas', (0.98, 0.92, 0.99)),
                 eps=self.kwargs.get('eps', 1e-8)
             )
         else:

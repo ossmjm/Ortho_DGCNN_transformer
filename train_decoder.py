@@ -112,7 +112,7 @@ def train(args):
         num_points=args.num_points,
         channels=args.channels,
         embed_dim=args.embed_dim,
-        teacher_forcing_prob=args.teacher_forcing_prob,  # Pass float probability
+        teacher_forcing_prob=args.teacher_forcing_prob,
         decoder_layers=args.decoder_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
@@ -120,7 +120,6 @@ def train(args):
         decoder_type=args.decoder_type
     ).to(device)
 
-    # Load model weights and initialize optimizers
     optimizer_dgcnn = Optimizers(
         optimizer_name=args.optimizer,
         parameters=model.dgcnn.parameters(),
@@ -141,21 +140,20 @@ def train(args):
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['ortho_dgcnn_state_dict'])
             logger.info(f"Loaded full model weights from {args.checkpoint_path}")
-            # Attempt to load optimizer states
             if 'optimizer_dgcnn_state_dict' in checkpoint and checkpoint['optimizer_dgcnn_state_dict'] is not None:
                 try:
                     optimizer_dgcnn.load_state_dict(checkpoint['optimizer_dgcnn_state_dict'])
                     logger.info("Loaded optimizer_dgcnn state from checkpoint")
                 except Exception as e:
                     logger.warning(f"Failed to load optimizer_dgcnn state: {e}. Resetting optimizer state.")
-                    optimizer_dgcnn.state = {}  # Reset state to ensure clean initialization
+                    optimizer_dgcnn.state = {}
             if 'optimizer_decoder_state_dict' in checkpoint and checkpoint['optimizer_decoder_state_dict'] is not None:
                 try:
                     optimizer_decoder.load_state_dict(checkpoint['optimizer_decoder_state_dict'])
                     logger.info("Loaded optimizer_decoder state from checkpoint")
                 except Exception as e:
                     logger.warning(f"Failed to load optimizer_decoder state: {e}. Resetting optimizer state.")
-                    optimizer_decoder.state = {}  # Reset state to ensure clean initialization
+                    optimizer_decoder.state = {}
         except Exception as e:
             logger.error(f"Failed to load model weights from {args.checkpoint_path}: {e}")
             raise
@@ -164,7 +162,6 @@ def train(args):
         model.dgcnn.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"Loaded pretrained DGCNN weights from {args.pretrained_dgcnn_path}")
 
-    # Initialize schedulers only if use_scheduler is True
     scheduler_dgcnn = LRSchedulers(
         scheduler_name=args.scheduler,
         optimizer=optimizer_dgcnn,
@@ -188,7 +185,6 @@ def train(args):
         use_scheduler=args.use_scheduler
     ).get_scheduler()
 
-    # Load scheduler states if available and scheduler is used
     if args.checkpoint_path and os.path.exists(args.checkpoint_path) and args.use_scheduler:
         try:
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
@@ -210,6 +206,28 @@ def train(args):
     best_val_loss = float('inf')
     best_epoch = 0
     patience_counter = 0
+
+    # Lists to store losses and F1 scores over epochs
+    train_loss_history = {
+        'total': [],
+        'loss_mse': [],
+        'loss_activity': [],
+        'loss_param_activity': [],
+        'padded_loss': [],
+        'consistency_loss': [],
+        'mean_f1_activity': [],
+        'mean_f1_param_activity': []
+    }
+    val_loss_history = {
+        'total': [],
+        'loss_mse': [],
+        'loss_activity': [],
+        'loss_param_activity': [],
+        'padded_loss': [],
+        'consistency_loss': [],
+        'mean_f1_activity': [],
+        'mean_f1_param_activity': []
+    }
 
     for epoch in range(args.epochs):
         model.train()
@@ -272,7 +290,6 @@ def train(args):
                             f"Padded: {losses['padded_loss'].item():.4f}, "
                             f"Consistency: {losses['consistency_loss'].item():.4f}")
 
-        # Step schedulers only if they exist and scheduler type is not reduceonplateau
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn is not None:
                 scheduler_dgcnn.step()
@@ -283,6 +300,16 @@ def train(args):
             train_losses[key] /= len(train_loader)
         mean_train_f1_activity = np.mean(train_f1_activity)
         mean_train_f1_param_activity = np.mean(train_f1_param_activity)
+
+        # Append training metrics to history
+        train_loss_history['total'].append(train_losses['total'])
+        train_loss_history['loss_mse'].append(train_losses['loss_mse'])
+        train_loss_history['loss_activity'].append(train_losses['loss_activity'])
+        train_loss_history['loss_param_activity'].append(train_losses['loss_param_activity'])
+        train_loss_history['padded_loss'].append(train_losses['padded_loss'])
+        train_loss_history['consistency_loss'].append(train_losses['consistency_loss'])
+        train_loss_history['mean_f1_activity'].append(mean_train_f1_activity)
+        train_loss_history['mean_f1_param_activity'].append(mean_train_f1_param_activity)
 
         model.eval()
         val_losses = {
@@ -331,7 +358,16 @@ def train(args):
         mean_val_f1_activity = np.mean(val_f1_activity)
         mean_val_f1_param_activity = np.mean(val_f1_param_activity)
 
-        # Step schedulers for reduceonplateau only if scheduler is used
+        # Append validation metrics to history
+        val_loss_history['total'].append(val_losses['total'])
+        val_loss_history['loss_mse'].append(val_losses['loss_mse'])
+        val_loss_history['loss_activity'].append(val_losses['loss_activity'])
+        val_loss_history['loss_param_activity'].append(val_losses['loss_param_activity'])
+        val_loss_history['padded_loss'].append(val_losses['padded_loss'])
+        val_loss_history['consistency_loss'].append(val_losses['consistency_loss'])
+        val_loss_history['mean_f1_activity'].append(mean_val_f1_activity)
+        val_loss_history['mean_f1_param_activity'].append(mean_val_f1_param_activity)
+
         if args.use_scheduler and args.scheduler.lower() == 'reduceonplateau':
             if scheduler_dgcnn is not None:
                 scheduler_dgcnn.step(val_losses['total'])
@@ -350,21 +386,9 @@ def train(args):
                     f"Padded: {val_losses['padded_loss']:.4f}, Consistency: {val_losses['consistency_loss']:.4f}, "
                     f"Val Mean F1 Activity: {mean_val_f1_activity:.4f}, Val Mean F1 Param Activity: {mean_val_f1_param_activity:.4f}")
 
-        if epoch % 10 == 0 and epoch != 0:
-            # Save DGCNN model separately
-            dgcnn_checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.dgcnn.state_dict(),
-                'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'val_loss': val_losses['total']
-            }
-            torch.save(dgcnn_checkpoint, os.path.join(args.output_dir, f'dgcnn_epoch_{epoch + 1}.pth'))
-            logger.info(f"Saved DGCNN model at epoch {epoch + 1} with val_loss {val_losses['total']:.4f}")
-
-            # Save whole model
+        if (epoch - 1) % 15 == 0 and epoch != 0:
             checkpoint = {
-                'epoch': epoch + 1,
+                'epoch': epoch,
                 'dgcnn_state_dict': model.dgcnn.state_dict(),
                 'decoder_state_dict': model.decoder.state_dict(),
                 'ortho_dgcnn_state_dict': model.state_dict(),
@@ -374,8 +398,8 @@ def train(args):
                 'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
                 'val_loss': val_losses['total']
             }
-            torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
-            logger.info(f"Saved full model at epoch {epoch + 1} with val_loss {val_losses['total']:.4f}")
+            torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch }.pth'))
+            logger.info(f"Saved full model at epoch {epoch} with val_loss {val_losses['total']:.4f}")
 
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
@@ -386,18 +410,6 @@ def train(args):
             logger.info(f"No improvement in val_loss, patience counter: {patience_counter}/{args.patience}")
 
         if patience_counter >= args.patience:
-            # Save DGCNN model separately
-            dgcnn_checkpoint = {
-                'epoch': best_epoch,
-                'model_state_dict': model.dgcnn.state_dict(),
-                'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'val_loss': best_val_loss
-            }
-            torch.save(dgcnn_checkpoint, os.path.join(args.output_dir, f'best_dgcnn.pth'))
-            logger.info(f"Saved best DGCNN model at epoch {best_epoch} with val_loss {best_val_loss:.4f}")
-
-            # Save whole model
             checkpoint = {
                 'epoch': best_epoch,
                 'dgcnn_state_dict': model.dgcnn.state_dict(),
@@ -416,18 +428,6 @@ def train(args):
 
         if epoch == args.epochs - 1:
             last_val_loss = val_losses['total']
-            # Save DGCNN model separately
-            dgcnn_checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.dgcnn.state_dict(),
-                'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'val_loss': last_val_loss
-            }
-            torch.save(dgcnn_checkpoint, os.path.join(args.output_dir, f'last_dgcnn.pth'))
-            logger.info(f"Saved last DGCNN model at epoch {epoch + 1} with val_loss {last_val_loss:.4f}")
-
-            # Save whole model
             checkpoint = {
                 'epoch': epoch + 1,
                 'dgcnn_state_dict': model.dgcnn.state_dict(),
@@ -442,13 +442,24 @@ def train(args):
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
             logger.info(f"Saved last full model at epoch {epoch + 1} with val_loss {last_val_loss:.4f}")
 
+    # Save training and validation loss history as NumPy arrays
+    for key in train_loss_history:
+        train_loss_history[key] = np.array(train_loss_history[key])
+        np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), train_loss_history[key])
+        logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
+    
+    for key in val_loss_history:
+        val_loss_history[key] = np.array(val_loss_history[key])
+        np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), val_loss_history[key])
+        logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
+
     logger.info("Training completed")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Orthodontic Treatment Prediction Model")
     parser.add_argument('--data_dir', type=str, default='./Data', help='Path to dataset')
-    parser.add_argument('--output_dir', type=str, default='./output_decoder_l', help='Path to save checkpoints')
-    parser.add_argument('--log_file', type=str, default='training_log_decoder_l.txt', help='Path to log file')
+    parser.add_argument('--output_dir', type=str, default='./output_decoder', help='Path to save checkpoints')
+    parser.add_argument('--log_file', type=str, default='training_log_decoder.txt', help='Path to log file')
     parser.add_argument('--cache_dir', type=str, default='./cache', help='Path to cache directory')
     parser.add_argument('--pretrained_dgcnn_path', type=str, default='./output/best_dgcnn.pth', help='Path to pretrained DGCNN weights')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model (optional)')
