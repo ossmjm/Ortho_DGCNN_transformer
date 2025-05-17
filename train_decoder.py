@@ -228,28 +228,6 @@ def train(args):
         'mean_f1_activity': [],
         'mean_f1_param_activity': []
     }
-    train_array = {
-        'total': [],
-        'loss_mse': [],
-        'loss_activity': [],
-        'loss_param_activity': [],
-        'padded_loss': [],
-        'consistency_loss': [],
-        'mean_f1_activity': [],
-        'mean_f1_param_activity': []
-    }
-    val_array = {
-        'total': [],
-        'loss_mse': [],
-        'loss_activity': [],
-        'loss_param_activity': [],
-        'padded_loss': [],
-        'consistency_loss': [],
-        'mean_f1_activity': [],
-        'mean_f1_param_activity': []
-    }
-
-
     for epoch in range(args.epochs):
         model.train()
         train_losses = {
