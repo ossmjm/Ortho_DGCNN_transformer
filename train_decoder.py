@@ -9,7 +9,7 @@ import argparse
 from torch.amp import autocast, GradScaler
 from dataset import JawTeethDataset
 from models.OrthoDGCNN_decoder import OrthoDGCNNModel
-from losses_decoder import StagewiseMSELoss, ToothActivityLoss, ParamActivityLoss, PaddedLoss, ConsistencyLoss
+from losses_decoder import HybridTransformLoss, ToothActivityLoss, ParamActivityLoss, PaddedLoss, ConsistencyLoss
 from optimizers import Optimizers, LRSchedulers
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -28,14 +28,15 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def compute_loss(transforms_sequence, activity_logits, param_activity_logits, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
-    mse_loss_fn = StagewiseMSELoss(weight=args.w_trans).to(device)
-    activity_loss_fn = ToothActivityLoss(weight=args.w_activity).to(device)
-    param_activity_loss_fn = ParamActivityLoss(weight=args.w_param_activity).to(device)
+def compute_loss(transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
+    mse_loss_fn = HybridTransformLoss(weight=args.w_trans, small_error_threshold=args.small_error_threshold, small_error_scale=args.small_error_scale).to(device)
+    activity_loss_fn = ToothActivityLoss(weight=args.w_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
+    param_activity_loss_fn = ParamActivityLoss(weight=args.w_param_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
     padded_loss_fn = PaddedLoss(weight=args.w_padded).to(device)
     consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
+    stage_activity_loss_fn = nn.BCEWithLogitsLoss(reduction='mean').to(device)
     
-    transforms_sequence = torch.clamp(transforms_sequence, -5, 5)
+    transforms_sequence = torch.clamp(transforms_sequence, -20, 20)
     
     logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
     
@@ -45,12 +46,19 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, ta
     padded_loss = padded_loss_fn(transforms_sequence, true_num_stages, max_stages)
     consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device)
     
+    # Stage activity loss
+    stage_activity_labels = torch.ones_like(stage_activity_logits)
+    for i in range(true_num_stages.size(0)):
+        stage_activity_labels[i, true_num_stages[i]:] = 0.0
+    loss_stage_activity = stage_activity_loss_fn(stage_activity_logits, stage_activity_labels)
+    
     losses = {
         'loss_mse': loss_mse,
         'loss_activity': loss_activity,
         'loss_param_activity': loss_param_activity,
         'padded_loss': padded_loss,
-        'consistency_loss': consistency_loss
+        'consistency_loss': consistency_loss,
+        'loss_stage_activity': loss_stage_activity
     }
     for name, loss in losses.items():
         if torch.isnan(loss) or torch.isinf(loss):
@@ -61,16 +69,14 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, ta
         args.w_activity * loss_activity +
         args.w_param_activity * loss_param_activity +
         args.w_padded * padded_loss +
-        args.w_consistency * consistency_loss
+        args.w_consistency * consistency_loss +
+        args.w_stage_activity * loss_stage_activity
     )
     
     if torch.isnan(total_loss) or torch.isinf(total_loss):
         logger.error(f"Total loss is NaN or Inf: {total_loss.item()}")
     
-    mean_f1_activity = f1_activity.mean().item()
-    mean_f1_param_activity = f1_param_activity.mean().item()
-    
-    return total_loss, losses, mean_f1_activity, mean_f1_param_activity
+    return total_loss, losses, f1_activity, f1_param_activity
 
 def train(args):
     logger = setup_logging(args.log_file)
@@ -157,7 +163,7 @@ def train(args):
         except Exception as e:
             logger.error(f"Failed to load model weights from {args.checkpoint_path}: {e}")
             raise
-    else:
+    elif args.pretrained_dgcnn_path and os.path.exists(args.pretrained_dgcnn_path):
         checkpoint = torch.load(args.pretrained_dgcnn_path, map_location=device)
         model.dgcnn.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"Loaded pretrained DGCNN weights from {args.pretrained_dgcnn_path}")
@@ -207,7 +213,6 @@ def train(args):
     best_epoch = 0
     patience_counter = 0
 
-    # Lists to store losses and F1 scores over epochs
     train_loss_history = {
         'total': [],
         'loss_mse': [],
@@ -215,6 +220,7 @@ def train(args):
         'loss_param_activity': [],
         'padded_loss': [],
         'consistency_loss': [],
+        'loss_stage_activity': [],
         'mean_f1_activity': [],
         'mean_f1_param_activity': []
     }
@@ -225,6 +231,7 @@ def train(args):
         'loss_param_activity': [],
         'padded_loss': [],
         'consistency_loss': [],
+        'loss_stage_activity': [],
         'mean_f1_activity': [],
         'mean_f1_param_activity': []
     }
@@ -236,7 +243,8 @@ def train(args):
             'loss_activity': 0.0,
             'loss_param_activity': 0.0,
             'padded_loss': 0.0,
-            'consistency_loss': 0.0
+            'consistency_loss': 0.0,
+            'loss_stage_activity': 0.0
         }
         train_f1_activity = []
         train_f1_param_activity = []
@@ -250,7 +258,7 @@ def train(args):
             optimizer_decoder.zero_grad()
 
             with autocast(device_type='cuda'):
-                pred_transforms, activity_logits, param_activity_logits = model(
+                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
                     coordinates=feats,
                     targets=transforms,
                     cumulative_targets=cumulative_transforms,
@@ -258,11 +266,13 @@ def train(args):
                     param_activity_targets=param_activity,
                     num_stages=num_stages,
                     epoch=epoch,
-                    total_epochs=args.epochs
+                    total_epochs=args.epochs,
+                    val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
+                    training=True
                 )
 
-                total_loss, losses, mean_f1_activity, mean_f1_param_activity = compute_loss(
-                    pred_transforms, activity_logits, param_activity_logits,
+                total_loss, losses, f1_activity, f1_param_activity = compute_loss(
+                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits,
                     transforms, activity, param_activity, cumulative_transforms,
                     num_stages, args.max_stages, device, logger, args
                 )
@@ -279,15 +289,16 @@ def train(args):
             train_losses['total'] += total_loss.item()
             for key in losses:
                 train_losses[key] += losses[key].item()
-            train_f1_activity.append(mean_f1_activity)
-            train_f1_param_activity.append(mean_f1_param_activity)
+            train_f1_activity.append(f1_activity.item())
+            train_f1_param_activity.append(f1_param_activity.item())
 
             if batch_idx % 10 == 0:
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, MSE: {losses['loss_mse'].item():.4f}, "
                             f"Activity: {losses['loss_activity'].item():.4f}, Param Activity: {losses['loss_param_activity'].item():.4f}, "
                             f"Padded: {losses['padded_loss'].item():.4f}, "
-                            f"Consistency: {losses['consistency_loss'].item():.4f}")
+                            f"Consistency: {losses['consistency_loss'].item():.4f}, "
+                            f"Stage Activity: {losses['loss_stage_activity'].item():.4f}")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn is not None:
@@ -300,13 +311,13 @@ def train(args):
         mean_train_f1_activity = np.mean(train_f1_activity)
         mean_train_f1_param_activity = np.mean(train_f1_param_activity)
 
-        # Append training metrics to history
         train_loss_history['total'].append(train_losses['total'])
         train_loss_history['loss_mse'].append(train_losses['loss_mse'])
         train_loss_history['loss_activity'].append(train_losses['loss_activity'])
         train_loss_history['loss_param_activity'].append(train_losses['loss_param_activity'])
         train_loss_history['padded_loss'].append(train_losses['padded_loss'])
         train_loss_history['consistency_loss'].append(train_losses['consistency_loss'])
+        train_loss_history['loss_stage_activity'].append(train_losses['loss_stage_activity'])
         train_loss_history['mean_f1_activity'].append(mean_train_f1_activity)
         train_loss_history['mean_f1_param_activity'].append(mean_train_f1_param_activity)
 
@@ -317,7 +328,8 @@ def train(args):
             'loss_activity': 0.0,
             'loss_param_activity': 0.0,
             'padded_loss': 0.0,
-            'consistency_loss': 0.0
+            'consistency_loss': 0.0,
+            'loss_stage_activity': 0.0
         }
         val_f1_activity = []
         val_f1_param_activity = []
@@ -329,7 +341,7 @@ def train(args):
                 ]
 
                 with autocast(device_type='cuda'):
-                    pred_transforms, activity_logits, param_activity_logits = model(
+                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
                         coordinates=feats,
                         targets=transforms,
                         cumulative_targets=cumulative_transforms,
@@ -337,11 +349,13 @@ def train(args):
                         param_activity_targets=param_activity,
                         num_stages=num_stages,
                         epoch=epoch,
-                        total_epochs=args.epochs
+                        total_epochs=args.epochs,
+                        val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
+                        training=False
                     )
 
-                    total_loss, losses, mean_f1_activity, mean_f1_param_activity = compute_loss(
-                        pred_transforms, activity_logits, param_activity_logits,
+                    total_loss, losses, f1_activity, f1_param_activity = compute_loss(
+                        pred_transforms, activity_logits, param_activity_logits, stage_activity_logits,
                         transforms, activity, param_activity, cumulative_transforms,
                         num_stages, args.max_stages, device, logger, args
                     )
@@ -349,23 +363,13 @@ def train(args):
                 val_losses['total'] += total_loss.item()
                 for key in losses:
                     val_losses[key] += losses[key].item()
-                val_f1_activity.append(mean_f1_activity)
-                val_f1_param_activity.append(mean_f1_param_activity)
+                val_f1_activity.append(f1_activity.item())
+                val_f1_param_activity.append(f1_param_activity.item())
 
         for key in val_losses:
             val_losses[key] /= len(val_loader)
         mean_val_f1_activity = np.mean(val_f1_activity)
         mean_val_f1_param_activity = np.mean(val_f1_param_activity)
-
-        # Append validation metrics to history
-        val_loss_history['total'].append(val_losses['total'])
-        val_loss_history['loss_mse'].append(val_losses['loss_mse'])
-        val_loss_history['loss_activity'].append(val_losses['loss_activity'])
-        val_loss_history['loss_param_activity'].append(val_losses['loss_param_activity'])
-        val_loss_history['padded_loss'].append(val_losses['padded_loss'])
-        val_loss_history['consistency_loss'].append(val_losses['consistency_loss'])
-        val_loss_history['mean_f1_activity'].append(mean_val_f1_activity)
-        val_loss_history['mean_f1_param_activity'].append(mean_val_f1_param_activity)
 
         if args.use_scheduler and args.scheduler.lower() == 'reduceonplateau':
             if scheduler_dgcnn is not None:
@@ -377,12 +381,14 @@ def train(args):
                     f"Train Loss: {train_losses['total']:.4f}, MSE: {train_losses['loss_mse']:.4f}, "
                     f"Activity: {train_losses['loss_activity']:.4f}, Param Activity: {train_losses['loss_param_activity']:.4f}, "
                     f"Padded: {train_losses['padded_loss']:.4f}, Consistency: {train_losses['consistency_loss']:.4f}, "
+                    f"Stage Activity: {train_losses['loss_stage_activity']:.4f}, "
                     f"Train Mean F1 Activity: {mean_train_f1_activity:.4f}, Train Mean F1 Param Activity: {mean_train_f1_param_activity:.4f}")
         
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Val Loss: {val_losses['total']:.4f}, MSE: {val_losses['loss_mse']:.4f}, "
                     f"Activity: {val_losses['loss_activity']:.4f}, Param Activity: {val_losses['loss_param_activity']:.4f}, "
                     f"Padded: {val_losses['padded_loss']:.4f}, Consistency: {val_losses['consistency_loss']:.4f}, "
+                    f"Stage Activity: {val_losses['loss_stage_activity']:.4f}, "
                     f"Val Mean F1 Activity: {mean_val_f1_activity:.4f}, Val Mean F1 Param Activity: {mean_val_f1_param_activity:.4f}")
 
         if (epoch +1) % 15 == 0 and epoch != 0:
@@ -449,7 +455,6 @@ def train(args):
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
             logger.info(f"Saved last full model at epoch {epoch + 1} with val_loss {last_val_loss:.4f}")
 
-    # Save training and validation loss history as NumPy arrays
     for key in train_loss_history:
         train_loss_history[key] = np.array(train_loss_history[key])
         np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), train_loss_history[key])
@@ -468,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='./output_decoder', help='Path to save checkpoints')
     parser.add_argument('--log_file', type=str, default='training_log_decoder.txt', help='Path to log file')
     parser.add_argument('--cache_dir', type=str, default='./cache', help='Path to cache directory')
-    parser.add_argument('--pretrained_dgcnn_path', type=str, default='./output/best_dgcnn.pth', help='Path to pretrained DGCNN weights')
+    parser.add_argument('--pretrained_dgcnn_path', type=str, default= None, help='Path to pretrained DGCNN weights')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model (optional)')
     parser.add_argument('--num_points', type=int, default=256, help='Number of points per tooth')
     parser.add_argument('--channels', type=int, default=4, help='Number of feature channels')
@@ -478,7 +483,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
     parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers in Transformer')
-    parser.add_argument('--decoder_type', type=str, default='decoder', help='Type of used decoder model')
+    parser.add_argument('--decoder_type', type=str, default='per_tooth', help='Type of used decoder model')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
@@ -486,11 +491,12 @@ if __name__ == "__main__":
     parser.add_argument('--teacher_forcing_prob', type=float, default=0.8, help='Teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
-    parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for MSE loss')
+    parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for transformation loss')
     parser.add_argument('--w_activity', type=float, default=1.0, help='Weight for activity loss')
     parser.add_argument('--w_param_activity', type=float, default=1.0, help='Weight for param activity loss')
-    parser.add_argument('--w_padded', type=float, default=0.2, help='Weight for padded loss')
-    parser.add_argument('--w_consistency', type=float, default=0.2, help='Weight for consistency loss')
+    parser.add_argument('--w_padded', type=float, default=0.5, help='Weight for padded loss')
+    parser.add_argument('--w_consistency', type=float, default=0.5, help='Weight for consistency loss')
+    parser.add_argument('--w_stage_activity', type=float, default=1, help='Weight for stage activity loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
                         help='Optimizer type')
@@ -503,6 +509,11 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of warmup epochs')
     parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Starting factor for warmup')
     parser.add_argument('--use_scheduler', type=bool, default=False, help='Whether to use a learning rate scheduler')
+    parser.add_argument('--small_error_threshold', type=float, default=1.0, help='Threshold for small errors in transformation loss')
+    parser.add_argument('--small_error_scale', type=float, default=5.0, help='Scale factor for small errors in transformation loss')
+    parser.add_argument('--use_focal_loss', type=bool, default=True, help='Use focal loss for activity losses')
+    parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha parameter for focal loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

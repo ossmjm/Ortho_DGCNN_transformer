@@ -13,15 +13,17 @@ class PerToothTransformerDecoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))
         self.target_embed = nn.Linear(6, embed_dim)
         self.cumulative_embed = nn.Linear(6, embed_dim)
-        # New embeddings for activity and parameter activity
-        self.activity_target_embed = nn.Linear(1, embed_dim)  # Activity is scalar (binary)
-        self.param_activity_target_embed = nn.Linear(6, embed_dim)  # Param activity is vector of 6
+        self.activity_target_embed = nn.Linear(1, embed_dim)
+        self.param_activity_target_embed = nn.Linear(6, embed_dim)
         
         # Cross-tooth attention to aggregate memory
         self.cross_tooth_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
         
         # Attention to aggregate previous stage embeddings
         self.prev_targets_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
+        
+        # Cumulative attention for stage-wise cumulative transforms
+        self.cumulative_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
         
         # Per-tooth transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
@@ -37,35 +39,41 @@ class PerToothTransformerDecoder(nn.Module):
         self.tooth_decoders = nn.ModuleList([
             nn.TransformerDecoder(decoder_layer, num_layers=num_layers) for _ in range(num_teeth)
         ])
-        # Enhanced MLP for transformation prediction
-        self.activity = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.Linear(128, 100),
-            nn.BatchNorm1d(100, eps=1e-3),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(100, 80),
-            nn.Linear(80, 50),
-            nn.BatchNorm1d(50, eps=1e-3),
-            nn.ReLU()
+
+        # Stage activity head
+        self.stage_activity_mlp = nn.Sequential(
+            nn.Linear(embed_dim, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, 1), nn.Sigmoid()
         )
 
-        # Shared prediction heads
+        self.activity_mlp = nn.Sequential(
+            nn.Linear(embed_dim, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3)
+        )
+        self.param_activity_mlp = nn.Sequential(
+            nn.Linear(embed_dim, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3)
+        )
+        self.transform_mlp = nn.Sequential(
+            nn.Linear(embed_dim, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 100), nn.BatchNorm1d(100), nn.ReLU(),
+            nn.Linear(100, 80), nn.Linear(80, 50), nn.ReLU()
+        )
+
         self.activity_head = nn.Sequential(
-            nn.Linear(50, 1),  
-            nn.Sigmoid()
+            nn.Linear(64, 1), nn.Sigmoid()
         )
-                
         self.param_activity_head = nn.Sequential(
-            nn.Linear(50, 6),  
-            nn.Sigmoid()
+            nn.Linear(64, 6), nn.Sigmoid()
         )
-
-        self.out_layer = nn.Linear(embed_dim, 6)
+        self.out_layer = nn.Linear(50, 6)
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-4)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-4)
         
-        # Initialize weights
+        # Learned stage weights for residual distribution
+        self.stage_weights = nn.Parameter(torch.ones(1, max_stages, 1, 1))
+        
         self._init_weights()
 
     def _init_weights(self):
@@ -76,26 +84,28 @@ class PerToothTransformerDecoder(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
                 nn.init.trunc_normal_(m, std=0.01)
-    
-    def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx):
-        """Compute teacher forcing probability and number of previous stages based on epoch."""
-        # Teacher forcing probability: Linear decay from 0.9 to 0.3
-        progress = epoch / total_epochs
-        tf_prob = max(0.3, 0.9 - 0.6 * progress)  # From 0.9 to 0.3
-        
-        # Curriculum for number of previous stages
-        if progress < 0.1:  # First 10% of epochs
-            num_stages = min(2, stage_idx)  # At least 2 stages
-        elif progress < 0.3:  # 10–30%
-            num_stages = min(5, stage_idx)  # Up to 5 stages
-        elif progress < 0.6:  # 30–60%
-            num_stages = min(10, stage_idx)  # Up to 10 stages
-        else:  # 60–100%
-            num_stages = stage_idx  # All previous stages
-        
-        return tf_prob, num_stages
 
-    def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100):
+    def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
+        """Compute teacher forcing probability and number of previous stages."""
+        if val_loss is not None:
+            normalized_loss = min(val_loss / 0.1, 1.0)  # Assume 0.1 is a reasonable loss threshold
+            tf_prob = base_tf_prob * (1 - normalized_loss)
+            tf_prob = max(0.3, tf_prob)
+        else:
+            progress = epoch / total_epochs
+            tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
+        
+        # Sample-specific stage curriculum
+        num_stages_to_use = min(stage_idx, num_stages.max().item() if num_stages is not None else stage_idx)
+        progress = epoch / total_epochs
+        if progress < 0.3:
+            num_stages_to_use = min(num_stages_to_use, 5)
+        elif progress < 0.6:
+            num_stages_to_use = min(num_stages_to_use, 10)
+        
+        return tf_prob, num_stages_to_use
+
+    def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
         device = memory.device
@@ -135,15 +145,15 @@ class PerToothTransformerDecoder(nn.Module):
         if param_activity_targets is not None:
             param_activity_targets = torch.nan_to_num(param_activity_targets, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Cross-tooth attention to enrich memory
+        # Cross-tooth attention
         memory_key_padding_mask = torch.zeros(B, self.num_teeth, dtype=torch.bool, device=device)
         memory_attn, _ = self.cross_tooth_attention(memory, memory, memory, key_padding_mask=memory_key_padding_mask)
-        memory = memory + memory_attn  # Residual connection
+        memory = memory + memory_attn
 
         # Cumulative embedding
-        cumulative_embed = self.cumulative_embed(cumulative_transforms)  # [B, num_teeth, embed_dim]
+        cumulative_embed = self.cumulative_embed(cumulative_transforms)
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
-        cumulative_embed = cumulative_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)  # [B, max_stages, num_teeth, embed_dim]
+        cumulative_embed = cumulative_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
 
         # Initialize outputs
         output_all = torch.zeros(B, self.max_stages, self.num_teeth, self.embed_dim, device=device)
@@ -151,146 +161,163 @@ class PerToothTransformerDecoder(nn.Module):
         activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, device=device)
         param_activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         param_activity_masks = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
+        stage_activity_logits = torch.zeros(B, self.max_stages, device=device)
 
-        # Initialize sequences for predicted values
-        prev_transform_seq = torch.zeros(B, self.max_stages, 6, device=device)  # [B, max_stages, 6]
-        prev_activity_seq = torch.zeros(B, self.max_stages, 1, device=device)  # [B, max_stages, 1]
-        prev_param_activity_seq = torch.zeros(B, self.max_stages, 6, device=device)  # [B, max_stages, 6]
+        # Initialize sequences
+        prev_transform_seq = torch.zeros(B, self.max_stages, 6, device=device)
+        prev_activity_seq = torch.zeros(B, self.max_stages, 1, device=device)
+        prev_param_activity_seq = torch.zeros(B, self.max_stages, 6, device=device)
 
-        # Process each tooth independently
+        # Process each tooth
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
-                # Get teacher forcing probability and number of stages
-                tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx)
-                # Combine with use_teacher_forcing (treat as probability if float)
+                # Get teacher forcing params (only relevant for training)
+                tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
                 effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
-                # Check if stage_idx is within true_num_stages for each sample
-                if num_stages is not None:
-                    tf_mask = (stage_idx < num_stages).float()  # [B]
+                if num_stages is not None and training:
+                    tf_mask = (stage_idx < num_stages).float()
                     use_tf = training and stage_idx > 0 and (torch.rand(B, device=device) < effective_tf_prob * tf_mask).any()
                 else:
-                    use_tf = training and stage_idx > 0 and torch.rand(1).item() < effective_tf_prob
+                    use_tf = False  # Disable teacher forcing during inference
 
-                # Prepare target embeddings
-                start_idx = max(0, stage_idx - num_stages_to_use)  # Use same start_idx for both cases
+                # Prepare target embeddings with scheduled sampling
+                start_idx = max(0, stage_idx - num_stages_to_use)
                 if use_tf and targets is not None:
-                    targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]  # [B, num_stages_to_use, 6]
-                    embedded_target = self.target_embed(targets_prev)  # [B, num_stages_to_use, embed_dim]
-                    # Aggregate using attention
-                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
-                    embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)  # [B, 1, embed_dim]
-                    embedded_target = embedded_target.squeeze(1)  # [B, embed_dim]
+                    targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]
+                    predicted_prev = prev_transform_seq[:, start_idx:stage_idx, :]
+                    mix_ratio = effective_tf_prob
+                    targets_prev = mix_ratio * targets_prev + (1 - mix_ratio) * predicted_prev
+                    embedded_target = self.target_embed(targets_prev)
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
+                    embedded_target = embedded_target.squeeze(1)
                 else:
-                    # Use accumulated predicted transforms, limited to num_stages_to_use
-                    targets_prev = prev_transform_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 6]
-                    if targets_prev.shape[1] == 0:  # Handle empty slice
-                        embedded_target = self.target_embed(torch.zeros(B, 6, device=device))  # [B, embed_dim]
+                    targets_prev = prev_transform_seq[:, start_idx:stage_idx, :]
+                    if targets_prev.shape[1] == 0:
+                        embedded_target = self.target_embed(torch.zeros(B, 6, device=device))
                     else:
-                        embedded_target = self.target_embed(targets_prev)  # [B, num_stages_to_use, embed_dim]
-                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
-                        embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)  # [B, 1, embed_dim]
-                        embedded_target = embedded_target.squeeze(1)  # [B, embed_dim]
-
-                # Prepare activity target embeddings
-                if use_tf and activity_targets is not None:
-                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)  # [B, num_stages_to_use, 1]
-                    embedded_activity = self.activity_target_embed(activity_prev)  # [B, num_stages_to_use, embed_dim]
-                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
-                    embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)  # [B, 1, embed_dim]
-                    embedded_activity = embedded_activity.squeeze(1)  # [B, embed_dim]
-                else:
-                    activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 1]
-                    if activity_prev.shape[1] == 0:  # Handle empty slice
-                        embedded_activity = self.activity_target_embed(torch.zeros(B, 1, device=device))  # [B, embed_dim]
-                    else:
-                        embedded_activity = self.activity_target_embed(activity_prev)  # [B, num_stages_to_use, embed_dim]
+                        embedded_target = self.target_embed(targets_prev)
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
-                        embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)  # [B, 1, embed_dim]
-                        embedded_activity = embedded_activity.squeeze(1)  # [B, embed_dim]
+                        embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
+                        embedded_target = embedded_target.squeeze(1)
 
-                # Prepare param activity target embeddings
-                if use_tf and param_activity_targets is not None:
-                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]  # [B, num_stages_to_use, 6]
-                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev)  # [B, num_stages_to_use, embed_dim]
-                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
-                    embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)  # [B, 1, embed_dim]
-                    embedded_param_activity = embedded_param_activity.squeeze(1)  # [B, embed_dim]
+                # Activity target embeddings
+                if use_tf and activity_targets is not None:
+                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)
+                    predicted_activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
+                    activity_prev = mix_ratio * activity_prev + (1 - mix_ratio) * predicted_activity_prev
+                    embedded_activity = self.activity_target_embed(activity_prev)
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
+                    embedded_activity = embedded_activity.squeeze(1)
                 else:
-                    param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]  # [B, num_stages_to_use, 6]
-                    if param_activity_prev.shape[1] == 0:  # Handle empty slice
-                        embedded_param_activity = self.param_activity_target_embed(torch.zeros(B, 6, device=device))  # [B, embed_dim]
+                    activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
+                    if activity_prev.shape[1] == 0:
+                        embedded_activity = self.activity_target_embed(torch.zeros(B, 1, device=device))
                     else:
-                        embedded_param_activity = self.param_activity_target_embed(param_activity_prev)  # [B, num_stages_to_use, embed_dim]
-                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)  # [B, 1, embed_dim]
-                        embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)  # [B, 1, embed_dim]
-                        embedded_param_activity = embedded_param_activity.squeeze(1)  # [B, embed_dim]
+                        embedded_activity = self.activity_target_embed(activity_prev)
+                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
+                        embedded_activity = embedded_activity.squeeze(1)
+
+                # Param activity target embeddings
+                if use_tf and param_activity_targets is not None:
+                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]
+                    predicted_param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
+                    param_activity_prev = mix_ratio * param_activity_prev + (1 - mix_ratio) * predicted_param_activity_prev
+                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
+                    query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
+                    embedded_param_activity = embedded_param_activity.squeeze(1)
+                else:
+                    param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
+                    if param_activity_prev.shape[1] == 0:
+                        embedded_param_activity = self.param_activity_target_embed(torch.zeros(B, 6, device=device))
+                    else:
+                        embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
+                        query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
+                        embedded_param_activity = embedded_param_activity.squeeze(1)
 
                 # Combine embeddings
-                pos_embed = self.pos_embed[:, stage_idx, :]  # [1, embed_dim]
-                cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]  # [B, embed_dim]
-                tgt = embedded_target + embedded_activity + embedded_param_activity + pos_embed + cum_embed  # [B, embed_dim]
-                tgt = self.pre_norm(tgt.unsqueeze(1))  # [B, 1, embed_dim]
+                pos_embed = self.pos_embed[:, stage_idx, :]
+                cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]
+                tgt = embedded_target + embedded_activity + embedded_param_activity + pos_embed + cum_embed
+                tgt = self.pre_norm(tgt.unsqueeze(1))
 
-                # Prepare memory for this tooth
-                tooth_memory = memory  # [B, num_teeth, embed_dim]
+                # Cumulative attention
+                cum_attn, _ = self.cumulative_attention(tgt, cumulative_embed[:, stage_idx], cumulative_embed[:, stage_idx])
+                tgt = tgt + cum_attn
 
                 # Decode
-                output = self.tooth_decoders[tooth_idx](tgt, tooth_memory, memory_key_padding_mask=memory_key_padding_mask)
-                output = self.final_norm(output.squeeze(1))  # [B, embed_dim]
-
-                # Store output
+                output = self.tooth_decoders[tooth_idx](tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
+                output = self.final_norm(output.squeeze(1))
                 output_all[:, stage_idx, tooth_idx, :] = output
-                activity_mlp = self.activity(output)
-                # Predict activity
-                activity_logit = self.activity_head(activity_mlp).squeeze(-1)  # [B]
-                activity_mask = (activity_logit > 0.5).float()  # [B]
+
+                # Stage activity prediction (using output from first tooth for simplicity)
+                if tooth_idx == 0:
+                    stage_activity_logit = self.stage_activity_mlp(output).squeeze(-1)
+                    stage_activity_logits[:, stage_idx] = stage_activity_logit
+
+                activity_mlp_out = self.activity_mlp(output)
+                param_activity_mlp_out = self.param_activity_mlp(output)
+                transform_mlp_out = self.transform_mlp(output)
+
+                activity_logit = self.activity_head(activity_mlp_out).squeeze(-1)
+                param_activity_logit = self.param_activity_head(param_activity_mlp_out)
+                transforms = self.out_layer(transform_mlp_out)
+
+                activity_mask = (activity_logit > 0.5).float()
                 activity_logits[:, stage_idx, tooth_idx] = activity_logit
 
-                # Predict parameter activity
-                param_activity_logit = self.param_activity_head(activity_mlp)  # [B, 6]
-                param_activity_mask = (param_activity_logit > 0.5).float() * activity_mask.unsqueeze(-1)  # [B, 6]
+                param_activity_mask = (param_activity_logit > 0.5).float() * activity_mask.unsqueeze(-1)
                 param_activity_logits[:, stage_idx, tooth_idx, :] = param_activity_logit
                 param_activity_masks[:, stage_idx, tooth_idx, :] = param_activity_mask
 
-                # Predict transformations
-                transforms = self.out_layer(output)  # [B, 6]
-                transforms = transforms * param_activity_mask  # Zero out inactive parameters
                 transforms_sequence[:, stage_idx, tooth_idx, :] = transforms
 
-                # Update previous sequences
                 prev_transform_seq[:, stage_idx, :] = transforms.detach()
                 prev_activity_seq[:, stage_idx, :] = activity_logit.detach().unsqueeze(-1)
                 prev_param_activity_seq[:, stage_idx, :] = param_activity_logit.detach()
                 if use_tf and stage_idx < self.max_stages - 1:
                     if targets is not None:
-                        prev_transform_seq[:, stage_idx, :] = targets[:, stage_idx, tooth_idx, :]
+                        prev_transform_seq[:, stage_idx, :] = mix_ratio * targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * transforms.detach()
                     if activity_targets is not None:
-                        prev_activity_seq[:, stage_idx, :] = activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1)
+                        prev_activity_seq[:, stage_idx, :] = mix_ratio * activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1) + (1 - mix_ratio) * activity_logit.detach().unsqueeze(-1)
                     if param_activity_targets is not None:
-                        prev_param_activity_seq[:, stage_idx, :] = param_activity_targets[:, stage_idx, tooth_idx, :]
+                        prev_param_activity_seq[:, stage_idx, :] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
 
-        # Enforce zero stage-wise transforms if cumulative transform is zero
-        cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)  # [B, 1, num_teeth, 6]
+        # Apply stage activity mask
+        stage_activity_mask = (stage_activity_logits > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # [B, max_stages, 1, 1]
+        transforms_sequence = transforms_sequence * stage_activity_mask
+        activity_logits = activity_logits * stage_activity_mask.squeeze(-1)
+        param_activity_logits = param_activity_logits * stage_activity_mask
+
+        # Enforce zero transforms for zero cumulative transforms
+        cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
 
-        # Adjust transforms to match cumulative transforms
+        # Non-uniform residual distribution
+        stage_weights = torch.softmax(self.stage_weights, dim=1)
         stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)
-        if num_stages is not None:
+        if num_stages is not None and training:
             for i in range(B):
-                assert isinstance(num_stages[i], (int, torch.Tensor)) and 0 <= num_stages[i] <= self.max_stages
                 stage_mask[i, num_stages[i]:] = 0.0
-        
-        pred_sum = (transforms_sequence * stage_mask).sum(dim=1)  # [B, num_teeth, 6]
-        residual = cumulative_transforms - pred_sum  # [B, num_teeth, 6]
-        active_stages = stage_mask.sum(dim=1, keepdim=True).clamp(min=1e-4)  # [B, 1, 1, 1]
-        residual_expanded = residual.unsqueeze(1).expand(-1, self.max_stages, -1, -1)  # [B, max_stages, num_teeth, 6]
-        adjustment = (residual_expanded / active_stages) * stage_mask * param_activity_masks
+        else:
+            # During inference, use stage_activity_mask to determine active stages
+            stage_mask = stage_activity_mask
+
+        pred_sum = (transforms_sequence * stage_mask).sum(dim=1)
+        residual = cumulative_transforms - pred_sum
+        residual_expanded = residual.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
+        adjustment = residual_expanded * stage_weights * stage_mask * param_activity_masks * 0.5  # Soft constraint
 
         transforms_sequence = transforms_sequence + adjustment
 
+        logger.debug(f"Stage activity mask mean: {stage_activity_mask.mean().item():.4f}")
         logger.debug(f"Activity mask mean: {activity_mask.mean().item():.4f}")
         logger.debug(f"Param activity mask mean: {param_activity_masks.mean().item():.4f}")
         logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}")
         logger.debug(f"Consistency error: {((transforms_sequence * stage_mask).sum(dim=1) - cumulative_transforms).abs().mean().item():.4f}")
 
-        return [transforms_sequence, activity_logits, param_activity_logits]
+        return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits]
