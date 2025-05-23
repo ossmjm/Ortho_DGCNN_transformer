@@ -68,8 +68,8 @@ class PerToothTransformerDecoder(nn.Module):
             nn.Linear(64, 6), nn.Sigmoid()
         )
         self.out_layer = nn.Linear(50, 6)
-        self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-4)
-        self.final_norm = nn.LayerNorm(embed_dim, eps=1e-4)
+        self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-3)  # Increased eps for stability
+        self.final_norm = nn.LayerNorm(embed_dim, eps=1e-3)  # Increased eps for stability
         
         # Learned stage weights for residual distribution
         self.stage_weights = nn.Parameter(torch.ones(1, max_stages, 1, 1))
@@ -79,11 +79,14 @@ class PerToothTransformerDecoder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.xavier_uniform_(m.weight, gain=0.5)  # Reduced gain for stability
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
                 nn.init.trunc_normal_(m, std=0.01)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
         """Compute teacher forcing probability and number of previous stages."""
@@ -233,6 +236,9 @@ class PerToothTransformerDecoder(nn.Module):
                     param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
                     if param_activity_prev.shape[1] == 0:
                         embedded_param_activity = self.param_activity_target_embed(torch.zeros(B, 6, device=device))
+                        # Log output for debugging
+                        if torch.isnan(embedded_param_activity).any() or torch.isinf(embedded_param_activity).any():
+                            logger.error(f"NaN/Inf in param_activity_target_embed output at tooth {tooth_idx}, stage {stage_idx}")
                     else:
                         embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
@@ -313,6 +319,12 @@ class PerToothTransformerDecoder(nn.Module):
         adjustment = residual_expanded * stage_weights * stage_mask * param_activity_masks * 0.5  # Soft constraint
 
         transforms_sequence = transforms_sequence + adjustment
+
+        # Clip gradients for stability
+        for p in self.parameters():
+            if p.grad is not None:
+                p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                p.grad.clamp_(-1.0, 1.0)
 
         logger.debug(f"Stage activity mask mean: {stage_activity_mask.mean().item():.4f}")
         logger.debug(f"Activity mask mean: {activity_mask.mean().item():.4f}")
