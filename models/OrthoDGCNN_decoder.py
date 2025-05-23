@@ -128,17 +128,23 @@ class OrthoDGCNNModel(nn.Module):
         
         transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits = outputs
         
+        # Extract stage_weights from decoder if it's PerToothTransformerDecoder
+        stage_weights = None
+        if isinstance(self.decoder, PerToothTransformerDecoder):
+            stage_weights = torch.softmax(self.decoder.stage_weights, dim=1)
+        
         if torch.isnan(transforms_sequence).any():
             logger.error("NaN values detected in transforms_sequence")
             transforms_sequence = torch.nan_to_num(transforms_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
         
         logger.debug(f"OrthoDGCNN output shape: transforms_sequence={transforms_sequence.shape}, "
                     f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
-                    f"stage_activity_logits={stage_activity_logits.shape}")
+                    f"stage_activity_logits={stage_activity_logits.shape}, "
+                    f"stage_weights_shape={stage_weights.shape if stage_weights is not None else 'None'}")
                      
         for i, output in enumerate(outputs):
             if torch.isnan(output).any():
                 logger.error(f"NaN values detected in output {i}")
                 outputs[i] = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
                 
-        return outputs
+        return outputs + [stage_weights]

@@ -18,9 +18,10 @@ torch.backends.cudnn.benchmark = True
 
 def setup_logging(log_file):
     logger = logging.getLogger('TrainLogger')
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     file_handler = logging.FileHandler(log_file)
     console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
     log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(log_format)
     console_handler.setFormatter(log_format)
@@ -28,7 +29,7 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def compute_loss(transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
+def compute_loss(transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, stage_weights, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
     mse_loss_fn = HybridTransformLoss(weight=args.w_trans, small_error_threshold=args.small_error_threshold, small_error_scale=args.small_error_scale).to(device)
     activity_loss_fn = ToothActivityLoss(weight=args.w_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
     param_activity_loss_fn = ParamActivityLoss(weight=args.w_param_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
@@ -36,13 +37,15 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
     stage_activity_loss_fn = nn.BCEWithLogitsLoss(reduction='mean').to(device)
     
-    transforms_sequence = torch.clamp(transforms_sequence, -20, 20)
+    transforms_sequence = torch.clamp(transforms_sequence, -40, 40)
     
     logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
+    if stage_weights is not None:
+        logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
     
-    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1))
+    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1), stage_weights=stage_weights)
     loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
-    loss_param_activity, f1_param_activity = param_activity_loss_fn(param_activity_logits, param_activity_labels, activity_logits, true_num_stages)
+    loss_param_activity, f1_param_activity = param_activity_loss_fn(param_activity_logits, param_activity_labels, activity_labels, true_num_stages)
     padded_loss = padded_loss_fn(transforms_sequence, true_num_stages, max_stages)
     consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device)
     
@@ -258,7 +261,7 @@ def train(args):
             optimizer_decoder.zero_grad()
 
             with autocast(device_type='cuda'):
-                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
+                outputs = model(
                     coordinates=feats,
                     targets=transforms,
                     cumulative_targets=cumulative_transforms,
@@ -270,9 +273,10 @@ def train(args):
                     val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                     training=True
                 )
+                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights = outputs
 
                 total_loss, losses, f1_activity, f1_param_activity = compute_loss(
-                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits,
+                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,
                     transforms, activity, param_activity, cumulative_transforms,
                     num_stages, args.max_stages, device, logger, args
                 )
@@ -341,7 +345,7 @@ def train(args):
                 ]
 
                 with autocast(device_type='cuda'):
-                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
+                    outputs = model(
                         coordinates=feats,
                         targets=transforms,
                         cumulative_targets=cumulative_transforms,
@@ -353,9 +357,10 @@ def train(args):
                         val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                         training=False
                     )
+                    pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights = outputs
 
                     total_loss, losses, f1_activity, f1_param_activity = compute_loss(
-                        pred_transforms, activity_logits, param_activity_logits, stage_activity_logits,
+                        pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,
                         transforms, activity, param_activity, cumulative_transforms,
                         num_stages, args.max_stages, device, logger, args
                     )
@@ -456,13 +461,11 @@ def train(args):
             logger.info(f"Saved last full model at epoch {epoch + 1} with val_loss {last_val_loss:.4f}")
 
     for key in train_loss_history:
-        train_loss_history[key] = np.array(train_loss_history[key])
-        np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), train_loss_history[key])
+        np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
         logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
     
     for key in val_loss_history:
-        val_loss_history[key] = np.array(val_loss_history[key])
-        np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), val_loss_history[key])
+        np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
         logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
 
     logger.info("Training completed")
