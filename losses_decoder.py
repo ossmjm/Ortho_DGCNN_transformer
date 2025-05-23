@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torcheval.metrics.functional import focal_loss
 from torchmetrics.functional.classification import binary_f1_score
+from torchvision.ops import sigmoid_focal_loss
 import logging
 
 class HybridTransformLoss(nn.Module):
@@ -82,7 +82,7 @@ class ToothActivityLoss(nn.Module):
             
             if self.use_focal:
                 # Use torcheval's focal_loss with sum reduction
-                tooth_loss = focal_loss(
+                tooth_loss = sigmoid_focal_loss(
                     tooth_logits.flatten(),
                     tooth_labels.flatten(),
                     alpha=self.alpha,
@@ -102,9 +102,11 @@ class ToothActivityLoss(nn.Module):
         loss = self.weight * loss / (num_valid_teeth + 1e-6)
         
         # Compute F1 score
-        preds = torch.sigmoid(logits) * stage_mask.unsqueeze(-1)
-        labels = labels * stage_mask.unsqueeze(-1)
-        valid_mask = stage_mask.unsqueeze(-1).flatten()
+        # Expand stage_mask to include num_teeth dimension
+        stage_mask_expanded = stage_mask.unsqueeze(-1).expand(-1, -1, num_teeth)
+        preds = torch.sigmoid(logits) * stage_mask_expanded
+        labels = labels * stage_mask_expanded
+        valid_mask = stage_mask_expanded.flatten()
         valid_preds = preds.flatten()[valid_mask.bool()]
         valid_labels = labels.flatten()[valid_mask.bool()]
         
@@ -152,7 +154,7 @@ class ParamActivityLoss(nn.Module):
                     param_labels = tooth_labels[:, :, param_idx]  # [batch_size, max_stages]
                     if self.use_focal:
                         # Use torcheval's focal_loss with sum reduction
-                        param_loss = focal_loss(
+                        param_loss = sigmoid_focal_loss(
                             param_logits.flatten(),
                             param_labels.flatten(),
                             alpha=self.alpha,
@@ -176,7 +178,7 @@ class ParamActivityLoss(nn.Module):
         logger.debug(f"ParamActivityLoss: num_active_teeth: {num_active_teeth}, active_mask_sum: {active_mask.sum().item()}")
         
         # Compute F1 score
-        stage_mask_expanded = stage_mask.unsqueeze(-1).unsqueeze(-1)
+        stage_mask_expanded = stage_mask.unsqueeze(-1).expand(-1, -1, num_teeth).unsqueeze(-1).expand(-1, -1, -1, num_params)
         active_mask_expanded = active_mask
         preds = torch.sigmoid(logits) * stage_mask_expanded * active_mask_expanded
         labels = labels * stage_mask_expanded * active_mask_expanded

@@ -25,6 +25,9 @@ class PerToothTransformerDecoder(nn.Module):
         # Cumulative attention for stage-wise cumulative transforms
         self.cumulative_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
         
+        # Additional normalization before cumulative attention
+        self.pre_cumulative_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        
         # Per-tooth transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
@@ -68,8 +71,8 @@ class PerToothTransformerDecoder(nn.Module):
             nn.Linear(64, 6), nn.Sigmoid()
         )
         self.out_layer = nn.Linear(50, 6)
-        self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-3)  # Increased eps for stability
-        self.final_norm = nn.LayerNorm(embed_dim, eps=1e-3)  # Increased eps for stability
+        self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.final_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         
         # Learned stage weights for residual distribution
         self.stage_weights = nn.Parameter(torch.ones(1, max_stages, 1, 1))
@@ -79,26 +82,33 @@ class PerToothTransformerDecoder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)  # Reduced gain for stability
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
-                nn.init.trunc_normal_(m, std=0.01)
+                nn.init.trunc_normal_(m, std=0.02)
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+        # Specific initialization for param_activity_target_embed
+        nn.init.xavier_uniform_(self.param_activity_target_embed.weight, gain=0.1)
+        if self.param_activity_target_embed.bias is not None:
+            nn.init.zeros_(self.param_activity_target_embed.bias)
+        # Specific initialization for cumulative_attention output projection
+        nn.init.xavier_uniform_(self.cumulative_attention.out_proj.weight, gain=0.1)
+        if self.cumulative_attention.out_proj.bias is not None:
+            nn.init.zeros_(self.cumulative_attention.out_proj.bias)
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
         """Compute teacher forcing probability and number of previous stages."""
         if val_loss is not None:
-            normalized_loss = min(val_loss / 0.1, 1.0)  # Assume 0.1 is a reasonable loss threshold
+            normalized_loss = min(val_loss / 0.1, 1.0)
             tf_prob = base_tf_prob * (1 - normalized_loss)
             tf_prob = max(0.3, tf_prob)
         else:
             progress = epoch / total_epochs
             tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
         
-        # Sample-specific stage curriculum
         num_stages_to_use = min(stage_idx, num_stages.max().item() if num_stages is not None else stage_idx)
         progress = epoch / total_epochs
         if progress < 0.3:
@@ -232,33 +242,72 @@ class PerToothTransformerDecoder(nn.Module):
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
                     embedded_param_activity = embedded_param_activity.squeeze(1)
+                    # Log output for debugging
+                    if torch.isnan(embedded_param_activity).any() or torch.isinf(embedded_param_activity).any():
+                        logger.error(f"NaN/Inf in prev_targets_attention output at tooth {tooth_idx}, stage {stage_idx}")
+                        raise RuntimeError("NaN/Inf detected in prev_targets_attention")
+                    logger.debug(f"prev_targets_attention output: min={embedded_param_activity.min().item():.4f}, max={embedded_param_activity.max().item():.4f}")
                 else:
                     param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
                     if param_activity_prev.shape[1] == 0:
-                        embedded_param_activity = self.param_activity_target_embed(torch.zeros(B, 6, device=device))
+                        zero_input = torch.zeros(B, 6, device=device)
+                        embedded_param_activity = self.param_activity_target_embed(zero_input)
                         # Log output for debugging
                         if torch.isnan(embedded_param_activity).any() or torch.isinf(embedded_param_activity).any():
                             logger.error(f"NaN/Inf in param_activity_target_embed output at tooth {tooth_idx}, stage {stage_idx}")
+                            raise RuntimeError("NaN/Inf detected in param_activity_target_embed")
+                        logger.debug(f"param_activity_target_embed output: min={embedded_param_activity.min().item():.4f}, max={embedded_param_activity.max().item():.4f}")
                     else:
                         embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
                         embedded_param_activity = embedded_param_activity.squeeze(1)
+                        # Log output for debugging
+                        if torch.isnan(embedded_param_activity).any() or torch.isinf(embedded_param_activity).any():
+                            logger.error(f"NaN/Inf in prev_targets_attention output at tooth {tooth_idx}, stage {stage_idx}")
+                            raise RuntimeError("NaN/Inf detected in prev_targets_attention")
+                        logger.debug(f"prev_targets_attention output: min={embedded_param_activity.min().item():.4f}, max={embedded_param_activity.max().item():.4f}")
 
                 # Combine embeddings
                 pos_embed = self.pos_embed[:, stage_idx, :]
                 cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]
                 tgt = embedded_target + embedded_activity + embedded_param_activity + pos_embed + cum_embed
+                # Log combined embeddings
+                if torch.isnan(tgt).any() or torch.isinf(tgt).any():
+                    logger.error(f"NaN/Inf in combined embeddings at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in combined embeddings")
+                logger.debug(f"Combined embeddings: min={tgt.min().item():.4f}, max={tgt.max().item():.4f}")
                 tgt = self.pre_norm(tgt.unsqueeze(1))
 
-                # Cumulative attention
-                cum_attn, _ = self.cumulative_attention(tgt, cumulative_embed[:, stage_idx], cumulative_embed[:, stage_idx])
+                # Normalize inputs to cumulative attention
+                tgt = self.pre_cumulative_norm(tgt)
+                cumulative_embed_stage = self.pre_cumulative_norm(cumulative_embed[:, stage_idx])
+
+                # Cumulative attention with scaling
+                cum_attn, attn_weights = self.cumulative_attention(tgt, cumulative_embed_stage, cumulative_embed_stage)
+                # Log attention weights
+                if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+                    logger.error(f"NaN/Inf in cumulative_attention weights at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in cumulative_attention weights")
+                logger.debug(f"Cumulative attention weights: min={attn_weights.min().item():.4f}, max={attn_weights.max().item():.4f}")
+                # Scale attention output
+                cum_attn = cum_attn * 0.1  # Additional scaling to prevent explosion
                 tgt = tgt + cum_attn
+                # Log after cumulative attention
+                if torch.isnan(tgt).any() or torch.isinf(tgt).any():
+                    logger.error(f"NaN/Inf after cumulative attention at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected after cumulative attention")
+                logger.debug(f"Post-cumulative attention: min={tgt.min().item():.4f}, max={tgt.max().item():.4f}")
 
                 # Decode
                 output = self.tooth_decoders[tooth_idx](tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
                 output = self.final_norm(output.squeeze(1))
                 output_all[:, stage_idx, tooth_idx, :] = output
+                # Log decoder output
+                if torch.isnan(output).any() or torch.isinf(output).any():
+                    logger.error(f"NaN/Inf in decoder output at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in decoder output")
+                logger.debug(f"Decoder output: min={output.min().item():.4f}, max={output.max().item():.4f}")
 
                 # Stage activity prediction (using output from first tooth for simplicity)
                 if tooth_idx == 0:
@@ -268,10 +317,30 @@ class PerToothTransformerDecoder(nn.Module):
                 activity_mlp_out = self.activity_mlp(output)
                 param_activity_mlp_out = self.param_activity_mlp(output)
                 transform_mlp_out = self.transform_mlp(output)
+                # Log MLP outputs
+                if torch.isnan(activity_mlp_out).any() or torch.isinf(activity_mlp_out).any():
+                    logger.error(f"NaN/Inf in activity_mlp output at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in activity_mlp")
+                if torch.isnan(param_activity_mlp_out).any() or torch.isinf(param_activity_mlp_out).any():
+                    logger.error(f"NaN/Inf in param_activity_mlp output at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in param_activity_mlp")
+                if torch.isnan(transform_mlp_out).any() or torch.isinf(transform_mlp_out).any():
+                    logger.error(f"NaN/Inf in transform_mlp output at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in transform_mlp")
 
                 activity_logit = self.activity_head(activity_mlp_out).squeeze(-1)
                 param_activity_logit = self.param_activity_head(param_activity_mlp_out)
                 transforms = self.out_layer(transform_mlp_out)
+                # Log final outputs
+                if torch.isnan(activity_logit).any() or torch.isinf(activity_logit).any():
+                    logger.error(f"NaN/Inf in activity_logit at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in activity_logit")
+                if torch.isnan(param_activity_logit).any() or torch.isinf(param_activity_logit).any():
+                    logger.error(f"NaN/Inf in param_activity_logit at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in param_activity_logit")
+                if torch.isnan(transforms).any() or torch.isinf(transforms).any():
+                    logger.error(f"NaN/Inf in transforms at tooth {tooth_idx}, stage {stage_idx}")
+                    raise RuntimeError("NaN/Inf detected in transforms")
 
                 activity_mask = (activity_logit > 0.5).float()
                 activity_logits[:, stage_idx, tooth_idx] = activity_logit
@@ -294,14 +363,22 @@ class PerToothTransformerDecoder(nn.Module):
                         prev_param_activity_seq[:, stage_idx, :] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
 
         # Apply stage activity mask
-        stage_activity_mask = (stage_activity_logits > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # [B, max_stages, 1, 1]
+        stage_activity_mask = (stage_activity_logits > 0.5).float().unsqueeze(-1).unsqueeze(-1)
         transforms_sequence = transforms_sequence * stage_activity_mask
         activity_logits = activity_logits * stage_activity_mask.squeeze(-1)
         param_activity_logits = param_activity_logits * stage_activity_mask
+        # Log after masking
+        if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
+            logger.error(f"NaN/Inf in transforms_sequence after masking")
+            raise RuntimeError("NaN/Inf detected in transforms_sequence")
 
         # Enforce zero transforms for zero cumulative transforms
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
+        # Log after zero transform enforcement
+        if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
+            logger.error(f"NaN/Inf in transforms_sequence after zero transform enforcement")
+            raise RuntimeError("NaN/Inf detected in transforms_sequence")
 
         # Non-uniform residual distribution
         stage_weights = torch.softmax(self.stage_weights, dim=1)
@@ -310,21 +387,28 @@ class PerToothTransformerDecoder(nn.Module):
             for i in range(B):
                 stage_mask[i, num_stages[i]:] = 0.0
         else:
-            # During inference, use stage_activity_mask to determine active stages
             stage_mask = stage_activity_mask
 
         pred_sum = (transforms_sequence * stage_mask).sum(dim=1)
         residual = cumulative_transforms - pred_sum
         residual_expanded = residual.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
-        adjustment = residual_expanded * stage_weights * stage_mask * param_activity_masks * 0.5  # Soft constraint
+        adjustment = residual_expanded * stage_weights * stage_mask * param_activity_masks * 0.5
+        # Log residual adjustment
+        if torch.isnan(adjustment).any() or torch.isinf(adjustment).any():
+            logger.error(f"NaN/Inf in residual adjustment")
+            raise RuntimeError("NaN/Inf detected in residual adjustment")
 
         transforms_sequence = transforms_sequence + adjustment
+        # Log final transforms_sequence
+        if torch.isnan(transforms_sequence).any() or torch.isinf(transforms_sequence).any():
+            logger.error(f"NaN/Inf in final transforms_sequence")
+            raise RuntimeError("NaN/Inf detected in final transforms_sequence")
 
         # Clip gradients for stability
         for p in self.parameters():
             if p.grad is not None:
                 p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
-                p.grad.clamp_(-1.0, 1.0)
+                p.grad.clamp_(-0.3, 0.3)  # Even tighter clipping
 
         logger.debug(f"Stage activity mask mean: {stage_activity_mask.mean().item():.4f}")
         logger.debug(f"Activity mask mean: {activity_mask.mean().item():.4f}")
