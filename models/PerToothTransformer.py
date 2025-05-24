@@ -17,6 +17,11 @@ class PerToothTransformerDecoder(nn.Module):
         self.activity_target_embed = nn.Linear(1, embed_dim)
         self.param_activity_target_embed = nn.Linear(6, embed_dim)
         
+        # Normalization layers for attention inputs
+        self.target_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.param_activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        
         # Cross-tooth attention
         self.cross_tooth_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.2, batch_first=True)
         
@@ -75,7 +80,7 @@ class PerToothTransformerDecoder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Smaller gain for stability
+                nn.init.xavier_uniform_(m.weight, gain=0.05)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
@@ -83,9 +88,8 @@ class PerToothTransformerDecoder(nn.Module):
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        # Specific initialization for attention output projections
         for attn in [self.cross_tooth_attention, self.prev_targets_attention, self.cumulative_attention]:
-            nn.init.xavier_uniform_(attn.out_proj.weight, gain=0.1)
+            nn.init.xavier_uniform_(attn.out_proj.weight, gain=0.05)
             if attn.out_proj.bias is not None:
                 nn.init.zeros_(attn.out_proj.bias)
 
@@ -112,7 +116,6 @@ class PerToothTransformerDecoder(nn.Module):
         B = memory.size(0)
         device = memory.device
 
-        # Input validation
         expected_shapes = {
             'memory': (B, self.num_teeth, self.embed_dim),
             'cumulative_transforms': (B, self.num_teeth, 6),
@@ -128,43 +131,53 @@ class PerToothTransformerDecoder(nn.Module):
                 logger.error(f"Invalid {name} shape: got {tensor.shape}, expected {expected}")
                 raise RuntimeError(f"{name} shape mismatch")
 
-        # Handle NaNs
+        # Pad param_activity_targets to max_stages if necessary
+        if param_activity_targets is not None and param_activity_targets.shape[1] != self.max_stages:
+            logger.warning(f"param_activity_targets has {param_activity_targets.shape[1]} stages, padding to {self.max_stages}")
+            padding = torch.zeros(B, self.max_stages - param_activity_targets.shape[1], self.num_teeth, 6, device=device)
+            param_activity_targets = torch.cat([param_activity_targets, padding], dim=1)
+
+        # Validate cumulative_transforms and transforms_sequence shapes
+        if cumulative_transforms.shape != (B, self.num_teeth, 6):
+            logger.error(f"Invalid cumulative_transforms shape: got {cumulative_transforms.shape}, expected {(B, self.num_teeth, 6)}")
+            raise RuntimeError("cumulative_transforms shape mismatch")
+
+        # Log input shapes for debugging
+        logger.debug(f"Input shapes: memory={memory.shape}, cumulative_transforms={cumulative_transforms.shape}, "
+                     f"num_stages={num_stages.tolist() if num_stages is not None else None}, "
+                     f"targets={targets.shape if targets is not None else None}, "
+                     f"activity_targets={activity_targets.shape if activity_targets is not None else None}, "
+                     f"param_activity_targets={param_activity_targets.shape if param_activity_targets is not None else None}")
+
         tensors = [memory, cumulative_transforms, targets, activity_targets, param_activity_targets]
         for tensor in tensors:
             if tensor is not None:
                 tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Cross-tooth attention
         memory_key_padding_mask = torch.zeros(B, self.num_teeth, dtype=torch.bool, device=device)
         memory_attn, _ = self.cross_tooth_attention(memory, memory, memory, key_padding_mask=memory_key_padding_mask)
-        memory = memory + memory_attn.clamp(-10, 10)
+        memory = memory + memory_attn.clamp(-20, 20)
 
-        # Cumulative embedding
-        with torch.amp.autocast(device_type='cuda', enabled=False):
-            cumulative_embed = self.cumulative_embed(cumulative_transforms.float())
+        cumulative_embed = self.cumulative_embed(cumulative_transforms.float())
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
         cumulative_embed = cumulative_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
 
-        # Initialize outputs
         transforms_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, device=device)
         param_activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         param_activity_masks = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         stage_activity_logits = torch.zeros(B, self.max_stages, device=device)
 
-        # Initialize sequences
         prev_transform_seq = torch.zeros(B, self.max_stages, 6, device=device)
         prev_activity_seq = torch.zeros(B, self.max_stages, 1, device=device)
         prev_param_activity_seq = torch.zeros(B, self.max_stages, 6, device=device)
 
-        # Process each tooth and stage
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
                 tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
                 effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
                 use_tf = training and stage_idx > 0 and (torch.rand(B, device=device) < effective_tf_prob).any()
 
-                # Prepare target embeddings
                 start_idx = max(0, stage_idx - num_stages_to_use)
                 if use_tf and targets is not None:
                     targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]
@@ -173,71 +186,86 @@ class PerToothTransformerDecoder(nn.Module):
                     targets_prev = mix_ratio * targets_prev + (1 - mix_ratio) * predicted_prev
                     embedded_target = self.target_embed(targets_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_target = self.target_norm(embedded_target)
+                    if embedded_target.isnan().any():
+                        logger.warning("NaN detected in embedded_target, replacing with zeros")
+                        embedded_target = torch.zeros_like(embedded_target)
                     embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
-                    embedded_target = embedded_target.squeeze(1).clamp(-10, 10)
+                    embedded_target = embedded_target.squeeze(1).clamp(-20, 20)
                 else:
                     targets_prev = prev_transform_seq[:, start_idx:stage_idx, :]
-                    with torch.amp.autocast(device_type = 'cuda', enabled=False):
-                        embedded_target = self.target_embed(targets_prev.float() if targets_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    embedded_target = self.target_embed(targets_prev.float() if targets_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
                     if targets_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_target = self.target_norm(embedded_target)
+                        if embedded_target.isnan().any():
+                            logger.warning("NaN detected in embedded_target, replacing with zeros")
+                            embedded_target = torch.zeros_like(embedded_target)
                         embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
-                        embedded_target = embedded_target.squeeze(1).clamp(-10, 10)
+                        embedded_target = embedded_target.squeeze(1).clamp(-20, 20)
 
-                # Activity target embeddings
                 if use_tf and activity_targets is not None:
                     activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)
                     predicted_activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
                     activity_prev = mix_ratio * activity_prev + (1 - mix_ratio) * predicted_activity_prev
                     embedded_activity = self.activity_target_embed(activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_activity = self.activity_norm(embedded_activity)
+                    if embedded_activity.isnan().any():
+                        logger.warning("NaN detected in embedded_activity, replacing with zeros")
+                        embedded_activity = torch.zeros_like(embedded_activity)
                     embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
-                    embedded_activity = embedded_activity.squeeze(1).clamp(-10, 10)
+                    embedded_activity = embedded_activity.squeeze(1).clamp(-20, 20)
                 else:
                     activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
-                    with torch.amp.autocast(device_type='cuda',enabled=False):
-                        embedded_activity = self.activity_target_embed(activity_prev.float() if activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
+                    embedded_activity = self.activity_target_embed(activity_prev.float() if activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
                     if activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_activity = self.activity_norm(embedded_activity)
+                        if embedded_activity.isnan().any():
+                            logger.warning("NaN detected in embedded_activity, replacing with zeros")
+                            embedded_activity = torch.zeros_like(embedded_activity)
                         embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
-                        embedded_activity = embedded_activity.squeeze(1).clamp(-10, 10)
+                        embedded_activity = embedded_activity.squeeze(1).clamp(-20, 20)
 
-                # Param activity target embeddings
                 if use_tf and param_activity_targets is not None:
                     param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]
                     predicted_param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
                     param_activity_prev = mix_ratio * param_activity_prev + (1 - mix_ratio) * predicted_param_activity_prev
                     embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                    embedded_param_activity = self.param_activity_norm(embedded_param_activity)
+                    if embedded_param_activity.isnan().any():
+                        logger.warning("NaN detected in embedded_param_activity, replacing with zeros")
+                        embedded_param_activity = torch.zeros_like(embedded_param_activity)
                     embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
-                    embedded_param_activity = embedded_param_activity.squeeze(1).clamp(-10, 10)
+                    embedded_param_activity = embedded_param_activity.squeeze(1).clamp(-20, 20)
                 else:
                     param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
-                    with torch.amp.autocast(device_type='cuda', enabled=False):
-                        embedded_param_activity = self.param_activity_target_embed(param_activity_prev.float() if param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev.float() if param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
                     if param_activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
+                        embedded_param_activity = self.param_activity_norm(embedded_param_activity)
+                        if embedded_param_activity.isnan().any():
+                            logger.warning("NaN detected in embedded_param_activity, replacing with zeros")
+                            embedded_param_activity = torch.zeros_like(embedded_param_activity)
                         embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
-                        embedded_param_activity = embedded_param_activity.squeeze(1).clamp(-10, 10)
+                        embedded_param_activity = embedded_param_activity.squeeze(1).clamp(-20, 20)
 
-                # Combine embeddings with residual connection
                 pos_embed = self.pos_embed[:, stage_idx, :]
                 cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]
                 tgt = embedded_target + 0.1 * embedded_activity + 0.1 * embedded_param_activity + pos_embed + cum_embed
                 tgt = self.pre_norm(tgt.unsqueeze(1))
 
-                # Cumulative attention
                 tgt = self.pre_cumulative_norm(tgt)
                 cumulative_embed_stage = self.pre_cumulative_norm(cumulative_embed[:, stage_idx])
                 cum_attn, _ = self.cumulative_attention(tgt, cumulative_embed_stage, cumulative_embed_stage)
-                cum_attn = cum_attn.clamp(-10, 10) * 0.1
+                cum_attn = cum_attn.clamp(-20, 20) * 0.1
                 tgt = tgt + cum_attn
 
-                # Decode
                 output = self.tooth_decoders[tooth_idx](tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
                 output = self.final_norm(output.squeeze(1))
 
-                # Predictions
                 if tooth_idx == 0:
                     stage_activity_logit = self.stage_activity_mlp(output).squeeze(-1)
                     stage_activity_logits[:, stage_idx] = stage_activity_logit
@@ -270,42 +298,116 @@ class PerToothTransformerDecoder(nn.Module):
                     if param_activity_targets is not None:
                         prev_param_activity_seq[:, stage_idx, :] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
 
-        # Apply stage activity mask
+        # Validate transforms_sequence shape
+        if transforms_sequence.shape != (B, self.max_stages, self.num_teeth, 6):
+            logger.error(f"Invalid transforms_sequence shape: got {transforms_sequence.shape}, expected {(B, self.max_stages, self.num_teeth, 6)}")
+            raise RuntimeError("transforms_sequence shape mismatch")
+
         stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)
         transforms_sequence = transforms_sequence * stage_activity_mask
         activity_logits = activity_logits * stage_activity_mask.squeeze(-1)
         param_activity_logits = param_activity_logits * stage_activity_mask
 
-        # Enforce zero transforms for zero cumulative transforms
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
 
-        # Residual adjustment
-        stage_weights = torch.softmax(self.stage_weights, dim=1)
-        stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)
-        if num_stages is not None and training:
+        # Residual adjustment per tooth and parameter
+        stage_weights = torch.softmax(self.stage_weights, dim=1)  # Shape: (1, 25, 1, 1)
+        # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
+        stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)  # Shape: (B, 25, 1, 1)
+        if training and num_stages is not None:
             for i in range(B):
                 stage_mask[i, num_stages[i]:] = 0.0
         else:
-            stage_mask = stage_activity_mask
+            stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # (B, 25, 1, 1)
+            stage_mask = stage_mask * stage_activity_mask  # Shape: (B, 25, 1, 1)
 
-        pred_sum = (transforms_sequence * stage_mask).sum(dim=1)
-        residual = cumulative_transforms - pred_sum
-        residual_expanded = residual.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
-        adjustment = residual_expanded * stage_weights * stage_mask * param_activity_masks * 0.5
+        # Validate stage_mask shape
+        if stage_mask.shape != (B, self.max_stages, 1, 1):
+            logger.error(f"Invalid stage_mask shape: got {stage_mask.shape}, expected {(B, self.max_stages, 1, 1)}")
+            raise RuntimeError("stage_mask shape mismatch")
+
+        # Log shapes for debugging
+        logger.debug(f"Residual adjustment shapes: stage_weights={stage_weights.shape}, stage_mask={stage_mask.shape}, "
+                     f"param_activity_masks={param_activity_masks.shape}")
+
+        # Initialize adjustment tensor
+        adjustment = torch.zeros_like(transforms_sequence)
+        # Parameter-specific clamping: translations (mm), rotations (radians)
+        clamp_ranges_residual = torch.tensor([5.0, 5.0, 5.0, 0.5, 0.5, 0.5], device=device)  # Translations, rotations
+        clamp_ranges_adjustment = torch.tensor([1.0, 1.0, 1.0, 0.1, 0.1, 0.1], device=device)
+        for tooth_idx in range(self.num_teeth):
+            for param_idx in range(6):
+                masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
+                # Validate masked_preds shape
+                if masked_preds.shape != (B, self.max_stages):
+                    logger.error(f"masked_preds shape {masked_preds.shape} does not match expected {(B, self.max_stages)}")
+                    raise RuntimeError("masked_preds shape mismatch")
+                
+                pred_sum = masked_preds.sum(dim=1)  # Shape: (B,)
+                residual = cumulative_transforms[:, tooth_idx, param_idx] - pred_sum  # Shape: (B,)
+                
+                # Ensure residual is (B,)
+                residual = residual.view(B)  # Explicitly reshape to (B,)
+                if residual.shape != (B,):
+                    logger.error(f"Residual shape {residual.shape} does not match expected (B,)=({B},)")
+                    raise RuntimeError(f"Residual shape mismatch")
+
+                # Log shapes for debugging
+                logger.debug(f"Shapes for tooth {tooth_idx} param {param_idx}: "
+                             f"masked_preds={masked_preds.shape}, "
+                             f"cumulative_transforms[:, {tooth_idx}, {param_idx}]={cumulative_transforms[:, tooth_idx, param_idx].shape}, "
+                             f"pred_sum={pred_sum.shape}, residual={residual.shape}")
+
+                residual = torch.clamp(residual, -clamp_ranges_residual[param_idx], clamp_ranges_residual[param_idx])
+                residual_expanded = residual.unsqueeze(1).unsqueeze(-1).expand(B, self.max_stages, 1)  # Shape: (B, 25, 1)
+                
+                # Log residual_expanded shape
+                logger.debug(f"residual_expanded shape for tooth {tooth_idx} param {param_idx}: {residual_expanded.shape}")
+                
+                param_mask = param_activity_masks[:, :, tooth_idx, param_idx].unsqueeze(-1)  # Shape: (B, 25, 1)
+                logger.debug(f"param_mask shape for tooth {tooth_idx} param {param_idx}: {param_mask.shape}")
+                if param_mask.sum(dim=1).eq(0).any():
+                    logger.debug(f"No active stages for tooth {tooth_idx} param {param_idx}, skipping adjustment")
+                    continue
+                residual_expanded_4d = residual_expanded.unsqueeze(-1)  # (B, 25, 1, 1)
+                param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
+                stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d
+
+                #stage_adjustment = residual_expanded * stage_weights * stage_mask * param_mask  # Shape: (B, 25, 1)
+                logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
+                stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
+                
+                adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1).squeeze(-1)  # (B, 25)
+                # adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1)
+                
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Residual tooth {tooth_idx} param {param_idx}: "
+                                 f"residual_mean={residual.mean().item():.4f}, "
+                                 f"adjustment_mean={stage_adjustment.mean().item():.4f}, "
+                                 f"pred_sum_mean={pred_sum.mean().item():.4f}")
+
+        # Apply adjustment to transforms_sequence
         transforms_sequence = transforms_sequence + adjustment
 
-        # Gradient clipping and scaling
+        # Log overall adjustment statistics
+        logger.debug(f"Residual adjustment: mean={adjustment.mean().item():.4f}, max={adjustment.max().item():.4f}, "
+                     f"min={adjustment.min().item():.4f}")
+
+        # Post-adjustment validation check
+        if training:
+            for tooth_idx in range(self.num_teeth):
+                for param_idx in range(6):
+                    final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
+                    error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
+                    if error > 0.1:
+                        logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, "
+                                       f"clamping may be too restrictive")
+
+        # Gradient clipping
         for p in self.parameters():
             if p.grad is not None:
                 p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
                 p.grad.clamp_(-0.3, 0.3)
-
-        # # Debug logging
-        # logger.debug(f"Stage activity mask mean: {stage_activity_mask.mean().item():.4f}")
-        # logger.debug(f"Activity mask mean: {activity_mask.mean().item():.4f}")
-        # logger.debug(f"Param activity mask mean: {param_activity_masks.mean().item():.4f}")
-        # logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}")
-        # logger.debug(f"Consistency error: {((transforms_sequence * stage_mask).sum(dim=1) - cumulative_transforms).abs().mean().item():.4f}")
 
         return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits]
