@@ -18,10 +18,10 @@ torch.backends.cudnn.benchmark = True
 
 def setup_logging(log_file):
     logger = logging.getLogger('TrainLogger')
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(log_file)
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(log_format)
     console_handler.setFormatter(log_format)
@@ -43,9 +43,14 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     if stage_weights is not None:
         logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
     
-    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1), stage_weights=stage_weights)
+    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1))
     loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
     loss_param_activity, f1_param_activity = param_activity_loss_fn(param_activity_logits, param_activity_labels, activity_labels, true_num_stages)
+    
+    # Normalize param_activity_loss gradients
+    if loss_param_activity.requires_grad:
+        loss_param_activity = loss_param_activity / (loss_param_activity.abs().mean() + 1e-8)
+    
     padded_loss = padded_loss_fn(transforms_sequence, true_num_stages, max_stages)
     consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device)
     
@@ -78,7 +83,7 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     
     if torch.isnan(total_loss) or torch.isinf(total_loss):
         logger.error(f"Total loss is NaN or Inf: {total_loss.item()}")
-    
+    print(total_loss)
     return total_loss, losses, f1_activity, f1_param_activity
 
 def train(args):
@@ -163,6 +168,9 @@ def train(args):
                 except Exception as e:
                     logger.warning(f"Failed to load optimizer_decoder state: {e}. Resetting optimizer state.")
                     optimizer_decoder.state = {}
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                logger.info("Loaded scaler state from checkpoint")
         except Exception as e:
             logger.error(f"Failed to load model weights from {args.checkpoint_path}: {e}")
             raise
@@ -406,6 +414,7 @@ def train(args):
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
                 'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
                 'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
+                'scaler_state_dict': scaler.state_dict(),
                 'val_loss': val_losses['total']
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
@@ -437,6 +446,7 @@ def train(args):
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
                 'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
                 'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
+                'scaler_state_dict': scaler.state_dict(),
                 'val_loss': best_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
@@ -455,6 +465,7 @@ def train(args):
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
                 'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
                 'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
+                'scaler_state_dict': scaler.state_dict(),
                 'val_loss': last_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
