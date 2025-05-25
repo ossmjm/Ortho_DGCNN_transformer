@@ -173,11 +173,18 @@ class PerToothTransformerDecoder(nn.Module):
         prev_activity_seq = [torch.zeros(B, 1, device=device) for _ in range(self.max_stages)]
         prev_param_activity_seq = [torch.zeros(B, 6, device=device) for _ in range(self.max_stages)]
 
+        # Initialize teacher forcing counter
+        tf_count = 0
+
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
                 tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
                 effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
                 use_tf = training and stage_idx > 0 and (torch.rand(B, device=device) < effective_tf_prob).any()
+
+                # Increment teacher forcing counter
+                if use_tf:
+                    tf_count += 1
 
                 start_idx = max(0, stage_idx - num_stages_to_use)
                 if use_tf and targets is not None:
@@ -411,4 +418,4 @@ class PerToothTransformerDecoder(nn.Module):
                 p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
                 p.grad.clamp_(-0.3, 0.3)
 
-        return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits]
+        return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count]

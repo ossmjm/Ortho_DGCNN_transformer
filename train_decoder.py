@@ -249,6 +249,7 @@ def train(args):
         train_f1_activity = []
         train_f1_param_activity = []
         train_f1_stage_activity = []
+        total_tf_count = 0.0
 
         for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, _, _, _, num_stages) in enumerate(train_loader):
             feats, transforms, cumulative_transforms, activity, param_activity, num_stages = [
@@ -270,7 +271,9 @@ def train(args):
                 val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                 training=True
             )
-            pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights = outputs
+            pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, tf_count, stage_weights = outputs
+
+            total_tf_count += tf_count
 
             total_loss, losses, f1_activity, f1_param_activity, f1_stage_activity = compute_loss(
                 pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,
@@ -304,7 +307,10 @@ def train(args):
                             f"Consistency: {losses['consistency_loss'].item():.4f}, "
                             f"Stage Activity: {losses['loss_stage_activity'].item():.4f}, "
                             f"F1 Activity: {f1_activity.item():.4f}, F1 Param Activity: {f1_param_activity.item():.4f}, "
-                            f"F1 Stage Activity: {f1_stage_activity.item():.4f}")
+                            f"F1 Stage Activity: {f1_stage_activity.item():.4f}, TF Count: {tf_count}")
+
+        avg_tf_count = total_tf_count / len(train_loader)
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Average Teacher Forcing Count: {avg_tf_count:.4f}")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn is not None:

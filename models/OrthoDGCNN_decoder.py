@@ -130,7 +130,7 @@ class OrthoDGCNNModel(nn.Module):
             val_loss=val_loss
         )
         
-        transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits = outputs
+        transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count = outputs
         
         # Extract stage_weights from decoder if it's PerToothTransformerDecoder
         stage_weights = None
@@ -144,11 +144,13 @@ class OrthoDGCNNModel(nn.Module):
         logger.debug(f"OrthoDGCNN output shape: transforms_sequence={transforms_sequence.shape}, "
                     f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
                     f"stage_activity_logits={stage_activity_logits.shape}, "
-                    f"stage_weights_shape={stage_weights.shape if stage_weights is not None else 'None'}")
+                    f"stage_weights_shape={stage_weights.shape if stage_weights is not None else 'None'}, "
+                    f"teacher_forcing_count={tf_count}")
                      
-        for i, output in enumerate(outputs):
+        for i, output in enumerate([transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits]):
             if torch.isnan(output).any():
                 logger.error(f"NaN values detected in output {i}")
-                outputs[i] = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+                output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+                outputs[i] = output
                 
         return outputs + [stage_weights]
