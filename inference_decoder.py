@@ -53,16 +53,12 @@ def transform_cumulative_transformations(transformations, scalers, logger):
         logger.error(f"Failed to transform cumulative transformations: {e}")
         return transformations
 
-def filter_transformations(transformations, stage_activity_probs, threshold=1e-4, inactive_proportion=0.9, logger=None):
-    """Filter out entire stages based on stage activity probabilities and near-zero transformations."""
-    abs_transforms = np.abs(transformations)
-    near_zero = abs_transforms <= threshold
-    num_values_per_stage = near_zero.shape[1] * near_zero.shape[2]
-    proportion_near_zero = np.sum(near_zero, axis=(1, 2)) / num_values_per_stage
-    active_stages = (proportion_near_zero < inactive_proportion) & (stage_activity_probs > 0.5)
+def filter_transformations(transformations, stage_activity_probs, logger=None):
+    """Filter out stages based on stage activity probabilities."""
+    active_stages = stage_activity_probs > 0.5
     if not np.any(active_stages):
         if logger:
-            logger.warning("All stages have mostly near-zero transformations or low activity probability")
+            logger.warning("All stages have low activity probability")
         return transformations, np.array([])
     filtered_transforms = transformations[active_stages]
     active_stage_indices = np.where(active_stages)[0]
@@ -179,13 +175,12 @@ def inference(args):
     }
 
     with torch.no_grad():
-        for jaw_id, feats, cumulative_transforms, num_stages in data_loader:
+        for jaw_id, feats, cumulative_transforms, _ in data_loader:
             jaw_id = jaw_id[0]
             feats = feats.to(device)
             cumulative_transforms = transform_cumulative_transformations(
                 cumulative_transforms.cpu().numpy(), cumulative_scalers, logger
             ).to(device)
-            num_stages = torch.tensor([args.max_stages], device=device)
 
             try:
                 pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
@@ -194,7 +189,7 @@ def inference(args):
                     cumulative_targets=cumulative_transforms,
                     activity_targets=None,
                     param_activity_targets=None,
-                    num_stages=num_stages,
+                    num_stages=None,
                     epoch=0,
                     total_epochs=1,
                     training=False
@@ -205,9 +200,9 @@ def inference(args):
                 continue
 
             activity_probs = torch.sigmoid(activity_logits)
-            activity_mask = (activity_probs > 0.7).float()
+            activity_mask = (activity_probs > 0.5).float()
             param_activity_probs = torch.sigmoid(param_activity_logits)
-            param_activity_mask = (param_activity_probs > 0.7).float() * activity_mask.unsqueeze(-1)
+            param_activity_mask = (param_activity_probs > 0.5).float() * activity_mask.unsqueeze(-1)
             stage_activity_probs = torch.sigmoid(stage_activity_logits).cpu().numpy()[0]
 
             masked_transforms_np = inverse_transform_transformations(
@@ -215,7 +210,7 @@ def inference(args):
             )
             masked_transforms_np = masked_transforms_np * param_activity_mask.cpu().numpy()
             filtered_transforms, active_stage_indices = filter_transformations(
-                masked_transforms_np[0], stage_activity_probs, threshold=1e-4, inactive_proportion=args.inactive_proportion, logger=logger
+                masked_transforms_np[0], stage_activity_probs, logger=logger
             )
             if len(active_stage_indices) == 0:
                 logger.warning(f"No active stages for Jaw_ID {jaw_id} after filtering")

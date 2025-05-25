@@ -334,8 +334,8 @@ class PerToothTransformerDecoder(nn.Module):
         # Initialize adjustment tensor
         adjustment = torch.zeros_like(transforms_sequence)
         # Parameter-specific clamping: translations (mm), rotations (radians)
-        clamp_ranges_residual = torch.tensor([5.0, 5.0, 5.0, 0.5, 0.5, 0.5], device=device)  # Translations, rotations
-        clamp_ranges_adjustment = torch.tensor([1.0, 1.0, 1.0, 0.1, 0.1, 0.1], device=device)
+        clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 5.0, 5.0, 5.0], device=device)  # Translations, rotations
+        clamp_ranges_adjustment = torch.tensor([0.3, 0.3, 0.3, 2.0, 2.0, 2.0], device=device)
         for tooth_idx in range(self.num_teeth):
             for param_idx in range(6):
                 masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)

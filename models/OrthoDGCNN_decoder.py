@@ -112,6 +112,10 @@ class OrthoDGCNNModel(nn.Module):
             
         features = self.feature_norm(features)
         
+        # In inference mode, set num_stages to None
+        if not training:
+            num_stages = None
+        
         outputs = self.decoder(
             memory=features,
             cumulative_transforms=cumulative_targets,
