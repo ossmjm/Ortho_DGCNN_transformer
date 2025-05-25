@@ -137,7 +137,7 @@ class PerToothTransformerDecoder(nn.Module):
             padding = torch.zeros(B, self.max_stages - param_activity_targets.shape[1], self.num_teeth, 6, device=device)
             param_activity_targets = torch.cat([param_activity_targets, padding], dim=1)
 
-        # Validate cumulative_transforms and transforms_sequence shapes
+        # Validate cumulative_transforms shape
         if cumulative_transforms.shape != (B, self.num_teeth, 6):
             logger.error(f"Invalid cumulative_transforms shape: got {cumulative_transforms.shape}, expected {(B, self.num_teeth, 6)}")
             raise RuntimeError("cumulative_transforms shape mismatch")
@@ -168,9 +168,10 @@ class PerToothTransformerDecoder(nn.Module):
         param_activity_masks = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         stage_activity_logits = torch.zeros(B, self.max_stages, device=device)
 
-        prev_transform_seq = torch.zeros(B, self.max_stages, 6, device=device)
-        prev_activity_seq = torch.zeros(B, self.max_stages, 1, device=device)
-        prev_param_activity_seq = torch.zeros(B, self.max_stages, 6, device=device)
+        # Initialize previous sequences as lists to avoid inplace modifications
+        prev_transform_seq = [torch.zeros(B, 6, device=device) for _ in range(self.max_stages)]
+        prev_activity_seq = [torch.zeros(B, 1, device=device) for _ in range(self.max_stages)]
+        prev_param_activity_seq = [torch.zeros(B, 6, device=device) for _ in range(self.max_stages)]
 
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
@@ -181,7 +182,7 @@ class PerToothTransformerDecoder(nn.Module):
                 start_idx = max(0, stage_idx - num_stages_to_use)
                 if use_tf and targets is not None:
                     targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]
-                    predicted_prev = prev_transform_seq[:, start_idx:stage_idx, :]
+                    predicted_prev = torch.stack(prev_transform_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
                     mix_ratio = effective_tf_prob
                     targets_prev = mix_ratio * targets_prev + (1 - mix_ratio) * predicted_prev
                     embedded_target = self.target_embed(targets_prev)
@@ -193,9 +194,9 @@ class PerToothTransformerDecoder(nn.Module):
                     embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
                     embedded_target = embedded_target.squeeze(1).clamp(-20, 20)
                 else:
-                    targets_prev = prev_transform_seq[:, start_idx:stage_idx, :]
-                    embedded_target = self.target_embed(targets_prev.float() if targets_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
-                    if targets_prev.shape[1] > 0:
+                    predicted_prev = torch.stack(prev_transform_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
+                    embedded_target = self.target_embed(predicted_prev.float() if predicted_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    if predicted_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_target = self.target_norm(embedded_target)
                         if embedded_target.isnan().any():
@@ -206,7 +207,7 @@ class PerToothTransformerDecoder(nn.Module):
 
                 if use_tf and activity_targets is not None:
                     activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)
-                    predicted_activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
+                    predicted_activity_prev = torch.stack(prev_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 1, device=device)
                     activity_prev = mix_ratio * activity_prev + (1 - mix_ratio) * predicted_activity_prev
                     embedded_activity = self.activity_target_embed(activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
@@ -217,9 +218,9 @@ class PerToothTransformerDecoder(nn.Module):
                     embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
                     embedded_activity = embedded_activity.squeeze(1).clamp(-20, 20)
                 else:
-                    activity_prev = prev_activity_seq[:, start_idx:stage_idx, :]
-                    embedded_activity = self.activity_target_embed(activity_prev.float() if activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
-                    if activity_prev.shape[1] > 0:
+                    predicted_activity_prev = torch.stack(prev_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 1, device=device)
+                    embedded_activity = self.activity_target_embed(predicted_activity_prev.float() if predicted_activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
+                    if predicted_activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_activity = self.activity_norm(embedded_activity)
                         if embedded_activity.isnan().any():
@@ -230,7 +231,7 @@ class PerToothTransformerDecoder(nn.Module):
 
                 if use_tf and param_activity_targets is not None:
                     param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]
-                    predicted_param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
+                    predicted_param_activity_prev = torch.stack(prev_param_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
                     param_activity_prev = mix_ratio * param_activity_prev + (1 - mix_ratio) * predicted_param_activity_prev
                     embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
@@ -241,9 +242,9 @@ class PerToothTransformerDecoder(nn.Module):
                     embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
                     embedded_param_activity = embedded_param_activity.squeeze(1).clamp(-20, 20)
                 else:
-                    param_activity_prev = prev_param_activity_seq[:, start_idx:stage_idx, :]
-                    embedded_param_activity = self.param_activity_target_embed(param_activity_prev.float() if param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
-                    if param_activity_prev.shape[1] > 0:
+                    predicted_param_activity_prev = torch.stack(prev_param_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
+                    embedded_param_activity = self.param_activity_target_embed(predicted_param_activity_prev.float() if predicted_param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    if predicted_param_activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_param_activity = self.param_activity_norm(embedded_param_activity)
                         if embedded_param_activity.isnan().any():
@@ -287,16 +288,18 @@ class PerToothTransformerDecoder(nn.Module):
 
                 transforms_sequence[:, stage_idx, tooth_idx, :] = transforms
 
-                prev_transform_seq[:, stage_idx, :] = transforms.detach()
-                prev_activity_seq[:, stage_idx, :] = activity_logit.detach().unsqueeze(-1)
-                prev_param_activity_seq[:, stage_idx, :] = param_activity_logit.detach()
+                # Update previous sequences without inplace operations
+                prev_transform_seq[stage_idx] = transforms.detach()
+                prev_activity_seq[stage_idx] = activity_logit.detach().unsqueeze(-1)
+                prev_param_activity_seq[stage_idx] = param_activity_logit.detach()
+
                 if use_tf and stage_idx < self.max_stages - 1:
                     if targets is not None:
-                        prev_transform_seq[:, stage_idx, :] = mix_ratio * targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * transforms.detach()
+                        prev_transform_seq[stage_idx] = mix_ratio * targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * transforms.detach()
                     if activity_targets is not None:
-                        prev_activity_seq[:, stage_idx, :] = mix_ratio * activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1) + (1 - mix_ratio) * activity_logit.detach().unsqueeze(-1)
+                        prev_activity_seq[stage_idx] = mix_ratio * activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1) + (1 - mix_ratio) * activity_logit.detach().unsqueeze(-1)
                     if param_activity_targets is not None:
-                        prev_param_activity_seq[:, stage_idx, :] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
+                        prev_param_activity_seq[stage_idx] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
 
         # Validate transforms_sequence shape
         if transforms_sequence.shape != (B, self.max_stages, self.num_teeth, 6):
@@ -333,9 +336,9 @@ class PerToothTransformerDecoder(nn.Module):
 
         # Initialize adjustment tensor
         adjustment = torch.zeros_like(transforms_sequence)
-        # Parameter-specific clamping: translations (mm), rotations (radians)
-        clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 5.0, 5.0, 5.0], device=device)  # Translations, rotations
-        clamp_ranges_adjustment = torch.tensor([0.3, 0.3, 0.3, 2.0, 2.0, 2.0], device=device)
+        # Parameter-specific clamping: translations (mm), rotations (degrees)
+        clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=device)  # Translations, rotations
+        clamp_ranges_adjustment = torch.tensor([0.3, 0.3, 0.3, 4.0, 4.0, 4.0], device=device)
         for tooth_idx in range(self.num_teeth):
             for param_idx in range(6):
                 masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
@@ -351,7 +354,7 @@ class PerToothTransformerDecoder(nn.Module):
                 residual = residual.view(B)  # Explicitly reshape to (B,)
                 if residual.shape != (B,):
                     logger.error(f"Residual shape {residual.shape} does not match expected (B,)=({B},)")
-                    raise RuntimeError(f"Residual shape mismatch")
+                    raise RuntimeError("Residual shape mismatch")
 
                 # Log shapes for debugging
                 logger.debug(f"Shapes for tooth {tooth_idx} param {param_idx}: "
@@ -374,12 +377,10 @@ class PerToothTransformerDecoder(nn.Module):
                 param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
                 stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d
 
-                #stage_adjustment = residual_expanded * stage_weights * stage_mask * param_mask  # Shape: (B, 25, 1)
                 logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
                 stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
                 
                 adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1).squeeze(-1)  # (B, 25)
-                # adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1)
                 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Residual tooth {tooth_idx} param {param_idx}: "
