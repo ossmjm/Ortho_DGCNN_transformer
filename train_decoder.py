@@ -367,7 +367,7 @@ def train(args):
                     val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                     training=False
                 )
-                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights = outputs
+                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,_ = outputs
 
                 total_loss, losses, f1_activity, f1_param_activity, f1_stage_activity = compute_loss(
                     pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,
