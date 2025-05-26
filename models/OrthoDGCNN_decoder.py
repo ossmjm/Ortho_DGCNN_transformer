@@ -152,5 +152,6 @@ class OrthoDGCNNModel(nn.Module):
                 logger.error(f"NaN values detected in output {i}")
                 output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
                 outputs[i] = output
-                
-        return outputs + [stage_weights]
+        if not torch.all(stage_weights.isfinite()):
+            raise ValueError("Stage weights contain NaN/Inf")
+        return outputs, stage_weights

@@ -39,9 +39,9 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     
     transforms_sequence = torch.clamp(transforms_sequence, -40, 40)
     
-    logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
-    if stage_weights is not None:
-        logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
+    # logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
+    # if stage_weights is not None:
+    #     logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
     
     loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1), stage_weights)
     loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
@@ -259,7 +259,7 @@ def train(args):
             optimizer_dgcnn.zero_grad()
             optimizer_decoder.zero_grad()
 
-            outputs = model(
+            outputs,stage_weights = model(
                 coordinates=feats,
                 targets=transforms,
                 cumulative_targets=cumulative_transforms,
@@ -271,7 +271,7 @@ def train(args):
                 val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                 training=True
             )
-            pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, tf_count, stage_weights = outputs
+            pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, tf_count = outputs
 
             total_tf_count += tf_count
 
@@ -355,7 +355,7 @@ def train(args):
                     x.to(device) for x in [feats, transforms, cumulative_transforms, activity, param_activity, num_stages]
                 ]
 
-                outputs = model(
+                outputs,stage_weights = model(
                     coordinates=feats,
                     targets=transforms,
                     cumulative_targets=cumulative_transforms,
@@ -367,7 +367,7 @@ def train(args):
                     val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
                     training=False
                 )
-                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,_ = outputs
+                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits,_ = outputs
 
                 total_loss, losses, f1_activity, f1_param_activity, f1_stage_activity = compute_loss(
                     pred_transforms, activity_logits, param_activity_logits, stage_activity_logits, stage_weights,
