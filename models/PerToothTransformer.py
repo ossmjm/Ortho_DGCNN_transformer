@@ -95,21 +95,14 @@ class PerToothTransformerDecoder(nn.Module):
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
         if val_loss is not None:
-            normalized_loss = min(val_loss / 0.1, 1.0)
-            tf_prob = base_tf_prob * (1 - normalized_loss)
-            tf_prob = max(0.3, tf_prob)
+            normalized_loss = 1 - torch.exp(torch.tensor(-val_loss / 2.0))
+            tf_prob = base_tf_prob * normalized_loss.item()
+            tf_prob = min(max(tf_prob, 0.3), 0.95)
         else:
             progress = epoch / total_epochs
             tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
         
-        num_stages_to_use = min(stage_idx, num_stages.max().item() if num_stages is not None else stage_idx)
-        progress = epoch / total_epochs
-        if progress < 0.3:
-            num_stages_to_use = min(num_stages_to_use, 5)
-        elif progress < 0.6:
-            num_stages_to_use = min(num_stages_to_use, 10)
-        
-        return tf_prob, num_stages_to_use
+        return tf_prob
 
     def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
@@ -178,20 +171,16 @@ class PerToothTransformerDecoder(nn.Module):
 
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
-                tf_prob, num_stages_to_use = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
+                tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
                 effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
-                use_tf = training and stage_idx > 0 and (torch.rand(B, device=device) < effective_tf_prob).any()
-
+                use_tf = training and stage_idx > 0 and stage_idx < num_stages.min().item() and (torch.rand(1, device=device) < effective_tf_prob).item() if num_stages is not None else False
                 # Increment teacher forcing counter
                 if use_tf:
                     tf_count += 1
 
-                start_idx = max(0, stage_idx - num_stages_to_use)
+                start_idx = 0  # Use all previous stages
                 if use_tf and targets is not None:
-                    targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]
-                    predicted_prev = torch.stack(prev_transform_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
-                    mix_ratio = effective_tf_prob
-                    targets_prev = mix_ratio * targets_prev + (1 - mix_ratio) * predicted_prev
+                    targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]  # Shape: (B, stage_idx, 6)
                     embedded_target = self.target_embed(targets_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_target = self.target_norm(embedded_target)
@@ -213,9 +202,7 @@ class PerToothTransformerDecoder(nn.Module):
                         embedded_target = embedded_target.squeeze(1).clamp(-20, 20)
 
                 if use_tf and activity_targets is not None:
-                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)
-                    predicted_activity_prev = torch.stack(prev_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 1, device=device)
-                    activity_prev = mix_ratio * activity_prev + (1 - mix_ratio) * predicted_activity_prev
+                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)  # Shape: (B, stage_idx, 1)
                     embedded_activity = self.activity_target_embed(activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_activity = self.activity_norm(embedded_activity)
@@ -237,9 +224,7 @@ class PerToothTransformerDecoder(nn.Module):
                         embedded_activity = embedded_activity.squeeze(1).clamp(-20, 20)
 
                 if use_tf and param_activity_targets is not None:
-                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]
-                    predicted_param_activity_prev = torch.stack(prev_param_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
-                    param_activity_prev = mix_ratio * param_activity_prev + (1 - mix_ratio) * predicted_param_activity_prev
+                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]  # Shape: (B, stage_idx, 6)
                     embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_param_activity = self.param_activity_norm(embedded_param_activity)
@@ -302,11 +287,11 @@ class PerToothTransformerDecoder(nn.Module):
 
                 if use_tf and stage_idx < self.max_stages - 1:
                     if targets is not None:
-                        prev_transform_seq[stage_idx] = mix_ratio * targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * transforms.detach()
+                        prev_transform_seq[stage_idx] = targets[:, stage_idx, tooth_idx, :].detach()
                     if activity_targets is not None:
-                        prev_activity_seq[stage_idx] = mix_ratio * activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1) + (1 - mix_ratio) * activity_logit.detach().unsqueeze(-1)
+                        prev_activity_seq[stage_idx] = activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1).detach()
                     if param_activity_targets is not None:
-                        prev_param_activity_seq[stage_idx] = mix_ratio * param_activity_targets[:, stage_idx, tooth_idx, :] + (1 - mix_ratio) * param_activity_logit.detach()
+                        prev_param_activity_seq[stage_idx] = param_activity_targets[:, stage_idx, tooth_idx, :].detach()
 
         # Validate transforms_sequence shape
         if transforms_sequence.shape != (B, self.max_stages, self.num_teeth, 6):

@@ -259,7 +259,7 @@ def train(args):
             optimizer_dgcnn.zero_grad()
             optimizer_decoder.zero_grad()
 
-            outputs,stage_weights = model(
+            outputs, stage_weights = model(
                 coordinates=feats,
                 targets=transforms,
                 cumulative_targets=cumulative_transforms,
@@ -281,7 +281,6 @@ def train(args):
                 num_stages, args.max_stages, device, logger, args
             )
 
-            # Check for NaN/Inf in loss
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 logger.error(f"Skipping batch {batch_idx} due to NaN/Inf in total_loss: {total_loss.item()}")
                 continue
@@ -309,8 +308,10 @@ def train(args):
                             f"F1 Activity: {f1_activity.item():.4f}, F1 Param Activity: {f1_param_activity.item():.4f}, "
                             f"F1 Stage Activity: {f1_stage_activity.item():.4f}, TF Count: {tf_count}")
 
-        avg_tf_count = total_tf_count / len(train_loader)
-        logger.info(f"Epoch {epoch+1}/{args.epochs}, Average Teacher Forcing Count: {avg_tf_count:.4f}")
+        # Calculate teacher forcing percentage
+        total_possible_tf_instances = args.num_teeth * (args.max_stages - 1) * args.batch_size * len(train_loader)
+        tf_percentage = (total_tf_count / total_possible_tf_instances) * 100 if total_possible_tf_instances > 0 else 0.0
+        logger.info(f"Epoch {epoch+1}/{args.epochs}, Teacher Forcing Usage: {tf_percentage:.2f}%")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn is not None:
@@ -355,7 +356,7 @@ def train(args):
                     x.to(device) for x in [feats, transforms, cumulative_transforms, activity, param_activity, num_stages]
                 ]
 
-                outputs,stage_weights = model(
+                outputs, stage_weights = model(
                     coordinates=feats,
                     targets=transforms,
                     cumulative_targets=cumulative_transforms,
