@@ -138,7 +138,6 @@ class ParamActivityLoss(nn.Module):
 
         logger.debug(f"ParamActivityLoss: loss={loss.item():.4f}, f1={f1.item():.4f}, active_elements={num_active.item()}")
         return loss, f1
-
 class StageActivityLoss(nn.Module):
     """Loss for predicting binary stage activity."""
     def __init__(self, weight=1.0):
@@ -155,19 +154,21 @@ class StageActivityLoss(nn.Module):
         batch_size, max_stages = logits.shape
         device = logits.device
 
-        stage_labels = torch.ones_like(logits)
+        # Label active stages (1) and inactive stages (0)
+        stage_labels = torch.zeros_like(logits)
         stage_mask = torch.arange(max_stages, device=device).unsqueeze(0).expand(batch_size, max_stages)
-        stage_mask = (stage_mask < true_num_stages.unsqueeze(1)).float()
-        stage_labels = stage_labels * stage_mask
+        stage_labels[stage_mask < true_num_stages.unsqueeze(1)] = 1.0
 
+        # Compute loss over all stages
         loss = self.bce_loss(logits, stage_labels)
-        loss = (loss * stage_mask).sum() / max(stage_mask.sum(), 1.0)
+        loss = loss.sum() / logits.numel()
 
-        valid_preds = torch.sigmoid(logits[stage_mask.bool()])
-        valid_labels = stage_labels[stage_mask.bool()]
+        # Compute F1 score over all stages
+        valid_preds = torch.sigmoid(logits)
+        valid_labels = stage_labels
         f1 = binary_f1_score(valid_preds, valid_labels, threshold=0.5) if valid_preds.numel() > 0 else torch.tensor(0.0, device=device)
 
-        logger.debug(f"StageActivityLoss: loss={loss.item():.4f}, f1={f1.item():.4f}, valid_stages={stage_mask.sum().item()}")
+        logger.debug(f"StageActivityLoss: loss={loss.item():.4f}, f1={f1.item():.4f}, total_stages={logits.numel()}")
         return self.weight * loss, f1
 
 class PaddedLoss(nn.Module):

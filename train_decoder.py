@@ -43,7 +43,7 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     # if stage_weights is not None:
     #     logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
     
-    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1), stage_weights)
+    loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1))
     loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
     loss_param_activity, f1_param_activity = param_activity_loss_fn(param_activity_logits, param_activity_labels, activity_labels, true_num_stages)
     loss_stage_activity, f1_stage_activity = stage_activity_loss_fn(stage_activity_logits, true_num_stages)

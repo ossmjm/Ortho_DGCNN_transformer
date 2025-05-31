@@ -59,9 +59,9 @@ class PerToothTransformerDecoder(nn.Module):
             nn.Linear(embed_dim, 64), nn.GELU()
         )
         self.transform_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 64), nn.GELU(),
-            nn.Linear(64, 32), nn.GELU()
-        )
+            nn.Linear(embed_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32),
+            )
 
         self.activity_head = nn.Linear(64, 1)
         self.param_activity_head = nn.Linear(64, 6)
@@ -71,6 +71,7 @@ class PerToothTransformerDecoder(nn.Module):
         
         # Stage weights
         self.stage_weights = nn.Parameter(torch.ones(1, max_stages, 1, 1))
+        self.stage_weight_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scale
         
         # Gradient scaling factor
         self.grad_scale = 0.1
@@ -84,7 +85,12 @@ class PerToothTransformerDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
-                nn.init.trunc_normal_(m, std=0.01)
+                if m is self.stage_weights:
+                    nn.init.trunc_normal_(m, mean=1.0, std=0.1, a=0.0)
+                elif m is self.stage_weight_scale:
+                    nn.init.constant_(m, 1.0)
+                else:
+                    nn.init.trunc_normal_(m, std=0.01)
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
@@ -308,6 +314,8 @@ class PerToothTransformerDecoder(nn.Module):
 
         # Residual adjustment per tooth and parameter
         stage_weights = torch.softmax(self.stage_weights, dim=1)  # Shape: (1, 25, 1, 1)
+        logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
+        print(stage_weights)
         # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
         stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)  # Shape: (B, 25, 1, 1)
         if training and num_stages is not None:
@@ -330,7 +338,7 @@ class PerToothTransformerDecoder(nn.Module):
         adjustment = torch.zeros_like(transforms_sequence)
         # Parameter-specific clamping: translations (mm), rotations (degrees)
         clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=device)  # Translations, rotations
-        clamp_ranges_adjustment = torch.tensor([0.3, 0.3, 0.3, 4.0, 4.0, 4.0], device=device)
+        clamp_ranges_adjustment = torch.tensor([0.5, 0.5, 0.5, 6.0, 6.0, 6.0], device=device)  # Relaxed clamping
         for tooth_idx in range(self.num_teeth):
             for param_idx in range(6):
                 masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
@@ -367,7 +375,7 @@ class PerToothTransformerDecoder(nn.Module):
                     continue
                 residual_expanded_4d = residual_expanded.unsqueeze(-1)  # (B, 25, 1, 1)
                 param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
-                stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d
+                stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d * self.stage_weight_scale
 
                 logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
                 stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
@@ -388,14 +396,14 @@ class PerToothTransformerDecoder(nn.Module):
                      f"min={adjustment.min().item():.4f}")
 
         # Post-adjustment validation check
-        if training:
-            for tooth_idx in range(self.num_teeth):
-                for param_idx in range(6):
-                    final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
-                    error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
-                    if error > 0.1:
-                        logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, "
-                                       f"clamping may be too restrictive")
+        # if training:
+        for tooth_idx in range(self.num_teeth):
+            for param_idx in range(6):
+                final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
+                error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
+                if error > 0.1:
+                    logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, and final_sum {final_sum.item()}"
+                                    f"clamping may be too restrictive")
 
         # Gradient clipping
         for p in self.parameters():
