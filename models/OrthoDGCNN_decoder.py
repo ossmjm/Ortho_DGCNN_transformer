@@ -11,7 +11,7 @@ class OrthoDGCNNModel(nn.Module):
         max_stages: int = 25,
         num_teeth: int = 14,
         num_points: int = 256,
-        channels: int = 4,
+        channels: int = 3,
         embed_dim: int = 384,
         teacher_forcing_prob: float = 0.0,
         decoder_layers: int = 1,
@@ -24,7 +24,7 @@ class OrthoDGCNNModel(nn.Module):
         per_tooth_mlp_ratio: float = 4.0
     ):
         super().__init__()
-        self.dgcnn = DGCNN(in_channels=4, embed_dim=embed_dim, num_teeth=num_teeth, num_points=num_points, k=k)
+        self.dgcnn = DGCNN(in_channels=channels, embed_dim=embed_dim, num_teeth=num_teeth, num_points=num_points, k=k)
         if decoder_type == 'per_tooth':
             self.decoder = PerToothTransformerDecoder(
                 embed_dim=embed_dim,
@@ -66,10 +66,10 @@ class OrthoDGCNNModel(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, coordinates, targets=None, cumulative_targets=None, activity_targets=None, param_activity_targets=None, num_stages=None, epoch=None, total_epochs=None, val_loss=None, training=True):
+    def forward(self, coordinates, targets=None, cumulative_targets=None, activity_targets=None, param_activity_targets=None, directions=None, num_stages=None, epoch=None, total_epochs=None, val_loss=None, training=True):
         logger = logging.getLogger('TrainLogger')
         
-        expected_shape = (-1, self.num_teeth, self.num_points, 4)
+        expected_shape = (-1, self.num_teeth, self.num_points, 3)
         if coordinates.shape[1:] != torch.Size(expected_shape[1:]):
             logger.error(f"Invalid coordinates shape: got {coordinates.shape}, expected {expected_shape}")
             raise RuntimeError(f"Coordinates shape mismatch: got {coordinates.shape}, expected {expected_shape}")
@@ -98,7 +98,12 @@ class OrthoDGCNNModel(nn.Module):
             if cumulative_targets.shape[1:] != torch.Size(expected_cumulative_shape[1:]):
                 logger.error(f"Invalid cumulative_targets shape: got {cumulative_targets.shape}, expected {expected_cumulative_shape}")
                 raise RuntimeError(f"Cumulative_targets shape mismatch")
-        
+        if directions is not None:
+            expected_directions_shape = (-1, self.num_teeth, 6)
+            if directions.shape[1:] != torch.Size(expected_directions_shape[1:]):
+                logger.error(f"Invalid directions shape: got {directions.shape}, expected {expected_directions_shape}")
+                raise RuntimeError(f"Directions shape mismatch")
+
         features = self.dgcnn(coordinates)
         
         expected_features_shape = (-1, self.num_teeth, self.embed_dim)
@@ -112,13 +117,13 @@ class OrthoDGCNNModel(nn.Module):
             
         features = self.feature_norm(features)
         
-        # In inference mode, set num_stages to None
         if not training:
             num_stages = None
         
         outputs = self.decoder(
             memory=features,
             cumulative_transforms=cumulative_targets,
+            directions=directions,
             num_stages=num_stages,
             targets=targets,
             activity_targets=activity_targets,
@@ -132,7 +137,6 @@ class OrthoDGCNNModel(nn.Module):
         
         transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count = outputs
         
-        # Extract stage_weights from decoder if it's PerToothTransformerDecoder
         stage_weights = None
         if isinstance(self.decoder, PerToothTransformerDecoder):
             stage_weights = torch.softmax(self.decoder.stage_weights, dim=1)

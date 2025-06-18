@@ -251,10 +251,11 @@ def train(args):
         train_f1_stage_activity = []
         total_tf_count = 0.0
 
-        for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, _, _, _, num_stages) in enumerate(train_loader):
-            feats, transforms, cumulative_transforms, activity, param_activity, num_stages = [
-                x.to(device) for x in [feats, transforms, cumulative_transforms, activity, param_activity, num_stages]
+        for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages) in enumerate(train_loader):
+            feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages = [
+                x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages]
             ]
+            logger.debug(f"Batch {batch_idx} shapes: feats={feats.shape}, transforms={transforms.shape}, cumulative_transforms={cumulative_transforms.shape}, directions={directions.shape}, num_stages={num_stages}")
             
             optimizer_dgcnn.zero_grad()
             optimizer_decoder.zero_grad()
@@ -265,6 +266,7 @@ def train(args):
                 cumulative_targets=cumulative_transforms,
                 activity_targets=activity,
                 param_activity_targets=param_activity,
+                directions=directions,
                 num_stages=num_stages,
                 epoch=epoch,
                 total_epochs=args.epochs,
@@ -351,9 +353,9 @@ def train(args):
         val_f1_stage_activity = []
 
         with torch.no_grad():
-            for jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, _, _, _, num_stages in val_loader:
-                feats, transforms, cumulative_transforms, activity, param_activity, num_stages = [
-                    x.to(device) for x in [feats, transforms, cumulative_transforms, activity, param_activity, num_stages]
+            for jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages in val_loader:
+                feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages = [
+                    x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages]
                 ]
 
                 outputs, stage_weights = model(
@@ -362,6 +364,7 @@ def train(args):
                     cumulative_targets=cumulative_transforms,
                     activity_targets=activity,
                     param_activity_targets=param_activity,
+                    directions=directions,
                     num_stages=num_stages,
                     epoch=epoch,
                     total_epochs=args.epochs,
@@ -492,8 +495,8 @@ if __name__ == "__main__":
     parser.add_argument('--cache_dir', type=str, default='./cache', help='Path to cache directory')
     parser.add_argument('--pretrained_dgcnn_path', type=str, default=None, help='Path to pretrained DGCNN weights')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model (optional)')
-    parser.add_argument('--num_points', type=int, default=256, help='Number of points per tooth')
-    parser.add_argument('--channels', type=int, default=4, help='Number of feature channels')
+    parser.add_argument('--num_points', type=int, default=4000, help='Number of points per tooth')
+    parser.add_argument('--channels', type=int, default=3, help='Number of feature channels')
     parser.add_argument('--train_ratio', type=float, default=0.8, help='Train/validation split ratio')
     parser.add_argument('--embed_dim', type=int, default=96, help='Embedding dimension')
     parser.add_argument('--k', type=int, default=10, help='Number of k in DGCNN')
@@ -515,7 +518,7 @@ if __name__ == "__main__":
     parser.add_argument('--w_consistency', type=float, default=0.5, help='Weight for consistency loss')
     parser.add_argument('--w_stage_activity', type=float, default=1.0, help='Weight for stage activity loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
                         help='Optimizer type')
     parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizers')
     parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'],

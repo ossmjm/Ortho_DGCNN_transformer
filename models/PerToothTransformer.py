@@ -10,10 +10,10 @@ class PerToothTransformerDecoder(nn.Module):
         self.num_teeth = num_teeth
         self.max_stages = max_stages
         
-        # Positional embeddings
         self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))
         self.target_embed = nn.Linear(6, embed_dim)
         self.cumulative_embed = nn.Linear(6, embed_dim)
+        self.direction_embed = nn.Linear(6, embed_dim)  # Embed binary directions
         self.activity_target_embed = nn.Linear(1, embed_dim)
         self.param_activity_target_embed = nn.Linear(6, embed_dim)
         
@@ -21,6 +21,7 @@ class PerToothTransformerDecoder(nn.Module):
         self.target_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.param_activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.direction_norm = nn.LayerNorm(embed_dim, eps=1e-5)  # Norm for direction embeddings
         
         # Cross-tooth attention
         self.cross_tooth_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.2, batch_first=True)
@@ -110,7 +111,7 @@ class PerToothTransformerDecoder(nn.Module):
         
         return tf_prob
 
-    def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
+    def forward(self, memory, cumulative_transforms, directions=None, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
         device = memory.device
@@ -118,6 +119,7 @@ class PerToothTransformerDecoder(nn.Module):
         expected_shapes = {
             'memory': (B, self.num_teeth, self.embed_dim),
             'cumulative_transforms': (B, self.num_teeth, 6),
+            'directions': (B, self.num_teeth, 6) if directions is not None else None,
             'targets': (B, self.max_stages, self.num_teeth, 6) if targets is not None else None,
             'activity_targets': (B, self.max_stages, self.num_teeth) if activity_targets is not None else None,
             'param_activity_targets': (B, self.max_stages, self.num_teeth, 6) if param_activity_targets is not None else None
@@ -143,12 +145,13 @@ class PerToothTransformerDecoder(nn.Module):
 
         # Log input shapes for debugging
         logger.debug(f"Input shapes: memory={memory.shape}, cumulative_transforms={cumulative_transforms.shape}, "
+                     f"directions={directions.shape if directions is not None else None}, "
                      f"num_stages={num_stages.tolist() if num_stages is not None else None}, "
                      f"targets={targets.shape if targets is not None else None}, "
                      f"activity_targets={activity_targets.shape if activity_targets is not None else None}, "
                      f"param_activity_targets={param_activity_targets.shape if param_activity_targets is not None else None}")
 
-        tensors = [memory, cumulative_transforms, targets, activity_targets, param_activity_targets]
+        tensors = [memory, cumulative_transforms, directions, targets, activity_targets, param_activity_targets]
         for tensor in tensors:
             if tensor is not None:
                 tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -160,6 +163,10 @@ class PerToothTransformerDecoder(nn.Module):
         cumulative_embed = self.cumulative_embed(cumulative_transforms.float())
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
         cumulative_embed = cumulative_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
+
+        direction_embed = self.direction_embed(directions.float()) if directions is not None else torch.zeros(B, self.num_teeth, self.embed_dim, device=device)
+        direction_embed = self.direction_norm(direction_embed)
+        direction_embed = direction_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
 
         transforms_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, device=device)
@@ -253,7 +260,8 @@ class PerToothTransformerDecoder(nn.Module):
 
                 pos_embed = self.pos_embed[:, stage_idx, :]
                 cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]
-                tgt = embedded_target + 0.1 * embedded_activity + 0.1 * embedded_param_activity + pos_embed + cum_embed
+                dir_embed = direction_embed[:, stage_idx, tooth_idx, :]
+                tgt = embedded_target + 0.1 * embedded_activity + 0.1 * embedded_param_activity + pos_embed + cum_embed + 0.1 * dir_embed
                 tgt = self.pre_norm(tgt.unsqueeze(1))
 
                 tgt = self.pre_cumulative_norm(tgt)

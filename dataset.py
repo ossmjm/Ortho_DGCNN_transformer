@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 import logging
 import re
 
@@ -42,7 +42,7 @@ class JawTeethDataset(Dataset):
         max_stages=25,
         num_teeth=14,
         num_points=256,
-        channels=4,
+        channels=3,
         split='train',
         train_ratio=0.8,
         inference=False,
@@ -63,7 +63,6 @@ class JawTeethDataset(Dataset):
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
-        # Initialize 6 scalers for each parameter
         self.scalers = [RobustScaler() for _ in range(6)]  # For Transformations
         self.cumulative_scalers = [RobustScaler() for _ in range(6)]  # For cumulative_transformations
 
@@ -95,7 +94,9 @@ class JawTeethDataset(Dataset):
         ]
         for col in columns:
             df[col] = df[col].apply(clean_numeric)
+            df[col] = df[col].abs()  # Convert to absolute values
             df[col] = df[col].replace([float('inf'), -float('inf')], 0.0)
+        self.logger.debug(f"Converted transformation values to absolute for Jaw_ID {jaw_id}")
 
         if not is_cumulative:
             df["Stage"] = df["Stage"].apply(clean_numeric).astype(int)
@@ -105,7 +106,6 @@ class JawTeethDataset(Dataset):
                 self.logger.error(f"Stage column for Jaw_ID {jaw_id} contains NaN after imputation")
                 return None
 
-        # Apply parameter-specific scaling
         if not self.inference and not skip_scaling and len(df) > 0:
             scalers = self.cumulative_scalers if is_cumulative else self.scalers
             for i, col in enumerate(columns):
@@ -121,6 +121,7 @@ class JawTeethDataset(Dataset):
     def _load_transformations(self, jaw_id, transform_df, cumulative_df, num_stages_df):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         cumulative_transformations = torch.zeros(self.num_teeth, 6)
+        directions = torch.ones(self.num_teeth, 6)  # Default to 1 (positive or zero)
         type_labels = torch.zeros(self.max_stages, self.num_teeth, dtype=torch.long)
 
         num_stages_data = num_stages_df[num_stages_df["Jaw_ID"] == jaw_id]
@@ -148,30 +149,38 @@ class JawTeethDataset(Dataset):
                     type_labels[stage, tooth_idx] = 3
 
         if cumulative_df is not None:
+            raw_values = []  # Store raw values before taking absolute
             for _, row in cumulative_df.iterrows():
                 tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
-                cumulative_transformations[tooth_idx] = torch.tensor([
+                raw = [
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
                     row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
-                ], dtype=torch.float32)
+                ]
+                raw_values.append(raw)
+                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
+                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+            self.logger.debug(f"Extracted directions for Jaw_ID {jaw_id}: {directions.tolist()}")
 
         activity = torch.any(transformations != 0, dim=-1).float()
         param_activity = (transformations != 0).float()
         cumulative_activity = torch.any(cumulative_transformations != 0, dim=-1).float()
         cumulative_param_activity = (cumulative_transformations != 0).float()
 
-        return transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity
+        return transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions
 
     def _load_cumulative_only(self, jaw_id, cumulative_df):
         cumulative_transformations = torch.zeros(self.num_teeth, 6)
+        directions = torch.ones(self.num_teeth, 6)  # Default to 1
         if cumulative_df is not None:
             for _, row in cumulative_df.iterrows():
                 tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
-                cumulative_transformations[tooth_idx] = torch.tensor([
+                raw = [
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
                     row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
-                ], dtype=torch.float32)
-        return cumulative_transformations
+                ]
+                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
+                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+        return cumulative_transformations, directions
 
     def _preprocess_json(self, json_file, jaw_id):
         try:
@@ -190,7 +199,6 @@ class JawTeethDataset(Dataset):
             if fdi not in teeth_data:
                 self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
                 feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
-                feats[:, 3] = tooth_idx
                 vertices = np.zeros((self.num_points, 3), dtype=np.float32)
                 faces = np.zeros((0, 3), dtype=np.int64)
             else:
@@ -201,7 +209,6 @@ class JawTeethDataset(Dataset):
                 if len(vertices) == 0:
                     self.logger.warning(f"Tooth {fdi} has no vertices in JSON file {json_file}")
                     feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
-                    feats[:, 3] = tooth_idx
                     vertices = np.zeros((self.num_points, 3), dtype=np.float32)
                     faces = np.zeros((0, 3), dtype=np.int64)
                 else:
@@ -219,7 +226,6 @@ class JawTeethDataset(Dataset):
                     
                     feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
                     feats[:, :3] = torch.tensor(points, dtype=torch.float32)
-                    feats[:, 3] = tooth_idx
 
             feats_list[tooth_idx] = feats
             vertices_list[tooth_idx] = vertices
@@ -247,7 +253,6 @@ class JawTeethDataset(Dataset):
             self.cases = test_cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
-        # Initialize and fit scalers for training split
         if self.split == 'train' and not self.inference:
             all_transforms = [[] for _ in range(6)]
             all_cumulative_transforms = [[] for _ in range(6)]
@@ -296,10 +301,10 @@ class JawTeethDataset(Dataset):
                     scaler_file = os.path.join(self.cache_dir, f'cumulative_scaler_param_{i}.pkl')
                     try:
                         with open(scaler_file, 'wb') as f:
-                            pickle.dump(self.cumulative_scalers[i], f)
+                            pickle.dump(self.scalers[i], f)
                         self.logger.info(f"Saved cumulative scaler for parameter {columns[i]} to {scaler_file}")
                     except Exception as e:
-                        self.logger.error(f"Failed to save cumulative scaler for parameter {columns[i]}: {e}")
+                        self.logger.error(f"Failed to save scaler for parameter {columns[i]}: {e}")
                 else:
                     self.logger.warning(f"No valid cumulative transformation data for parameter {columns[i]} to fit scaler")
                     self.cumulative_scalers[i] = None
@@ -359,7 +364,7 @@ class JawTeethDataset(Dataset):
                 except Exception as e:
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
                 cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
-                cumulative_transformations = self._load_cumulative_only(case, cumulative_data) if cumulative_data is not None else torch.zeros(self.num_teeth, 6)
+                cumulative_transformations, directions = self._load_cumulative_only(case, cumulative_data) if cumulative_data is not None else (torch.zeros(self.num_teeth, 6), torch.ones(self.num_teeth, 6))
                 num_stages = self.max_stages
                 feats = self._preprocess_json(json_file, case)
                 if feats is None:
@@ -369,6 +374,7 @@ class JawTeethDataset(Dataset):
                     'jaw_id': case,
                     'feats': feats,
                     'cumulative_transformations': cumulative_transformations,
+                    'directions': directions,
                     'num_stages': num_stages
                 }
             else:
@@ -385,7 +391,7 @@ class JawTeethDataset(Dataset):
 
                 transform_data = self._preprocess_excel(transform_df, case) if transform_df is not None else None
                 cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
-                transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity = self._load_transformations(
+                transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions = self._load_transformations(
                     case, transform_data, cumulative_data, num_stages_df
                 )
                 feats, vertices, faces = self._preprocess_json(json_file, case)
@@ -402,9 +408,8 @@ class JawTeethDataset(Dataset):
                     'type_labels': type_labels,
                     'cumulative_activity': cumulative_activity,
                     'cumulative_param_activity': cumulative_param_activity,
-                    'num_stages': num_stages,
-                    'vertices': vertices,
-                    'faces': faces
+                    'directions': directions,
+                    'num_stages': num_stages
                 }
 
             try:
@@ -427,6 +432,7 @@ class JawTeethDataset(Dataset):
                 data['jaw_id'],
                 data['feats'],
                 data['cumulative_transformations'],
+                data['directions'],
                 data['num_stages']
             )
         return (
@@ -439,13 +445,13 @@ class JawTeethDataset(Dataset):
             data['type_labels'],
             data['cumulative_activity'],
             data['cumulative_param_activity'],
+            data['directions'],
             data['num_stages']
         )
 
     def get_scalers(self):
         """Return the parameter-specific scalers for external use (e.g., inference)."""
         return self.scalers, self.cumulative_scalers
-    
 
 class CumulativeJawTeethDataset(Dataset):
     def __init__(
@@ -453,7 +459,7 @@ class CumulativeJawTeethDataset(Dataset):
         data_dir,
         num_teeth=14,
         num_points=256,
-        channels=4,
+        channels=3,
         split='train',
         train_ratio=0.8,
         inference=False,
@@ -545,7 +551,6 @@ class CumulativeJawTeethDataset(Dataset):
             if fdi not in teeth_data:
                 self.logger.warning(f"Tooth {fdi} missing in JSON file {json_file}")
                 feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
-                feats[:, 3] = tooth_idx
             else:
                 tooth_data = teeth_data[fdi]
                 vertices = np.array(tooth_data.get("v", []), dtype=np.float32)
@@ -557,11 +562,10 @@ class CumulativeJawTeethDataset(Dataset):
                 else:
                     points = vertices
                     if len(points) < self.num_points:
-                        points = np.pad(points, ((0, self.num_points - len(points)), (0, 0)), mode='wrap')[:self.num_points]
+                        points = np.pad(points, ((0, self.num_points - len(points)), (0, 0)), mode='constant')[:self.num_points]
                 
                 feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
                 feats[:, :3] = torch.tensor(points, dtype=torch.float32)
-                feats[:, 3] = tooth_idx
 
             feats_list[tooth_idx] = feats
 

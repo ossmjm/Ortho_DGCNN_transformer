@@ -29,7 +29,7 @@ def get_graph_feature(x, k, idx=None):
     return feature
 
 class DGCNN(nn.Module):
-    def __init__(self, in_channels=4, embed_dim=384, num_teeth=14, num_points=256, k=20, dropout=0.5):  # Changed from 13 to 4
+    def __init__(self, in_channels=3, embed_dim=384, num_teeth=14, num_points=256, k=20, dropout=0.5):  # Changed from 13 to 4
         super(DGCNN, self).__init__()
         self.k = k
         self.num_teeth = num_teeth
