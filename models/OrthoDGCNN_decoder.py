@@ -137,7 +137,7 @@ class OrthoDGCNNModel(nn.Module):
         
         transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count = outputs
         
-        stage_weights = None
+        # stage_weights = None
         # if isinstance(self.decoder, PerToothTransformerDecoder):
         #     stage_weights = self.decoder.stage_weights
         
@@ -148,7 +148,6 @@ class OrthoDGCNNModel(nn.Module):
         logger.debug(f"OrthoDGCNN output shape: transforms_sequence={transforms_sequence.shape}, "
                     f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
                     f"stage_activity_logits={stage_activity_logits.shape}, "
-                    f"stage_weights_shape={stage_weights.shape if stage_weights is not None else 'None'}, "
                     f"teacher_forcing_count={tf_count}")
                      
         for i, output in enumerate([transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits]):
@@ -156,6 +155,4 @@ class OrthoDGCNNModel(nn.Module):
                 logger.error(f"NaN values detected in output {i}")
                 output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
                 outputs[i] = output
-        if not torch.all(stage_weights.isfinite()):
-            raise ValueError("Stage weights contain NaN/Inf")
         return outputs
