@@ -10,6 +10,7 @@ class PerToothTransformerDecoder(nn.Module):
         self.num_teeth = num_teeth
         self.max_stages = max_stages
         
+        # Positional embeddings
         self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))
         self.target_embed = nn.Linear(6, embed_dim)
         self.cumulative_embed = nn.Linear(6, embed_dim)
@@ -410,7 +411,7 @@ class PerToothTransformerDecoder(nn.Module):
                 final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
                 error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
                 if error > 0.1:
-                    logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, and final_sum {final_sum.item()}"
+                    logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, and final_sum {final_sum}"
                                     f"clamping may be too restrictive")
 
         # Gradient clipping
