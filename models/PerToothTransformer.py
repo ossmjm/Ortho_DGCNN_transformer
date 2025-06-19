@@ -63,7 +63,7 @@ class PerToothTransformerDecoder(nn.Module):
         self.transform_mlp = nn.Sequential(
             nn.Linear(embed_dim, 64), nn.ReLU(),
             nn.Linear(64, 32),
-            )
+        )
 
         self.activity_head = nn.Linear(64, 1)
         self.param_activity_head = nn.Linear(64, 6)
@@ -71,8 +71,13 @@ class PerToothTransformerDecoder(nn.Module):
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         
-        # Stage weights
-        self.stage_weights = nn.Parameter(torch.ones(1, max_stages, 1, 1))
+        # Stage weights MLP
+        self.stage_index_embed = nn.Parameter(torch.zeros(max_stages, embed_dim // 4))
+        self.stage_weights_mlp = nn.Sequential(
+            nn.Linear(embed_dim // 4, embed_dim // 8),
+            nn.GELU(),
+            nn.Linear(embed_dim // 8, 1)
+        )
         self.stage_weight_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scale
         
         # Gradient scaling factor
@@ -87,10 +92,10 @@ class PerToothTransformerDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
-                if m is self.stage_weights:
-                    nn.init.trunc_normal_(m, mean=1.0, std=0.1, a=0.0)
-                elif m is self.stage_weight_scale:
+                if m is self.stage_weight_scale:
                     nn.init.constant_(m, 1.0)
+                elif m is self.stage_index_embed:
+                    nn.init.trunc_normal_(m, mean=0.0, std=0.02)
                 else:
                     nn.init.trunc_normal_(m, std=0.01)
             elif isinstance(m, nn.BatchNorm1d):
@@ -111,6 +116,14 @@ class PerToothTransformerDecoder(nn.Module):
             tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
         
         return tf_prob
+
+    def _get_stage_weights(self):
+        # Compute stage weights using MLP
+        stage_indices = self.stage_index_embed  # Shape: (max_stages, embed_dim // 4)
+        stage_weights = self.stage_weights_mlp(stage_indices)  # Shape: (max_stages, 1)
+        stage_weights = stage_weights.view(1, self.max_stages, 1, 1)  # Shape: (1, max_stages, 1, 1)
+        stage_weights = torch.softmax(stage_weights, dim=1)  # Normalize across stages
+        return stage_weights
 
     def forward(self, memory, cumulative_transforms, directions=None, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
@@ -322,7 +335,7 @@ class PerToothTransformerDecoder(nn.Module):
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
 
         # Residual adjustment per tooth and parameter
-        stage_weights = torch.softmax(self.stage_weights, dim=1)  # Shape: (1, 25, 1, 1)
+        stage_weights = self._get_stage_weights()  # Shape: (1, max_stages, 1, 1)
         logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
         print(stage_weights)
         # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
@@ -405,13 +418,12 @@ class PerToothTransformerDecoder(nn.Module):
                      f"min={adjustment.min().item():.4f}")
 
         # Post-adjustment validation check
-        # if training:
         for tooth_idx in range(self.num_teeth):
             for param_idx in range(6):
                 final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
                 error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
-                if error > 0.1:
-                    logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}, and final_sum {final_sum}"
+                if error > 1:
+                    logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}"
                                     f"clamping may be too restrictive")
 
         # Gradient clipping
