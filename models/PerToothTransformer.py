@@ -427,10 +427,10 @@ class PerToothTransformerDecoder(nn.Module):
         #                 logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}"
         #                                 f"clamping may be too restrictive")
 
-        # Gradient clipping
-        for p in self.parameters():
-            if p.grad is not None:
-                p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
-                p.grad.clamp_(-0.3, 0.3)
+        # # Gradient clipping
+        # for p in self.parameters():
+        #     if p.grad is not None:
+        #         p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
+        #         p.grad.clamp_(-0.3, 0.3)
 
         return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count]
