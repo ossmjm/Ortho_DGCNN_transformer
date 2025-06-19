@@ -418,14 +418,14 @@ class PerToothTransformerDecoder(nn.Module):
                      f"min={adjustment.min().item():.4f}")
 
         # Post-adjustment validation check
-        if training:
-            for tooth_idx in range(self.num_teeth):
-                for param_idx in range(6):
-                    final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
-                    error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
-                    if error > 1:
-                        logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}"
-                                        f"clamping may be too restrictive")
+        # if training:
+        #     for tooth_idx in range(self.num_teeth):
+        #         for param_idx in range(6):
+        #             final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
+        #             error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
+        #             if error > 1:
+        #                 logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}"
+        #                                 f"clamping may be too restrictive")
 
         # Gradient clipping
         for p in self.parameters():
