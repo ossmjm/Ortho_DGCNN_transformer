@@ -47,7 +47,9 @@ class JawTeethDataset(Dataset):
         train_ratio=0.8,
         inference=False,
         cache_dir='./cache',
-        log_file='dataset_log.txt'
+        log_file='dataset_log.txt',
+        use_scaler=True,
+        scaler_type='robust'
     ):
         self.data_dir = data_dir
         self.max_stages = max_stages
@@ -59,33 +61,47 @@ class JawTeethDataset(Dataset):
         self.inference = inference
         self.cache_dir = cache_dir
         self.logger = setup_logging(log_file)
+        self.use_scaler = use_scaler
+        self.scaler_type = scaler_type.lower()
         self.FDI_TO_INDEX = {
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
-        self.scalers = [RobustScaler() for _ in range(6)]  # For Transformations
-        self.cumulative_scalers = [RobustScaler() for _ in range(6)]  # For cumulative_transformations
+        self.scalers = [None for _ in range(6)]  # For stage-wise transformations
+        if self.use_scaler:
+            if self.scaler_type == 'robust':
+                self.scalers = [RobustScaler() for _ in range(6)]
+            elif self.scaler_type == 'standard':
+                self.scalers = [StandardScaler() for _ in range(6)]
+            else:
+                raise ValueError(f"Invalid scaler_type: {self.scaler_type}. Must be 'robust' or 'standard'.")
 
-        if self.split not in ['train', 'val', 'test']:
-            raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'test'.")
+        if self.split not in ['train', 'val']:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' since test cases are handled separately.")
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
 
     def _preprocess_excel(self, df, jaw_id, is_cumulative=False, skip_scaling=False):
         if df is None or df.empty:
-            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel; DataFrame is None or empty")
             return None
 
+        self.logger.debug(f"Processing Excel for Jaw_ID {jaw_id}, initial rows: {len(df)}, columns: {df.columns.tolist()}")
+        
         df = df[df["Jaw_ID"] == jaw_id].copy()
+        self.logger.debug(f"After Jaw_ID filter for {jaw_id}, rows: {len(df)}")
         if df.empty:
-            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering by Jaw_ID; unique Jaw_IDs in data: {df['Jaw_ID'].unique().tolist()}")
             return None
 
         df["Tooth_ID"] = df["Tooth_ID"].astype(str).str.strip().str.replace(',', '.').str.split('.').str[0].str.extract(r'(\d+)')
+        self.logger.debug(f"After Tooth_ID processing for Jaw_ID {jaw_id}, unique Tooth_IDs: {df['Tooth_ID'].unique().tolist()}")
+        
         df = df[df["Tooth_ID"].isin(self.FDI_TO_INDEX.keys())]
+        self.logger.debug(f"After Tooth_ID filter for Jaw_ID {jaw_id}, rows: {len(df)}, valid Tooth_IDs: {df['Tooth_ID'].unique().tolist()}")
         if df.empty:
-            self.logger.warning(f"No valid Tooth_ID for Jaw_ID {jaw_id} after cleaning")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering by Tooth_ID; valid FDI keys: {list(self.FDI_TO_INDEX.keys())}")
             return None
 
         columns = [
@@ -96,33 +112,31 @@ class JawTeethDataset(Dataset):
             df[col] = df[col].apply(clean_numeric)
             df[col] = df[col].abs()  # Convert to absolute values
             df[col] = df[col].replace([float('inf'), -float('inf')], 0.0)
-        self.logger.debug(f"Converted transformation values to absolute for Jaw_ID {jaw_id}")
+            if (df[col] < 0).any():
+                self.logger.warning(f"Negative values detected in {col} for Jaw_ID {jaw_id} after abs(): {(df[col] < 0).sum()} instances")
+        self.logger.debug(f"Applied absolute values to transformations for Jaw_ID {jaw_id}")
 
-        if not is_cumulative:
-            df["Stage"] = df["Stage"].apply(clean_numeric).astype(int)
-            df["Stage"] = df["Stage"].fillna(1).clip(lower=1, upper=self.max_stages)
-            df = df[df["Stage"] <= self.max_stages]
-            if df["Stage"].isna().any():
-                self.logger.error(f"Stage column for Jaw_ID {jaw_id} contains NaN after imputation")
-                return None
-
-        if not self.inference and not skip_scaling and len(df) > 0:
-            scalers = self.cumulative_scalers if is_cumulative else self.scalers
+        if self.use_scaler and not self.inference and not skip_scaling and not is_cumulative and len(df) > 0:
             for i, col in enumerate(columns):
-                data = df[[col]].values
-                if self.split == 'train':
-                    scaled_data = scalers[i].fit_transform(data)
-                else:
-                    scaled_data = scalers[i].transform(data) if scalers[i] is not None else data
-                df[col] = scaled_data.flatten()
+                if self.scalers[i] is None:
+                    self.logger.warning(f"No scaler available for parameter {col} in Jaw_ID {jaw_id}; using unscaled data")
+                    continue
+                try:
+                    data = df[[col]].values
+                    if self.split == 'train':
+                        scaled_data = self.scalers[i].fit_transform(data)
+                    else:
+                        scaled_data = self.scalers[i].transform(data)
+                    df[col] = scaled_data.flatten()
+                except Exception as e:
+                    self.logger.error(f"Failed to scale parameter {col} for Jaw_ID {jaw_id}: {e}; using unscaled data")
+                    df[col] = df[col].values  # Revert to unscaled data
 
         return df
 
-    def _load_transformations(self, jaw_id, transform_df, cumulative_df, num_stages_df):
+    def _load_transformations(self, jaw_id, transform_df, num_stages_df):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
-        cumulative_transformations = torch.zeros(self.num_teeth, 6)
         directions = torch.ones(self.num_teeth, 6)  # Default to 1 (positive or zero)
-        type_labels = torch.zeros(self.max_stages, self.num_teeth, dtype=torch.long)
 
         num_stages_data = num_stages_df[num_stages_df["Jaw_ID"] == jaw_id]
         num_stages = min(int(clean_numeric(num_stages_data["Num_Stages"].iloc[0])), self.max_stages) if not num_stages_data.empty else self.max_stages
@@ -135,38 +149,15 @@ class JawTeethDataset(Dataset):
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
                     row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
                 ], dtype=torch.float32)
-                trans = transformations[stage, tooth_idx, :3]
-                rot = transformations[stage, tooth_idx, 3:]
-                has_trans = torch.any(trans != 0).item()
-                has_rot = torch.any(rot != 0).item()
-                if not has_trans and not has_rot:
-                    type_labels[stage, tooth_idx] = 0
-                elif has_trans and not has_rot:
-                    type_labels[stage, tooth_idx] = 1
-                elif not has_trans and has_rot:
-                    type_labels[stage, tooth_idx] = 2
-                else:
-                    type_labels[stage, tooth_idx] = 3
 
-        if cumulative_df is not None:
-            raw_values = []  # Store raw values before taking absolute
-            for _, row in cumulative_df.iterrows():
-                tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
-                raw = [
-                    row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
-                    row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
-                ]
-                raw_values.append(raw)
-                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
-                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
-            self.logger.debug(f"Extracted directions for Jaw_ID {jaw_id}: {directions.tolist()}")
-
+        # Compute cumulative transformations as sum of scaled stage-wise transformations
+        cumulative_transformations = torch.sum(transformations, dim=0)  # Sum over stages
         activity = torch.any(transformations != 0, dim=-1).float()
         param_activity = (transformations != 0).float()
         cumulative_activity = torch.any(cumulative_transformations != 0, dim=-1).float()
         cumulative_param_activity = (cumulative_transformations != 0).float()
 
-        return transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions
+        return transformations, cumulative_transformations, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions
 
     def _load_cumulative_only(self, jaw_id, cumulative_df):
         cumulative_transformations = torch.zeros(self.num_teeth, 6)
@@ -178,8 +169,24 @@ class JawTeethDataset(Dataset):
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
                     row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
                 ]
-                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
-                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+                # Apply stage-wise scaler if enabled
+                if self.use_scaler:
+                    scaled = []
+                    for i, val in enumerate(raw):
+                        if self.scalers[i] is not None:
+                            try:
+                                scaled_val = self.scalers[i].transform([[val]])[0][0]
+                            except Exception as e:
+                                self.logger.error(f"Failed to scale parameter {i} for Jaw_ID {jaw_id}: {e}; using unscaled value")
+                                scaled_val = abs(val)
+                        else:
+                            scaled_val = abs(val)
+                        scaled.append(scaled_val)
+                    cumulative_transformations[tooth_idx] = torch.tensor(scaled, dtype=torch.float32)
+                    directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+                else:
+                    cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
+                    directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
         return cumulative_transformations, directions
 
     def _preprocess_json(self, json_file, jaw_id):
@@ -235,7 +242,7 @@ class JawTeethDataset(Dataset):
         return feats if self.inference else (feats, vertices_list, faces_list)
 
     def _initialize_dataset(self):
-        self.logger.info(f"Initializing dataset for split '{self.split}'")
+        self.logger.info(f"Initializing dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}")
 
         num_stages_file = os.path.join(self.data_dir, "num_stages.xlsx")
         num_stages_df = pd.read_excel(num_stages_file, dtype={"Jaw_ID": str}) if not self.inference and os.path.exists(num_stages_file) else pd.DataFrame()
@@ -243,44 +250,35 @@ class JawTeethDataset(Dataset):
         cases = [d for d in os.listdir(self.data_dir) if os.path.isdir(os.path.join(self.data_dir, d)) and d.isdigit()]
         self.logger.info(f"Found {len(cases)} cases: {cases}")
 
-        train_val_cases, test_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
-        train_cases, val_cases = train_test_split(train_val_cases, train_size=self.train_ratio, random_state=42)
+        train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
         if self.split == 'train':
             self.cases = train_cases
-        elif self.split == 'val':
+        else:  # self.split == 'val'
             self.cases = val_cases
-        else:
-            self.cases = test_cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
-        if self.split == 'train' and not self.inference:
+        if self.split == 'train' and not self.inference and self.use_scaler:
             all_transforms = [[] for _ in range(6)]
-            all_cumulative_transforms = [[] for _ in range(6)]
             columns = [
                 "Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                 "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
             ]
             for case in train_cases:
                 transform_file = os.path.join(self.data_dir, case, "Transformations.xlsx")
-                cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
                 if os.path.exists(transform_file):
                     try:
+                        self.logger.debug(f"Loading Transformations.xlsx for case {case}: {transform_file}")
                         df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
-                        df = self._preprocess_excel(df, case, is_cumulative=False, skip_scaling=True)
+                        df = self._preprocess_excel(df, case, skip_scaling=True)
                         if df is not None and not df.empty:
                             for i, col in enumerate(columns):
                                 all_transforms[i].append(df[[col]].values)
+                        else:
+                            self.logger.warning(f"No valid data after preprocessing Transformations.xlsx for case {case}")
                     except Exception as e:
                         self.logger.error(f"Failed to load Transformations.xlsx for case {case}: {e}")
-                if os.path.exists(cumulative_file):
-                    try:
-                        df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
-                        df = self._preprocess_excel(df, case, is_cumulative=True, skip_scaling=True)
-                        if df is not None and not df.empty:
-                            for i, col in enumerate(columns):
-                                all_cumulative_transforms[i].append(df[[col]].values)
-                    except Exception as e:
-                        self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
+                else:
+                    self.logger.warning(f"Transformations.xlsx not found for case {case}: {transform_file}")
             for i in range(6):
                 if all_transforms[i]:
                     data = np.concatenate(all_transforms[i], axis=0)
@@ -292,48 +290,26 @@ class JawTeethDataset(Dataset):
                         self.logger.info(f"Saved scaler for parameter {columns[i]} to {scaler_file}")
                     except Exception as e:
                         self.logger.error(f"Failed to save scaler for parameter {columns[i]}: {e}")
+                        self.scalers[i] = None
                 else:
-                    self.logger.warning(f"No valid transformation data for parameter {columns[i]} to fit scaler")
-                    self.scalers[i] = None
-                if all_cumulative_transforms[i]:
-                    data = np.concatenate(all_cumulative_transforms[i], axis=0)
-                    self.cumulative_scalers[i].fit(data)
-                    scaler_file = os.path.join(self.cache_dir, f'cumulative_scaler_param_{i}.pkl')
-                    try:
-                        with open(scaler_file, 'wb') as f:
-                            pickle.dump(self.scalers[i], f)
-                        self.logger.info(f"Saved cumulative scaler for parameter {columns[i]} to {scaler_file}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to save scaler for parameter {columns[i]}: {e}")
-                else:
-                    self.logger.warning(f"No valid cumulative transformation data for parameter {columns[i]} to fit scaler")
-                    self.cumulative_scalers[i] = None
+                    self.logger.warning(f"No valid transformation data for parameter {columns[i]} to fit scaler; initializing default scaler")
+                    self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
         else:
             for i in range(6):
                 scaler_file = os.path.join(self.cache_dir, f'scaler_param_{i}.pkl')
-                if os.path.exists(scaler_file):
+                self.logger.debug(f"Checking scaler file: {scaler_file}")
+                if os.path.exists(scaler_file) and self.use_scaler:
                     try:
                         with open(scaler_file, 'rb') as f:
                             self.scalers[i] = pickle.load(f)
                         self.logger.info(f"Loaded scaler for parameter {i} from {scaler_file}")
                     except Exception as e:
-                        self.logger.error(f"Failed to load scaler for parameter {i}: {e}")
-                        self.scalers[i] = None
+                        self.logger.error(f"Failed to load scaler for parameter {i} from {scaler_file}: {e}")
+                        self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
                 else:
-                    self.logger.warning(f"No scaler found for parameter {i}; proceeding without scaling")
-                    self.scalers[i] = None
-                cumulative_scaler_file = os.path.join(self.cache_dir, f'cumulative_scaler_param_{i}.pkl')
-                if os.path.exists(cumulative_scaler_file):
-                    try:
-                        with open(cumulative_scaler_file, 'rb') as f:
-                            self.cumulative_scalers[i] = pickle.load(f)
-                        self.logger.info(f"Loaded cumulative scaler for parameter {i} from {cumulative_scaler_file}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to load cumulative scaler for parameter {i}: {e}")
-                        self.cumulative_scalers[i] = None
-                else:
-                    self.logger.warning(f"No cumulative scaler found for parameter {i}; proceeding without scaling")
-                    self.cumulative_scalers[i] = None
+                    if self.use_scaler:
+                        self.logger.warning(f"No scaler file found for parameter {i} at {scaler_file}; using default scaler")
+                        self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
 
         self.data = []
 
@@ -360,10 +336,15 @@ class JawTeethDataset(Dataset):
             if self.inference:
                 cumulative_df = None
                 try:
-                    cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str}) if os.path.exists(cumulative_file) else None
+                    self.logger.debug(f"Checking for cumulative file: {cumulative_file}")
+                    if os.path.exists(cumulative_file):
+                        cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        self.logger.debug(f"Loaded cumulative_transformations.xlsx for case {case}, rows: {len(cumulative_df)}")
+                    else:
+                        self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}")
                 except Exception as e:
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
-                cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
+                cumulative_data = self._preprocess_excel(cumulative_df, case) if cumulative_df is not None else None
                 cumulative_transformations, directions = self._load_cumulative_only(case, cumulative_data) if cumulative_data is not None else (torch.zeros(self.num_teeth, 6), torch.ones(self.num_teeth, 6))
                 num_stages = self.max_stages
                 feats = self._preprocess_json(json_file, case)
@@ -379,22 +360,21 @@ class JawTeethDataset(Dataset):
                 }
             else:
                 transform_df = None
-                cumulative_df = None
                 try:
-                    transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str}) if os.path.exists(transform_file) else None
+                    self.logger.debug(f"Checking for transform file: {transform_file}")
+                    if os.path.exists(transform_file):
+                        transform_df = pd.read_excel(transform_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        self.logger.debug(f"Loaded Transformations.xlsx for case {case}, rows: {len(transform_df)}")
+                    else:
+                        self.logger.warning(f"Transformations.xlsx not found for case {case}")
                 except Exception as e:
                     self.logger.error(f"Failed to load Transformations.xlsx for case {case}: {e}")
-                try:
-                    cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str}) if os.path.exists(cumulative_file) else None
-                except Exception as e:
-                    self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
 
                 transform_data = self._preprocess_excel(transform_df, case) if transform_df is not None else None
-                cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
-                transformations, cumulative_transformations, type_labels, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions = self._load_transformations(
-                    case, transform_data, cumulative_data, num_stages_df
+                transformations, cumulative_transformations, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions = self._load_transformations(
+                    case, transform_data, num_stages_df
                 )
-                feats, vertices, faces = self._preprocess_json(json_file, case)
+                feats, _,_ = self._preprocess_json(json_file, case)
                 if feats is None:
                     self.logger.warning(f"Skipping case {case}: Invalid JSON data")
                     continue
@@ -405,7 +385,6 @@ class JawTeethDataset(Dataset):
                     'cumulative_transformations': cumulative_transformations,
                     'activity': activity,
                     'param_activity': param_activity,
-                    'type_labels': type_labels,
                     'cumulative_activity': cumulative_activity,
                     'cumulative_param_activity': cumulative_param_activity,
                     'directions': directions,
@@ -435,6 +414,7 @@ class JawTeethDataset(Dataset):
                 data['directions'],
                 data['num_stages']
             )
+        
         return (
             data['jaw_id'],
             data['feats'],
@@ -442,7 +422,6 @@ class JawTeethDataset(Dataset):
             data['cumulative_transformations'],
             data['activity'],
             data['param_activity'],
-            data['type_labels'],
             data['cumulative_activity'],
             data['cumulative_param_activity'],
             data['directions'],
@@ -451,7 +430,7 @@ class JawTeethDataset(Dataset):
 
     def get_scalers(self):
         """Return the parameter-specific scalers for external use (e.g., inference)."""
-        return self.scalers, self.cumulative_scalers
+        return self.scalers
 
 class CumulativeJawTeethDataset(Dataset):
     def __init__(
@@ -464,7 +443,9 @@ class CumulativeJawTeethDataset(Dataset):
         train_ratio=0.8,
         inference=False,
         cache_dir='./cache',
-        log_file='dataset_log.txt'
+        log_file='dataset_log.txt',
+        use_scaler=True,
+        scaler_type='robust'
     ):
         self.data_dir = data_dir
         self.num_teeth = num_teeth
@@ -475,49 +456,68 @@ class CumulativeJawTeethDataset(Dataset):
         self.inference = inference
         self.cache_dir = cache_dir
         self.logger = setup_logging(log_file)
+        self.use_scaler = use_scaler
+        self.scaler_type = scaler_type.lower()
         self.FDI_TO_INDEX = {
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
         self.scaler = None
+        if self.use_scaler:
+            if self.scaler_type == 'robust':
+                self.scaler = RobustScaler()
+            elif self.scaler_type == 'standard':
+                self.scaler = StandardScaler()
+            else:
+                raise ValueError(f"Invalid scaler_type: {self.scaler_type}. Must be 'robust' or 'standard'.")
 
-        if self.split not in ['train', 'val', 'test']:
-            raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'test'.")
+        if self.split not in ['train', 'val']:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' since test cases are handled separately.")
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
 
     def _preprocess_excel(self, df, jaw_id, skip_scaling=False):
         if df is None or df.empty:
-            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel; DataFrame is None or empty")
             return None
 
+        self.logger.debug(f"Processing Excel for Jaw_ID {jaw_id}, initial rows: {len(df)}, columns: {df.columns.tolist()}")
+        
         df = df[df["Jaw_ID"] == jaw_id].copy()
+        self.logger.debug(f"After Jaw_ID filter for {jaw_id}, rows: {len(df)}")
         if df.empty:
-            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering by Jaw_ID; unique Jaw_IDs in data: {df['Jaw_ID'].unique().tolist()}")
             return None
 
         df["Tooth_ID"] = df["Tooth_ID"].astype(str).str.strip().str.replace(',', '.').str.split('.').str[0].str.extract(r'(\d+)')
+        self.logger.debug(f"After Tooth_ID processing for Jaw_ID {jaw_id}, unique Tooth_IDs: {df['Tooth_ID'].unique().tolist()}")
+        
         df = df[df["Tooth_ID"].isin(self.FDI_TO_INDEX.keys())]
+        self.logger.debug(f"After Tooth_ID filter for Jaw_ID {jaw_id}, rows: {len(df)}, valid Tooth_IDs: {df['Tooth_ID'].unique().tolist()}")
         if df.empty:
-            self.logger.warning(f"No valid Tooth_ID for Jaw_ID {jaw_id} after cleaning")
+            self.logger.warning(f"No data for Jaw_ID {jaw_id} in Excel after filtering by Tooth_ID; valid FDI keys: {list(self.FDI_TO_INDEX.keys())}")
             return None
 
         columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
                    "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
         for col in columns:
             df[col] = df[col].apply(clean_numeric)
+            df[col] = df[col].abs()  # Convert to absolute values
             df[col] = df[col].replace([float('inf'), -float('inf')], 0)
+            if (df[col] < 0).any():
+                self.logger.warning(f"Negative values detected in {col} for Jaw_ID {jaw_id} after abs(): {(df[col] < 0).sum()} instances")
 
-        if self.scaler is not None and not self.inference and not skip_scaling:
+        if self.use_scaler and self.scaler is not None and not self.inference and not skip_scaling:
             try:
                 data = df[columns]
                 scaled_data = self.scaler.transform(data)
                 df[columns] = scaled_data
-                self.logger.debug(f"Applied StandardScaler to transformations for Jaw_ID {jaw_id}")
+                self.logger.debug(f"Applied {self.scaler_type.capitalize()}Scaler to transformations for Jaw_ID {jaw_id}")
             except Exception as e:
-                self.logger.error(f"Failed to apply StandardScaler for Jaw_ID {jaw_id}: {e}")
-                return None
+                self.logger.error(f"Failed to apply {self.scaler_type.capitalize()}Scaler for Jaw_ID {jaw_id}: {e}; using unscaled data")
+        else:
+            self.logger.debug(f"No scaling applied for Jaw_ID {jaw_id}: use_scaler={self.use_scaler}, inference={self.inference}, skip_scaling={skip_scaling}")
 
         return df
 
@@ -572,61 +572,73 @@ class CumulativeJawTeethDataset(Dataset):
         return torch.stack(feats_list)
 
     def _initialize_dataset(self):
-        self.logger.info(f"Initializing cumulative dataset for split '{self.split}'")
+        self.logger.info(f"Initializing cumulative dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}")
 
         cases = [d for d in os.listdir(self.data_dir) if os.path.isdir(os.path.join(self.data_dir, d)) and d.isdigit()]
         self.logger.info(f"Found {len(cases)} cases: {cases}")
 
-        train_val_cases, test_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
-        train_cases, val_cases = train_test_split(train_val_cases, train_size=self.train_ratio, random_state=42)
+        train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
         if self.split == 'train':
             self.cases = train_cases
-        elif self.split == 'val':
+        else:  # self.split == 'val'
             self.cases = val_cases
-        else:
-            self.cases = test_cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
         scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
-        if self.split == 'train' and not self.inference:
-            self.scaler = StandardScaler()
+        self.logger.debugcrops = [[] for _ in range(6)]
+        columns = [
+            "Left/Right (mm)",
+            "Forward/Backward (mm)",
+            "Extrude/Intrude (mm)",
+            "Buccal/Lingual (degrees)",
+            "Mesial/Distal (degrees)",
+            "Rotation (degrees)"
+        ]
+        if self.split == 'train' and not self.inference and self.use_scaler:
+            self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
             all_transforms = []
-            for case in train_cases:
+            for case in self.cases:
                 cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
                 if os.path.exists(cumulative_file):
                     try:
+                        self.logger.debug(f"Loading cumulative_transformations.xlsx for case {case}: {cumulative_file}")
                         df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        self.logger.debug(f"Loaded cumulative_transformations.xlsx for case {case}, rows: {len(df)}")
                         df = self._preprocess_excel(df, case, skip_scaling=True)
                         if df is not None and not df.empty:
-                            columns = ["Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
-                                       "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"]
                             all_transforms.append(df[columns])
+                        else:
+                            self.logger.warning(f"No valid data after preprocessing cumulative_transformations.xlsx for case {case}")
                     except Exception as e:
                         self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
+                else:
+                    self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}: {cumulative_file}")
             if all_transforms:
                 all_transforms = pd.concat(all_transforms, ignore_index=True)
-                self.scaler.fit(all_transforms)
                 try:
+                    self.scaler.fit(all_transforms)
                     with open(scaler_file, 'wb') as f:
                         pickle.dump(self.scaler, f)
-                    self.logger.info(f"Saved StandardScaler to {scaler_file}")
+                    self.logger.info(f"Saved {self.scaler_type.capitalize()}Scaler to {scaler_file}")
                 except Exception as e:
-                    self.logger.error(f"Failed to save StandardScaler: {e}")
+                    self.logger.error(f"Failed to fit or save {self.scaler_type.capitalize()}Scaler: {e}")
+                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
             else:
-                self.logger.warning("No valid transformation data to fit StandardScaler")
-                self.scaler = None
+                self.logger.warning(f"No valid transformation data to fit {self.scaler_type.capitalize()}Scaler; using default scaler")
+                self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
         else:
-            if os.path.exists(scaler_file):
+            if os.path.exists(scaler_file) and self.use_scaler:
                 try:
                     with open(scaler_file, 'rb') as f:
                         self.scaler = pickle.load(f)
-                    self.logger.info(f"Loaded StandardScaler from {scaler_file}")
+                    self.logger.info(f"Loaded {self.scaler_type.capitalize()}Scaler from {scaler_file}")
                 except Exception as e:
-                    self.logger.error(f"Failed to load StandardScaler: {e}")
-                    self.scaler = None
+                    self.logger.error(f"Failed to load {self.scaler_type.capitalize()}Scaler from {scaler_file}: {e}")
+                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
             else:
-                self.logger.warning("No StandardScaler found; proceeding without scaling")
-                self.scaler = None
+                if self.use_scaler:
+                    self.logger.warning(f"No {self.scaler_type.capitalize()}Scaler file found at {scaler_file}; using default scaler")
+                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
 
         self.data = []
 
@@ -652,7 +664,12 @@ class CumulativeJawTeethDataset(Dataset):
             cumulative_df = None
             if not self.inference:
                 try:
-                    cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str}) if os.path.exists(cumulative_file) else None
+                    self.logger.debug(f"Checking for cumulative file: {cumulative_file}")
+                    if os.path.exists(cumulative_file):
+                        cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        self.logger.debug(f"Loaded cumulative_transformations.xlsx for case {case}, rows: {len(cumulative_df)}")
+                    else:
+                        self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}")
                 except Exception as e:
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
 

@@ -37,11 +37,7 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
     stage_activity_loss_fn = StageActivityLoss(weight=args.w_stage_activity).to(device)
     
-    transforms_sequence = torch.clamp(transforms_sequence, -40, 40)
-    
-    # logger.debug(f"Transforms sequence min: {transforms_sequence.min().item():.4f}, max: {transforms_sequence.max().item():.4f}, has_nan: {torch.isnan(transforms_sequence).any().item()}")
-    # if stage_weights is not None:
-    #     logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
+    transforms_sequence = torch.clamp(transforms_sequence, 0, 40)
     
     loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1))
     loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
@@ -93,7 +89,9 @@ def train(args):
         split='train',
         train_ratio=args.train_ratio,
         cache_dir=args.cache_dir,
-        log_file=args.log_file
+        log_file=args.log_file,
+        use_scaler=args.use_scaler,
+        scaler_type=args.scaler_type
     )
     val_dataset = JawTeethDataset(
         data_dir=args.data_dir,
@@ -104,7 +102,9 @@ def train(args):
         split='val',
         train_ratio=args.train_ratio,
         cache_dir=args.cache_dir,
-        log_file=args.log_file
+        log_file=args.log_file,
+        use_scaler=args.use_scaler,
+        scaler_type=args.scaler_type
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -251,9 +251,9 @@ def train(args):
         train_f1_stage_activity = []
         total_tf_count = 0.0
 
-        for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages) in enumerate(train_loader):
-            feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages = [
-                x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages]
+        for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages) in enumerate(train_loader):
+            feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages = [
+                x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages]
             ]
             logger.debug(f"Batch {batch_idx} shapes: feats={feats.shape}, transforms={transforms.shape}, cumulative_transforms={cumulative_transforms.shape}, directions={directions.shape}, num_stages={num_stages}")
             
@@ -304,13 +304,12 @@ def train(args):
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, MSE: {losses['loss_mse'].item():.4f}, "
                             f"Activity: {losses['loss_activity'].item():.4f}, Param Activity: {losses['loss_param_activity'].item():.4f}, "
-                            f"Padded: {losses['padded_loss'].item():.4f}, "
+                            f"Padded Loss: {losses['padded_loss'].item():.4f}, "
                             f"Consistency: {losses['consistency_loss'].item():.4f}, "
                             f"Stage Activity: {losses['loss_stage_activity'].item():.4f}, "
                             f"F1 Activity: {f1_activity.item():.4f}, F1 Param Activity: {f1_param_activity.item():.4f}, "
                             f"F1 Stage Activity: {f1_stage_activity.item():.4f}, TF Count: {tf_count}")
 
-        # Calculate teacher forcing percentage
         total_possible_tf_instances = args.num_teeth * (args.max_stages - 1) * args.batch_size * len(train_loader)
         tf_percentage = (total_tf_count / total_possible_tf_instances) * 100 if total_possible_tf_instances > 0 else 0.0
         logger.info(f"Epoch {epoch+1}/{args.epochs}, Teacher Forcing Usage: {tf_percentage:.2f}%")
@@ -332,7 +331,7 @@ def train(args):
         train_loss_history['loss_activity'].append(train_losses['loss_activity'])
         train_loss_history['loss_param_activity'].append(train_losses['loss_param_activity'])
         train_loss_history['padded_loss'].append(train_losses['padded_loss'])
-        train_loss_history['consistency_loss'].append(train_losses['consistency_loss'])
+        train_loss_history['consistency_loss'].append(train_losses['consistency'])
         train_loss_history['loss_stage_activity'].append(train_losses['loss_stage_activity'])
         train_loss_history['mean_f1_activity'].append(mean_train_f1_activity)
         train_loss_history['mean_f1_param_activity'].append(mean_train_f1_param_activity)
@@ -353,9 +352,9 @@ def train(args):
         val_f1_stage_activity = []
 
         with torch.no_grad():
-            for jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages in val_loader:
-                feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages = [
-                    x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, type_labels, cumulative_activity, cumulative_param_activity, directions, num_stages]
+            for jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages in val_loader:
+                feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages = [
+                    x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages]
                 ]
 
                 outputs = model(
@@ -515,14 +514,12 @@ if __name__ == "__main__":
     parser.add_argument('--w_activity', type=float, default=1.0, help='Weight for activity loss')
     parser.add_argument('--w_param_activity', type=float, default=1.0, help='Weight for param activity loss')
     parser.add_argument('--w_padded', type=float, default=0.5, help='Weight for padded loss')
-    parser.add_argument('--w_consistency', type=float, default=0.5, help='Weight for consistency loss')
+    parser.add_argument('--w_consistency', type=float, default=0.0, help='Weight for consistency loss')
     parser.add_argument('--w_stage_activity', type=float, default=1.0, help='Weight for stage activity loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'],
-                        help='Optimizer type')
-    parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizers')
-    parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'],
-                        help='Learning rate scheduler type')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'], help='Optimizer type')
+    parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizer')
+    parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'], help='Learning rate scheduler type')
     parser.add_argument('--scheduler_eta_min', type=float, default=0.0, help='Minimum learning rate for CosineAnnealing')
     parser.add_argument('--scheduler_factor', type=float, default=0.5, help='Factor for ReduceLROnPlateau')
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau')
@@ -534,6 +531,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_focal_loss', type=bool, default=True, help='Use focal loss for activity losses')
     parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha parameter for focal loss')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+    parser.add_argument('--use_scaler', type=bool, default=False, help='Whether to apply scaler to transformations')
+    parser.add_argument('--scaler_type', type=str, default='robust', choices=['robust', 'standard'], help='Type of scaler (robust or standard)')
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
