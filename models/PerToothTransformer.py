@@ -71,14 +71,14 @@ class PerToothTransformerDecoder(nn.Module):
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         
-        # Stage weights MLP
-        self.stage_index_embed = nn.Parameter(torch.zeros(max_stages, embed_dim // 4))
-        self.stage_weights_mlp = nn.Sequential(
-            nn.Linear(embed_dim // 4, embed_dim // 8),
-            nn.GELU(),
-            nn.Linear(embed_dim // 8, 1)
-        )
-        self.stage_weight_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scale
+        # # Stage weights MLP
+        # self.stage_index_embed = nn.Parameter(torch.zeros(max_stages, embed_dim // 4))
+        # self.stage_weights_mlp = nn.Sequential(
+        #     nn.Linear(embed_dim // 4, embed_dim // 8),
+        #     nn.GELU(),
+        #     nn.Linear(embed_dim // 8, 1)
+        # )
+        # self.stage_weight_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scale
         
         # Gradient scaling factor
         self.grad_scale = 0.1
@@ -117,13 +117,13 @@ class PerToothTransformerDecoder(nn.Module):
         
         return tf_prob
 
-    def _get_stage_weights(self):
-        # Compute stage weights using MLP
-        stage_indices = self.stage_index_embed  # Shape: (max_stages, embed_dim // 4)
-        stage_weights = self.stage_weights_mlp(stage_indices)  # Shape: (max_stages, 1)
-        stage_weights = stage_weights.view(1, self.max_stages, 1, 1)  # Shape: (1, max_stages, 1, 1)
-        stage_weights = torch.softmax(stage_weights, dim=1)  # Normalize across stages
-        return stage_weights
+    # def _get_stage_weights(self):
+    #     # Compute stage weights using MLP
+    #     stage_indices = self.stage_index_embed  # Shape: (max_stages, embed_dim // 4)
+    #     stage_weights = self.stage_weights_mlp(stage_indices)  # Shape: (max_stages, 1)
+    #     stage_weights = stage_weights.view(1, self.max_stages, 1, 1)  # Shape: (1, max_stages, 1, 1)
+    #     stage_weights = torch.softmax(stage_weights, dim=1)  # Normalize across stages
+    #     return stage_weights
 
     def forward(self, memory, cumulative_transforms, directions=None, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
@@ -334,88 +334,88 @@ class PerToothTransformerDecoder(nn.Module):
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
 
-        # Residual adjustment per tooth and parameter
-        stage_weights = self._get_stage_weights()  # Shape: (1, max_stages, 1, 1)
-        logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
-        # print(stage_weights)
-        # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
-        stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)  # Shape: (B, 25, 1, 1)
-        if training and num_stages is not None:
-            for i in range(B):
-                stage_mask[i, num_stages[i]:] = 0.0
-        else:
-            stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # (B, 25, 1, 1)
-            stage_mask = stage_mask * stage_activity_mask  # Shape: (B, 25, 1, 1)
+        # # Residual adjustment per tooth and parameter
+        # stage_weights = self._get_stage_weights()  # Shape: (1, max_stages, 1, 1)
+        # logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
+        # # print(stage_weights)
+        # # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
+        # stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)  # Shape: (B, 25, 1, 1)
+        # if training and num_stages is not None:
+        #     for i in range(B):
+        #         stage_mask[i, num_stages[i]:] = 0.0
+        # else:
+        #     stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # (B, 25, 1, 1)
+        #     stage_mask = stage_mask * stage_activity_mask  # Shape: (B, 25, 1, 1)
 
-        # Validate stage_mask shape
-        if stage_mask.shape != (B, self.max_stages, 1, 1):
-            logger.error(f"Invalid stage_mask shape: got {stage_mask.shape}, expected {(B, self.max_stages, 1, 1)}")
-            raise RuntimeError("stage_mask shape mismatch")
+        # # Validate stage_mask shape
+        # if stage_mask.shape != (B, self.max_stages, 1, 1):
+        #     logger.error(f"Invalid stage_mask shape: got {stage_mask.shape}, expected {(B, self.max_stages, 1, 1)}")
+        #     raise RuntimeError("stage_mask shape mismatch")
 
-        # Log shapes for debugging
-        logger.debug(f"Residual adjustment shapes: stage_weights={stage_weights.shape}, stage_mask={stage_mask.shape}, "
-                     f"param_activity_masks={param_activity_masks.shape}")
+        # # Log shapes for debugging
+        # logger.debug(f"Residual adjustment shapes: stage_weights={stage_weights.shape}, stage_mask={stage_mask.shape}, "
+        #              f"param_activity_masks={param_activity_masks.shape}")
 
-        # Initialize adjustment tensor
-        adjustment = torch.zeros_like(transforms_sequence)
-        # Parameter-specific clamping: translations (mm), rotations (degrees)
-        clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=device)  # Translations, rotations
-        clamp_ranges_adjustment = torch.tensor([0.5, 0.5, 0.5, 6.0, 6.0, 6.0], device=device)  # Relaxed clamping
-        for tooth_idx in range(self.num_teeth):
-            for param_idx in range(6):
-                masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
-                # Validate masked_preds shape
-                if masked_preds.shape != (B, self.max_stages):
-                    logger.error(f"masked_preds shape {masked_preds.shape} does not match expected {(B, self.max_stages)}")
-                    raise RuntimeError("masked_preds shape mismatch")
+        # # Initialize adjustment tensor
+        # adjustment = torch.zeros_like(transforms_sequence)
+        # # Parameter-specific clamping: translations (mm), rotations (degrees)
+        # clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=device)  # Translations, rotations
+        # clamp_ranges_adjustment = torch.tensor([0.5, 0.5, 0.5, 6.0, 6.0, 6.0], device=device)  # Relaxed clamping
+        # for tooth_idx in range(self.num_teeth):
+        #     for param_idx in range(6):
+        #         masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
+        #         # Validate masked_preds shape
+        #         if masked_preds.shape != (B, self.max_stages):
+        #             logger.error(f"masked_preds shape {masked_preds.shape} does not match expected {(B, self.max_stages)}")
+        #             raise RuntimeError("masked_preds shape mismatch")
                 
-                pred_sum = masked_preds.sum(dim=1)  # Shape: (B,)
-                residual = cumulative_transforms[:, tooth_idx, param_idx] - pred_sum  # Shape: (B,)
+        #         pred_sum = masked_preds.sum(dim=1)  # Shape: (B,)
+        #         residual = cumulative_transforms[:, tooth_idx, param_idx] - pred_sum  # Shape: (B,)
                 
-                # Ensure residual is (B,)
-                residual = residual.view(B)  # Explicitly reshape to (B,)
-                if residual.shape != (B,):
-                    logger.error(f"Residual shape {residual.shape} does not match expected (B,)=({B},)")
-                    raise RuntimeError("Residual shape mismatch")
+        #         # Ensure residual is (B,)
+        #         residual = residual.view(B)  # Explicitly reshape to (B,)
+        #         if residual.shape != (B,):
+        #             logger.error(f"Residual shape {residual.shape} does not match expected (B,)=({B},)")
+        #             raise RuntimeError("Residual shape mismatch")
 
-                # Log shapes for debugging
-                logger.debug(f"Shapes for tooth {tooth_idx} param {param_idx}: "
-                             f"masked_preds={masked_preds.shape}, "
-                             f"cumulative_transforms[:, {tooth_idx}, {param_idx}]={cumulative_transforms[:, tooth_idx, param_idx].shape}, "
-                             f"pred_sum={pred_sum.shape}, residual={residual.shape}")
+        #         # Log shapes for debugging
+        #         logger.debug(f"Shapes for tooth {tooth_idx} param {param_idx}: "
+        #                      f"masked_preds={masked_preds.shape}, "
+        #                      f"cumulative_transforms[:, {tooth_idx}, {param_idx}]={cumulative_transforms[:, tooth_idx, param_idx].shape}, "
+        #                      f"pred_sum={pred_sum.shape}, residual={residual.shape}")
 
-                residual = torch.clamp(residual, -clamp_ranges_residual[param_idx], clamp_ranges_residual[param_idx])
-                residual_expanded = residual.unsqueeze(1).unsqueeze(-1).expand(B, self.max_stages, 1)  # Shape: (B, 25, 1)
+        #         residual = torch.clamp(residual, -clamp_ranges_residual[param_idx], clamp_ranges_residual[param_idx])
+        #         residual_expanded = residual.unsqueeze(1).unsqueeze(-1).expand(B, self.max_stages, 1)  # Shape: (B, 25, 1)
                 
-                # Log residual_expanded shape
-                logger.debug(f"residual_expanded shape for tooth {tooth_idx} param {param_idx}: {residual_expanded.shape}")
+        #         # Log residual_expanded shape
+        #         logger.debug(f"residual_expanded shape for tooth {tooth_idx} param {param_idx}: {residual_expanded.shape}")
                 
-                param_mask = param_activity_masks[:, :, tooth_idx, param_idx].unsqueeze(-1)  # Shape: (B, 25, 1)
-                logger.debug(f"param_mask shape for tooth {tooth_idx} param {param_idx}: {param_mask.shape}")
-                if param_mask.sum(dim=1).eq(0).any():
-                    logger.debug(f"No active stages for tooth {tooth_idx} param {param_idx}, skipping adjustment")
-                    continue
-                residual_expanded_4d = residual_expanded.unsqueeze(-1)  # (B, 25, 1, 1)
-                param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
-                stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d * self.stage_weight_scale
+        #         param_mask = param_activity_masks[:, :, tooth_idx, param_idx].unsqueeze(-1)  # Shape: (B, 25, 1)
+        #         logger.debug(f"param_mask shape for tooth {tooth_idx} param {param_idx}: {param_mask.shape}")
+        #         if param_mask.sum(dim=1).eq(0).any():
+        #             logger.debug(f"No active stages for tooth {tooth_idx} param {param_idx}, skipping adjustment")
+        #             continue
+        #         residual_expanded_4d = residual_expanded.unsqueeze(-1)  # (B, 25, 1, 1)
+        #         param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
+        #         stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d * self.stage_weight_scale
 
-                logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
-                stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
+        #         logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
+        #         stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
                 
-                adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1).squeeze(-1)  # (B, 25)
+        #         adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1).squeeze(-1)  # (B, 25)
                 
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Residual tooth {tooth_idx} param {param_idx}: "
-                                 f"residual_mean={residual.mean().item():.4f}, "
-                                 f"adjustment_mean={stage_adjustment.mean().item():.4f}, "
-                                 f"pred_sum_mean={pred_sum.mean().item():.4f}")
+        #         if logger.isEnabledFor(logging.DEBUG):
+        #             logger.debug(f"Residual tooth {tooth_idx} param {param_idx}: "
+        #                          f"residual_mean={residual.mean().item():.4f}, "
+        #                          f"adjustment_mean={stage_adjustment.mean().item():.4f}, "
+        #                          f"pred_sum_mean={pred_sum.mean().item():.4f}")
 
-        # Apply adjustment to transforms_sequence
-        transforms_sequence = transforms_sequence + adjustment
+        # # Apply adjustment to transforms_sequence
+        # transforms_sequence = transforms_sequence + adjustment
 
-        # Log overall adjustment statistics
-        logger.debug(f"Residual adjustment: mean={adjustment.mean().item():.4f}, max={adjustment.max().item():.4f}, "
-                     f"min={adjustment.min().item():.4f}")
+        # # Log overall adjustment statistics
+        # logger.debug(f"Residual adjustment: mean={adjustment.mean().item():.4f}, max={adjustment.max().item():.4f}, "
+        #              f"min={adjustment.min().item():.4f}")
 
         # Post-adjustment validation check
         # if training:
