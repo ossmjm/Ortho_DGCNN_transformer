@@ -148,7 +148,7 @@ class JawTeethDataset(Dataset):
                 stage = int(row["Stage"]) - 1
                 transformations[stage, tooth_idx] = torch.tensor([
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
-                    "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
+                    row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
                 ], dtype=torch.float32)
 
         if cumulative_df is not None:
