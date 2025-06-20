@@ -14,7 +14,7 @@ class PerToothTransformerDecoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))
         self.target_embed = nn.Linear(6, embed_dim)
         self.cumulative_embed = nn.Linear(6, embed_dim)
-        # self.direction_embed = nn.Linear(6, embed_dim)  # Embed binary directions
+        self.direction_embed = nn.Linear(6, embed_dim)
         self.activity_target_embed = nn.Linear(1, embed_dim)
         self.param_activity_target_embed = nn.Linear(6, embed_dim)
         
@@ -22,7 +22,7 @@ class PerToothTransformerDecoder(nn.Module):
         self.target_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.param_activity_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.direction_norm = nn.LayerNorm(embed_dim, eps=1e-5)  # Norm for direction embeddings
+        self.direction_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         
         # Cross-tooth attention
         self.cross_tooth_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.2, batch_first=True)
@@ -49,36 +49,33 @@ class PerToothTransformerDecoder(nn.Module):
             nn.TransformerDecoder(decoder_layer, num_layers=num_layers) for _ in range(num_teeth)
         ])
 
-        # Simplified MLP heads
+        # Enhanced MLP heads
         self.stage_activity_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 64), nn.GELU(),
-            nn.Linear(64, 1)
+            nn.Linear(embed_dim, 256), nn.GELU(),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(128, 1)
         )
         self.activity_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 64), nn.GELU()
+            nn.Linear(embed_dim, 256), nn.GELU(),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(128, 64), nn.GELU()
         )
         self.param_activity_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 64), nn.GELU()
+            nn.Linear(embed_dim, 256), nn.GELU(),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(128, 64), nn.GELU()
         )
         self.transform_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(embed_dim, 256), nn.GELU(),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(128, 64), nn.GELU(),
+            nn.Linear(64, 6), nn.ReLU()
         )
 
         self.activity_head = nn.Linear(64, 1)
         self.param_activity_head = nn.Linear(64, 6)
-        self.out_layer = nn.Linear(32, 6)
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        
-        # # Stage weights MLP
-        # self.stage_index_embed = nn.Parameter(torch.zeros(max_stages, embed_dim // 4))
-        # self.stage_weights_mlp = nn.Sequential(
-        #     nn.Linear(embed_dim // 4, embed_dim // 8),
-        #     nn.GELU(),
-        #     nn.Linear(embed_dim // 8, 1)
-        # )
-        # self.stage_weight_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scale
         
         # Gradient scaling factor
         self.grad_scale = 0.1
@@ -88,25 +85,21 @@ class PerToothTransformerDecoder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.05)
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
-                if m is self.stage_weight_scale:
-                    nn.init.constant_(m, 1.0)
-                elif m is self.stage_index_embed:
-                    nn.init.trunc_normal_(m, mean=0.0, std=0.02)
-                else:
-                    nn.init.trunc_normal_(m, std=0.01)
+                nn.init.trunc_normal_(m, std=0.01)
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
         for attn in [self.cross_tooth_attention, self.prev_targets_attention, self.cumulative_attention]:
-            nn.init.xavier_uniform_(attn.out_proj.weight, gain=0.05)
+            nn.init.xavier_uniform_(attn.out_proj.weight, gain=1.0)
             if attn.out_proj.bias is not None:
                 nn.init.zeros_(attn.out_proj.bias)
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
+        logger = logging.getLogger('TrainLogger')
         if val_loss is not None:
             normalized_loss = 1 - torch.exp(torch.tensor(-val_loss / 2.0))
             tf_prob = base_tf_prob * normalized_loss.item()
@@ -114,18 +107,10 @@ class PerToothTransformerDecoder(nn.Module):
         else:
             progress = epoch / total_epochs
             tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
-        
+        logger.debug(f"Teacher forcing prob: epoch={epoch}, stage_idx={stage_idx}, tf_prob={tf_prob:.4f}")
         return tf_prob
 
-    # def _get_stage_weights(self):
-    #     # Compute stage weights using MLP
-    #     stage_indices = self.stage_index_embed  # Shape: (max_stages, embed_dim // 4)
-    #     stage_weights = self.stage_weights_mlp(stage_indices)  # Shape: (max_stages, 1)
-    #     stage_weights = stage_weights.view(1, self.max_stages, 1, 1)  # Shape: (1, max_stages, 1, 1)
-    #     stage_weights = torch.softmax(stage_weights, dim=1)  # Normalize across stages
-    #     return stage_weights
-
-    def forward(self, memory, cumulative_transforms, directions=None, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=False, training=False, epoch=0, total_epochs=100, val_loss=None):
+    def forward(self, memory, cumulative_transforms, directions=None, num_stages=None, targets=None, activity_targets=None, param_activity_targets=None, use_teacher_forcing=True, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
         device = memory.device
@@ -152,11 +137,6 @@ class PerToothTransformerDecoder(nn.Module):
             padding = torch.zeros(B, self.max_stages - param_activity_targets.shape[1], self.num_teeth, 6, device=device)
             param_activity_targets = torch.cat([param_activity_targets, padding], dim=1)
 
-        # Validate cumulative_transforms shape
-        if cumulative_transforms.shape != (B, self.num_teeth, 6):
-            logger.error(f"Invalid cumulative_transforms shape: got {cumulative_transforms.shape}, expected {(B, self.num_teeth, 6)}")
-            raise RuntimeError("cumulative_transforms shape mismatch")
-
         # Log input shapes for debugging
         logger.debug(f"Input shapes: memory={memory.shape}, cumulative_transforms={cumulative_transforms.shape}, "
                      f"directions={directions.shape if directions is not None else None}, "
@@ -178,9 +158,9 @@ class PerToothTransformerDecoder(nn.Module):
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
         cumulative_embed = cumulative_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
 
-        # direction_embed = self.direction_embed(directions.float()) if directions is not None else torch.zeros(B, self.num_teeth, self.embed_dim, device=device)
-        # direction_embed = self.direction_norm(direction_embed)
-        # direction_embed = direction_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
+        direction_embed = self.direction_embed(directions.float()) if directions is not None else torch.zeros(B, self.num_teeth, self.embed_dim, device=device)
+        direction_embed = self.direction_norm(direction_embed)
+        direction_embed = direction_embed.unsqueeze(1).expand(-1, self.max_stages, -1, -1)
 
         transforms_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, device=device)
@@ -196,23 +176,28 @@ class PerToothTransformerDecoder(nn.Module):
         # Initialize teacher forcing counter
         tf_count = 0
 
+        # Collect tooth outputs for stage activity
+        tooth_outputs = []
+
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
+                # Simplified teacher forcing logic
                 tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
                 effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
-                use_tf = training and stage_idx > 0 and stage_idx < num_stages.min().item() and (torch.rand(1, device=device) < effective_tf_prob).item() if num_stages is not None else False
-                # Increment teacher forcing counter
+                batch_tf_mask = (stage_idx > 0) & (stage_idx <= num_stages) & (torch.rand(B, device=device) < effective_tf_prob) if num_stages is not None else torch.zeros(B, dtype=torch.bool, device=device)
+                use_tf = training and batch_tf_mask.any().item()
                 if use_tf:
-                    tf_count += 1
+                    tf_count += batch_tf_mask.sum().item()
+                    logger.debug(f"Applying teacher forcing for tooth {tooth_idx}, stage {stage_idx}, batch_tf_mask={batch_tf_mask.sum().item()}/{B}")
 
-                start_idx = 0  # Use all previous stages
+                start_idx = 0
                 if use_tf and targets is not None:
                     targets_prev = targets[:, start_idx:stage_idx, tooth_idx, :]  # Shape: (B, stage_idx, 6)
                     embedded_target = self.target_embed(targets_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_target = self.target_norm(embedded_target)
                     if embedded_target.isnan().any():
-                        logger.warning("NaN detected in embedded_target, replacing with zeros")
+                        logger.warning(f"NaN in embedded_target for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                         embedded_target = torch.zeros_like(embedded_target)
                     embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
                     embedded_target = embedded_target.squeeze(1).clamp(0, 30)
@@ -223,59 +208,59 @@ class PerToothTransformerDecoder(nn.Module):
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_target = self.target_norm(embedded_target)
                         if embedded_target.isnan().any():
-                            logger.warning("NaN detected in embedded_target, replacing with zeros")
+                            logger.warning(f"NaN in embedded_target for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                             embedded_target = torch.zeros_like(embedded_target)
                         embedded_target, _ = self.prev_targets_attention(query, embedded_target, embedded_target)
                         embedded_target = embedded_target.squeeze(1).clamp(0, 30)
 
                 if use_tf and activity_targets is not None:
-                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)  # Shape: (B, stage_idx, 1)
+                    activity_prev = activity_targets[:, start_idx:stage_idx, tooth_idx].unsqueeze(-1)
                     embedded_activity = self.activity_target_embed(activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_activity = self.activity_norm(embedded_activity)
                     if embedded_activity.isnan().any():
-                        logger.warning("NaN detected in embedded_activity, replacing with zeros")
+                        logger.warning(f"NaN in embedded_activity for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                         embedded_activity = torch.zeros_like(embedded_activity)
                     embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
                     embedded_activity = embedded_activity.squeeze(1).clamp(0, 30)
                 else:
                     predicted_activity_prev = torch.stack(prev_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 1, device=device)
                     embedded_activity = self.activity_target_embed(predicted_activity_prev.float() if predicted_activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
-                    if predicted_activity_prev.shape[1] > 0:
+                    if predicted_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_activity = self.activity_norm(embedded_activity)
                         if embedded_activity.isnan().any():
-                            logger.warning("NaN detected in embedded_activity, replacing with zeros")
+                            logger.warning(f"NaN in embedded_activity for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                             embedded_activity = torch.zeros_like(embedded_activity)
                         embedded_activity, _ = self.prev_targets_attention(query, embedded_activity, embedded_activity)
                         embedded_activity = embedded_activity.squeeze(1).clamp(0, 30)
 
                 if use_tf and param_activity_targets is not None:
-                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]  # Shape: (B, stage_idx, 6)
+                    param_activity_prev = param_activity_targets[:, start_idx:stage_idx, tooth_idx, :]
                     embedded_param_activity = self.param_activity_target_embed(param_activity_prev)
                     query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                     embedded_param_activity = self.param_activity_norm(embedded_param_activity)
                     if embedded_param_activity.isnan().any():
-                        logger.warning("NaN detected in embedded_param_activity, replacing with zeros")
+                        logger.warning(f"NaN in embedded_param_activity for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                         embedded_param_activity = torch.zeros_like(embedded_param_activity)
                     embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
                     embedded_param_activity = embedded_param_activity.squeeze(1).clamp(0, 30)
                 else:
                     predicted_param_activity_prev = torch.stack(prev_param_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
-                    embedded_param_activity = self.param_activity_target_embed(predicted_param_activity_prev.float() if predicted_param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
-                    if predicted_param_activity_prev.shape[1] > 0:
+                    embedded_param_activity = self.param_activity_target_embed(predicted_param_activity_prev.float() if predicted_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    if predicted_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_param_activity = self.param_activity_norm(embedded_param_activity)
                         if embedded_param_activity.isnan().any():
-                            logger.warning("NaN detected in embedded_param_activity, replacing with zeros")
+                            logger.warning(f"NaN in embedded_param_activity for tooth {tooth_idx}, stage {stage_idx}, replacing with zeros")
                             embedded_param_activity = torch.zeros_like(embedded_param_activity)
                         embedded_param_activity, _ = self.prev_targets_attention(query, embedded_param_activity, embedded_param_activity)
                         embedded_param_activity = embedded_param_activity.squeeze(1).clamp(0, 30)
 
                 pos_embed = self.pos_embed[:, stage_idx, :]
                 cum_embed = cumulative_embed[:, stage_idx, tooth_idx, :]
-                # dir_embed = direction_embed[:, stage_idx, tooth_idx, :]
-                tgt = embedded_target + 0.1 * embedded_activity + 0.1 * embedded_param_activity + pos_embed + cum_embed
+                dir_embed = direction_embed[:, stage_idx, tooth_idx, :]
+                tgt = embedded_target + 0.1 * embedded_activity + 0.1 * embedded_param_activity + pos_embed + cum_embed + 0.1 * dir_embed
                 tgt = self.pre_norm(tgt.unsqueeze(1))
 
                 tgt = self.pre_cumulative_norm(tgt)
@@ -287,17 +272,15 @@ class PerToothTransformerDecoder(nn.Module):
                 output = self.tooth_decoders[tooth_idx](tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
                 output = self.final_norm(output.squeeze(1))
 
-                if tooth_idx == 0:
-                    stage_activity_logit = self.stage_activity_mlp(output).squeeze(-1)
-                    stage_activity_logits[:, stage_idx] = stage_activity_logit
+                tooth_outputs.append(output)  # Collect for stage activity
 
                 activity_mlp_out = self.activity_mlp(output)
                 param_activity_mlp_out = self.param_activity_mlp(output)
-                transform_mlp_out = self.transform_mlp(output)
+                transforms = self.transform_mlp(output)
+                transforms = torch.nan_to_num(transforms, nan=0.0, posinf=1.0, neginf=0.0)  # Ensure numerical stability
 
                 activity_logit = self.activity_head(activity_mlp_out).squeeze(-1)
                 param_activity_logit = self.param_activity_head(param_activity_mlp_out)
-                transforms = self.out_layer(transform_mlp_out)
 
                 activity_mask = torch.sigmoid(activity_logit) > 0.5
                 activity_logits[:, stage_idx, tooth_idx] = activity_logit
@@ -313,124 +296,43 @@ class PerToothTransformerDecoder(nn.Module):
                 prev_activity_seq[stage_idx] = activity_logit.detach().unsqueeze(-1)
                 prev_param_activity_seq[stage_idx] = param_activity_logit.detach()
 
-                if use_tf and stage_idx < self.max_stages - 1:
-                    if targets is not None:
-                        prev_transform_seq[stage_idx] = targets[:, stage_idx, tooth_idx, :].detach()
-                    if activity_targets is not None:
-                        prev_activity_seq[stage_idx] = activity_targets[:, stage_idx, tooth_idx].unsqueeze(-1).detach()
-                    if param_activity_targets is not None:
-                        prev_param_activity_seq[stage_idx] = param_activity_targets[:, stage_idx, tooth_idx, :].detach()
+                # Teacher forcing update using non-inplace operation
+                if use_tf and stage_idx < self.max_stages - 1 and targets is not None:
+                    tf_updates = targets[batch_tf_mask, stage_idx, tooth_idx, :].detach()
+                    new_transform_seq = prev_transform_seq[stage_idx].clone()
+                    new_transform_seq[batch_tf_mask] = tf_updates
+                    prev_transform_seq[stage_idx] = new_transform_seq
+                if use_tf and stage_idx < self.max_stages - 1 and activity_targets is not None:
+                    tf_updates = activity_targets[batch_tf_mask, stage_idx, tooth_idx].unsqueeze(-1).detach()
+                    new_activity_seq = prev_activity_seq[stage_idx].clone()
+                    new_activity_seq[batch_tf_mask] = tf_updates
+                    prev_activity_seq[stage_idx] = new_activity_seq
+                if use_tf and stage_idx < self.max_stages - 1 and param_activity_targets is not None:
+                    tf_updates = param_activity_targets[batch_tf_mask, stage_idx, tooth_idx, :].detach()
+                    new_param_activity_seq = prev_param_activity_seq[stage_idx].clone()
+                    new_param_activity_seq[batch_tf_mask] = tf_updates
+                    prev_param_activity_seq[stage_idx] = new_param_activity_seq
+
+            # Compute stage_activity_logits after processing all teeth for the stage
+            if tooth_outputs:
+                stage_output = torch.stack(tooth_outputs[-self.num_teeth:], dim=1)  # Shape: (B, num_teeth, embed_dim)
+                stage_output = stage_output.mean(dim=1)  # Aggregate across teeth: (B, embed_dim)
+                stage_activity_logit = self.stage_activity_mlp(stage_output).squeeze(-1)
+                stage_activity_logits[:, stage_idx] = stage_activity_logit
 
         # Validate transforms_sequence shape
         if transforms_sequence.shape != (B, self.max_stages, self.num_teeth, 6):
             logger.error(f"Invalid transforms_sequence shape: got {transforms_sequence.shape}, expected {(B, self.max_stages, self.num_teeth, 6)}")
             raise RuntimeError("transforms_sequence shape mismatch")
 
-        stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)
-        transforms_sequence = transforms_sequence * stage_activity_mask
-        activity_logits = activity_logits * stage_activity_mask.squeeze(-1)
-        param_activity_logits = param_activity_logits * stage_activity_mask
-
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
         transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
 
-        # # Residual adjustment per tooth and parameter
-        # stage_weights = self._get_stage_weights()  # Shape: (1, max_stages, 1, 1)
-        # logger.debug(f"Stage weights mean: {stage_weights.mean().item():.4f}, std: {stage_weights.std().item():.4f}")
-        # # print(stage_weights)
-        # # Dynamic stage_mask: use num_stages in training, stage_activity_logits in inference
-        # stage_mask = torch.ones(B, self.max_stages, 1, 1, device=device)  # Shape: (B, 25, 1, 1)
-        # if training and num_stages is not None:
-        #     for i in range(B):
-        #         stage_mask[i, num_stages[i]:] = 0.0
-        # else:
-        #     stage_activity_mask = (torch.sigmoid(stage_activity_logits) > 0.5).float().unsqueeze(-1).unsqueeze(-1)  # (B, 25, 1, 1)
-        #     stage_mask = stage_mask * stage_activity_mask  # Shape: (B, 25, 1, 1)
-
-        # # Validate stage_mask shape
-        # if stage_mask.shape != (B, self.max_stages, 1, 1):
-        #     logger.error(f"Invalid stage_mask shape: got {stage_mask.shape}, expected {(B, self.max_stages, 1, 1)}")
-        #     raise RuntimeError("stage_mask shape mismatch")
-
-        # # Log shapes for debugging
-        # logger.debug(f"Residual adjustment shapes: stage_weights={stage_weights.shape}, stage_mask={stage_mask.shape}, "
-        #              f"param_activity_masks={param_activity_masks.shape}")
-
-        # # Initialize adjustment tensor
-        # adjustment = torch.zeros_like(transforms_sequence)
-        # # Parameter-specific clamping: translations (mm), rotations (degrees)
-        # clamp_ranges_residual = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=device)  # Translations, rotations
-        # clamp_ranges_adjustment = torch.tensor([0.5, 0.5, 0.5, 6.0, 6.0, 6.0], device=device)  # Relaxed clamping
-        # for tooth_idx in range(self.num_teeth):
-        #     for param_idx in range(6):
-        #         masked_preds = transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)  # (B, 25)
-        #         # Validate masked_preds shape
-        #         if masked_preds.shape != (B, self.max_stages):
-        #             logger.error(f"masked_preds shape {masked_preds.shape} does not match expected {(B, self.max_stages)}")
-        #             raise RuntimeError("masked_preds shape mismatch")
-                
-        #         pred_sum = masked_preds.sum(dim=1)  # Shape: (B,)
-        #         residual = cumulative_transforms[:, tooth_idx, param_idx] - pred_sum  # Shape: (B,)
-                
-        #         # Ensure residual is (B,)
-        #         residual = residual.view(B)  # Explicitly reshape to (B,)
-        #         if residual.shape != (B,):
-        #             logger.error(f"Residual shape {residual.shape} does not match expected (B,)=({B},)")
-        #             raise RuntimeError("Residual shape mismatch")
-
-        #         # Log shapes for debugging
-        #         logger.debug(f"Shapes for tooth {tooth_idx} param {param_idx}: "
-        #                      f"masked_preds={masked_preds.shape}, "
-        #                      f"cumulative_transforms[:, {tooth_idx}, {param_idx}]={cumulative_transforms[:, tooth_idx, param_idx].shape}, "
-        #                      f"pred_sum={pred_sum.shape}, residual={residual.shape}")
-
-        #         residual = torch.clamp(residual, -clamp_ranges_residual[param_idx], clamp_ranges_residual[param_idx])
-        #         residual_expanded = residual.unsqueeze(1).unsqueeze(-1).expand(B, self.max_stages, 1)  # Shape: (B, 25, 1)
-                
-        #         # Log residual_expanded shape
-        #         logger.debug(f"residual_expanded shape for tooth {tooth_idx} param {param_idx}: {residual_expanded.shape}")
-                
-        #         param_mask = param_activity_masks[:, :, tooth_idx, param_idx].unsqueeze(-1)  # Shape: (B, 25, 1)
-        #         logger.debug(f"param_mask shape for tooth {tooth_idx} param {param_idx}: {param_mask.shape}")
-        #         if param_mask.sum(dim=1).eq(0).any():
-        #             logger.debug(f"No active stages for tooth {tooth_idx} param {param_idx}, skipping adjustment")
-        #             continue
-        #         residual_expanded_4d = residual_expanded.unsqueeze(-1)  # (B, 25, 1, 1)
-        #         param_mask_4d = param_mask.unsqueeze(-1)  # (B, 25, 1, 1)
-        #         stage_adjustment = residual_expanded_4d * stage_weights * stage_mask * param_mask_4d * self.stage_weight_scale
-
-        #         logger.debug(f"stage_adjustment shape for tooth {tooth_idx} param {param_idx}: {stage_adjustment.shape}")
-        #         stage_adjustment = torch.clamp(stage_adjustment, -clamp_ranges_adjustment[param_idx], clamp_ranges_adjustment[param_idx])
-                
-        #         adjustment[:, :, tooth_idx, param_idx] = stage_adjustment.squeeze(-1).squeeze(-1)  # (B, 25)
-                
-        #         if logger.isEnabledFor(logging.DEBUG):
-        #             logger.debug(f"Residual tooth {tooth_idx} param {param_idx}: "
-        #                          f"residual_mean={residual.mean().item():.4f}, "
-        #                          f"adjustment_mean={stage_adjustment.mean().item():.4f}, "
-        #                          f"pred_sum_mean={pred_sum.mean().item():.4f}")
-
-        # # Apply adjustment to transforms_sequence
-        # transforms_sequence = transforms_sequence + adjustment
-
-        # # Log overall adjustment statistics
-        # logger.debug(f"Residual adjustment: mean={adjustment.mean().item():.4f}, max={adjustment.max().item():.4f}, "
-        #              f"min={adjustment.min().item():.4f}")
-
-        # Post-adjustment validation check
-        # if training:
-        #     for tooth_idx in range(self.num_teeth):
-        #         for param_idx in range(6):
-        #             final_sum = (transforms_sequence[:, :, tooth_idx, param_idx] * stage_mask.squeeze(-1).squeeze(-1)).sum(dim=1)
-        #             error = torch.abs(final_sum - cumulative_transforms[:, tooth_idx, param_idx]).mean()
-        #             if error > 1:
-        #                 logger.warning(f"Post-adjustment tooth {tooth_idx} param {param_idx}: error={error.item():.4f}"
-        #                                 f"clamping may be too restrictive")
-
-        # # Gradient clipping
-        # for p in self.parameters():
-        #     if p.grad is not None:
-        #         p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        #         p.grad.clamp_(-0.3, 0.3)
+        logger.debug(f"Output stats: transforms_mean={transforms_sequence.mean().item():.4f}, "
+                     f"transforms_min={transforms_sequence.min().item():.4f}, "
+                     f"transforms_max={transforms_sequence.max().item():.4f}, "
+                     f"activity_logits_mean={activity_logits.mean().item():.4f}, "
+                     f"param_activity_logits_mean={param_activity_logits.mean().item():.4f}, "
+                     f"stage_activity_logits_mean={stage_activity_logits.mean().item():.4f}")
 
         return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count]

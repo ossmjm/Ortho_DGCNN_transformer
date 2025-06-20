@@ -30,13 +30,44 @@ def setup_logging(log_file):
     return logger
 
 def compute_loss(transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
-    mse_loss_fn = HybridTransformLoss(weight=args.w_trans, small_error_threshold=args.small_error_threshold, small_error_scale=args.small_error_scale).to(device)
+    mse_loss_fn = HybridTransformLoss(
+        weight=args.w_trans,
+        small_error_threshold=args.small_error_threshold,
+        large_delta=args.large_delta,
+        sparse_weight=args.sparse_weight,
+        max_error=args.max_error,
+        small_error_scale=args.small_error_scale
+    ).to(device)
     activity_loss_fn = ToothActivityLoss(weight=args.w_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
     param_activity_loss_fn = ParamActivityLoss(weight=args.w_param_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
     padded_loss_fn = PaddedLoss(weight=args.w_padded).to(device)
     consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
-    stage_activity_loss_fn = StageActivityLoss(weight=args.w_stage_activity).to(device)
-    
+    stage_activity_loss_fn = StageActivityLoss(weight=args.w_stage_activity, seq_penalty=args.seq_penalty).to(device)
+    if args.use_scaler:
+        train_dataset = JawTeethDataset(
+            data_dir=args.data_dir,
+            max_stages=args.max_stages,
+            num_teeth=args.num_teeth,
+            num_points=args.num_points,
+            channels=args.channels,
+            split='train',
+            train_ratio=args.train_ratio,
+            cache_dir=args.cache_dir,
+            log_file=args.log_file,
+            use_scaler=args.use_scaler,
+            scaler_type=args.scaler_type
+        )
+        scalers = train_dataset.get_scalers()
+    else:
+        scalers = None
+    # Warn if any loss weight is zero
+    for w_name, w_value in [
+        ('w_trans', args.w_trans), ('w_activity', args.w_activity), ('w_param_activity', args.w_param_activity),
+        ('w_padded', args.w_padded), ('w_consistency', args.w_consistency), ('w_stage_activity', args.w_stage_activity)
+    ]:
+        if w_value == 0.0:
+            logger.warning(f"Loss weight {w_name} is set to 0.0; corresponding loss will not contribute to training.")
+
     transforms_sequence = torch.clamp(transforms_sequence, 0, 40)
     
     loss_mse = mse_loss_fn(transforms_sequence, targets, activity_labels.unsqueeze(-1))
@@ -45,7 +76,7 @@ def compute_loss(transforms_sequence, activity_logits, param_activity_logits, st
     loss_stage_activity, f1_stage_activity = stage_activity_loss_fn(stage_activity_logits, true_num_stages)
     
     padded_loss = padded_loss_fn(transforms_sequence, true_num_stages, max_stages)
-    consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device)
+    consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device,use_scaler=args.use_scaler,scalers=scalers)
     
     losses = {
         'loss_mse': loss_mse,
@@ -331,7 +362,7 @@ def train(args):
         train_loss_history['loss_activity'].append(train_losses['loss_activity'])
         train_loss_history['loss_param_activity'].append(train_losses['loss_param_activity'])
         train_loss_history['padded_loss'].append(train_losses['padded_loss'])
-        train_loss_history['consistency_loss'].append(train_losses['consistency'])
+        train_loss_history['consistency_loss'].append(train_losses['consistency_loss'])
         train_loss_history['loss_stage_activity'].append(train_losses['loss_stage_activity'])
         train_loss_history['mean_f1_activity'].append(mean_train_f1_activity)
         train_loss_history['mean_f1_param_activity'].append(mean_train_f1_param_activity)
@@ -507,14 +538,14 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
-    parser.add_argument('--teacher_forcing_prob', type=float, default=0.8, help='Teacher forcing probability')
+    parser.add_argument('--teacher_forcing_prob', type=float, default=0.9, help='Teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
     parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for transformation loss')
     parser.add_argument('--w_activity', type=float, default=1.0, help='Weight for activity loss')
     parser.add_argument('--w_param_activity', type=float, default=1.0, help='Weight for param activity loss')
     parser.add_argument('--w_padded', type=float, default=0.5, help='Weight for padded loss')
-    parser.add_argument('--w_consistency', type=float, default=0.0, help='Weight for consistency loss')
+    parser.add_argument('--w_consistency', type=float, default=0.1, help='Weight for consistency loss')
     parser.add_argument('--w_stage_activity', type=float, default=1.0, help='Weight for stage activity loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'], help='Optimizer type')
@@ -526,8 +557,12 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of warmup epochs')
     parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Starting factor for warmup')
     parser.add_argument('--use_scheduler', type=bool, default=False, help='Whether to use a learning rate scheduler')
-    parser.add_argument('--small_error_threshold', type=float, default=1.0, help='Threshold for small errors in transformation loss')
+    parser.add_argument('--small_error_threshold', type=float, default=0.5, help='Threshold for small errors in transformation loss')
     parser.add_argument('--small_error_scale', type=float, default=5.0, help='Scale factor for small errors in transformation loss')
+    parser.add_argument('--large_delta', type=float, default=5.0, help='Delta for large errors in transformation loss')
+    parser.add_argument('--sparse_weight', type=float, default=0.5, help='Weight for sparsity term in transformation loss')
+    parser.add_argument('--max_error', type=float, default=40.0, help='Maximum error clamp in transformation loss')
+    parser.add_argument('--seq_penalty', type=float, default=0.1, help='Penalty for non-sequential stages in stage activity loss')
     parser.add_argument('--use_focal_loss', type=bool, default=True, help='Use focal loss for activity losses')
     parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha parameter for focal loss')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')

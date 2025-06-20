@@ -128,7 +128,7 @@ class OrthoDGCNNModel(nn.Module):
             targets=targets,
             activity_targets=activity_targets,
             param_activity_targets=param_activity_targets,
-            use_teacher_forcing=self.teacher_forcing_prob if training else 0.0,
+            use_teacher_forcing=True if training else False,
             training=training,
             epoch=epoch,
             total_epochs=total_epochs,

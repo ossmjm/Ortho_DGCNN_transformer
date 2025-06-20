@@ -134,9 +134,10 @@ class JawTeethDataset(Dataset):
 
         return df
 
-    def _load_transformations(self, jaw_id, transform_df, num_stages_df):
+    def _load_transformations(self, jaw_id, transform_df, num_stages_df, cumulative_df):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         directions = torch.ones(self.num_teeth, 6)  # Default to 1 (positive or zero)
+        cumulative_transformations = torch.zeros(self.num_teeth, 6)
 
         num_stages_data = num_stages_df[num_stages_df["Jaw_ID"] == jaw_id]
         num_stages = min(int(clean_numeric(num_stages_data["Num_Stages"].iloc[0])), self.max_stages) if not num_stages_data.empty else self.max_stages
@@ -147,11 +148,19 @@ class JawTeethDataset(Dataset):
                 stage = int(row["Stage"]) - 1
                 transformations[stage, tooth_idx] = torch.tensor([
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
-                    row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
+                    "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
                 ], dtype=torch.float32)
 
-        # Compute cumulative transformations as sum of scaled stage-wise transformations
-        cumulative_transformations = torch.sum(transformations, dim=0)  # Sum over stages
+        if cumulative_df is not None:
+            for _, row in cumulative_df.iterrows():
+                tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
+                raw = [
+                    row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
+                    row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
+                ]
+                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
+                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+
         activity = torch.any(transformations != 0, dim=-1).float()
         param_activity = (transformations != 0).float()
         cumulative_activity = torch.any(cumulative_transformations != 0, dim=-1).float()
@@ -169,24 +178,8 @@ class JawTeethDataset(Dataset):
                     row["Left/Right (mm"], row["Forward/Backward (mm)"], row["Extrude/Intrude (mm)"],
                     row["Buccal/Lingual (degrees)"], row["Mesial/Distal (degrees)"], row["Rotation (degrees)"]
                 ]
-                # Apply stage-wise scaler if enabled
-                if self.use_scaler:
-                    scaled = []
-                    for i, val in enumerate(raw):
-                        if self.scalers[i] is not None:
-                            try:
-                                scaled_val = self.scalers[i].transform([[val]])[0][0]
-                            except Exception as e:
-                                self.logger.error(f"Failed to scale parameter {i} for Jaw_ID {jaw_id}: {e}; using unscaled value")
-                                scaled_val = abs(val)
-                        else:
-                            scaled_val = abs(val)
-                        scaled.append(scaled_val)
-                    cumulative_transformations[tooth_idx] = torch.tensor(scaled, dtype=torch.float32)
-                    directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
-                else:
-                    cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
-                    directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
+                cumulative_transformations[tooth_idx] = torch.tensor([abs(x) for x in raw], dtype=torch.float32)
+                directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in raw], dtype=torch.float32)
         return cumulative_transformations, directions
 
     def _preprocess_json(self, json_file, jaw_id):
@@ -344,7 +337,7 @@ class JawTeethDataset(Dataset):
                         self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}")
                 except Exception as e:
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
-                cumulative_data = self._preprocess_excel(cumulative_df, case) if cumulative_df is not None else None
+                cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
                 cumulative_transformations, directions = self._load_cumulative_only(case, cumulative_data) if cumulative_data is not None else (torch.zeros(self.num_teeth, 6), torch.ones(self.num_teeth, 6))
                 num_stages = self.max_stages
                 feats = self._preprocess_json(json_file, case)
@@ -360,6 +353,7 @@ class JawTeethDataset(Dataset):
                 }
             else:
                 transform_df = None
+                cumulative_df = None
                 try:
                     self.logger.debug(f"Checking for transform file: {transform_file}")
                     if os.path.exists(transform_file):
@@ -367,12 +361,19 @@ class JawTeethDataset(Dataset):
                         self.logger.debug(f"Loaded Transformations.xlsx for case {case}, rows: {len(transform_df)}")
                     else:
                         self.logger.warning(f"Transformations.xlsx not found for case {case}")
+                    self.logger.debug(f"Checking for cumulative file: {cumulative_file}")
+                    if os.path.exists(cumulative_file):
+                        cumulative_df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
+                        self.logger.debug(f"Loaded cumulative_transformations.xlsx for case {case}, rows: {len(cumulative_df)}")
+                    else:
+                        self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}")
                 except Exception as e:
-                    self.logger.error(f"Failed to load Transformations.xlsx for case {case}: {e}")
+                    self.logger.error(f"Failed to load Excel files for case {case}: {e}")
 
                 transform_data = self._preprocess_excel(transform_df, case) if transform_df is not None else None
+                cumulative_data = self._preprocess_excel(cumulative_df, case, is_cumulative=True) if cumulative_df is not None else None
                 transformations, cumulative_transformations, num_stages, activity, param_activity, cumulative_activity, cumulative_param_activity, directions = self._load_transformations(
-                    case, transform_data, num_stages_df
+                    case, transform_data, num_stages_df, cumulative_data
                 )
                 feats, _,_ = self._preprocess_json(json_file, case)
                 if feats is None:
@@ -585,7 +586,7 @@ class CumulativeJawTeethDataset(Dataset):
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
         scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
-        self.logger.debugcrops = [[] for _ in range(6)]
+        self.logger.debug(f"Checking scaler file: {scaler_file}")
         columns = [
             "Left/Right (mm)",
             "Forward/Backward (mm)",
