@@ -228,7 +228,6 @@ class StageActivityLoss(nn.Module):
         # F1 score over all stages
         valid_labels = stage_labels
         logger.debug(f"Valid labels unique values: {torch.unique(valid_labels).tolist()}")
-        print(f'valid labels {valid_labels}')
         f1 = binary_f1_score(preds.flatten(), valid_labels.flatten(), threshold=0.5)
         logger.debug(f"StageActivityLoss: loss={loss.item():.4f}, seq_penalty={seq_penalty.item():.4f}, total={total_loss.item():.4f}, f1={f1.item():.4f}, total_stages={logits.numel()}, alpha={alpha:.4f}")
         return total_loss, f1
