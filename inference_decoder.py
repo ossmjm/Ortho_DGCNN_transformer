@@ -21,10 +21,13 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def inverse_transform_transformations(transformations, scalers, logger):
-    """Reverse parameter-specific RobustScaler transformation for transformations."""
-    if not scalers or any(scaler is None for scaler in scalers):
-        logger.warning("One or more scalers missing; returning transformations as is")
+def inverse_transform_transformations(transformations, scalers, logger, use_scaler):
+    """Reverse parameter-specific RobustScaler transformation for transformations if use_scaler is True."""
+    if not use_scaler or not scalers or any(scaler is None for scaler in scalers):
+        if not use_scaler:
+            logger.info("use_scaler is False; returning transformations without inverse scaling")
+        else:
+            logger.warning("One or more scalers missing; returning transformations as is")
         return transformations
     try:
         shape = transformations.shape
@@ -37,11 +40,14 @@ def inverse_transform_transformations(transformations, scalers, logger):
         logger.error(f"Failed to inverse transform transformations: {e}")
         return transformations
 
-def transform_cumulative_transformations(transformations, scalers, logger):
-    """Apply parameter-specific RobustScaler transformation to cumulative transformations."""
-    if not scalers or any(scaler is None for scaler in scalers):
-        logger.warning("One or more cumulative scalers missing; returning transformations as is")
-        return transformations
+def transform_cumulative_transformations(transformations, scalers, logger, use_scaler):
+    """Apply parameter-specific RobustScaler transformation to cumulative transformations if use_scaler is True."""
+    if not use_scaler or not scalers or any(scaler is None for scaler in scalers):
+        if not use_scaler:
+            logger.info("use_scaler is False; returning cumulative transformations without scaling")
+        else:
+            logger.warning("One or more cumulative scalers missing; returning transformations as tensor")
+        return torch.tensor(transformations, dtype=torch.float32)
     try:
         shape = transformations.shape
         transformations_flat = transformations.reshape(-1, 6)
@@ -51,14 +57,14 @@ def transform_cumulative_transformations(transformations, scalers, logger):
         return torch.tensor(transformed.reshape(shape), dtype=torch.float32)
     except Exception as e:
         logger.error(f"Failed to transform cumulative transformations: {e}")
-        return transformations
+        return torch.tensor(transformations, dtype=torch.float32)
 
-def filter_transformations(transformations, stage_activity_probs, logger=None):
-    """Filter out stages based on stage activity probabilities."""
-    active_stages = stage_activity_probs > 0.5
+def filter_transformations(transformations, logger=None):
+    """Filter out stages where all transformation values are less than 0.1."""
+    active_stages = np.any(np.abs(transformations) >= 0.1, axis=(1, 2))
     if not np.any(active_stages):
         if logger:
-            logger.warning("All stages have low activity probability")
+            logger.warning("All stages have transformations with absolute values < 0.1")
         return transformations, np.array([])
     filtered_transforms = transformations[active_stages]
     active_stage_indices = np.where(active_stages)[0]
@@ -103,27 +109,28 @@ def inference(args):
     # Load parameter-specific scalers
     scalers = [None] * 6
     cumulative_scalers = [None] * 6
-    for i in range(6):
-        scaler_file = os.path.join(args.cache_dir, f'scaler_param_{i}.pkl')
-        cumulative_scaler_file = os.path.join(args.cache_dir, f'cumulative_scaler_param_{i}.pkl')
-        if os.path.exists(scaler_file):
-            try:
-                with open(scaler_file, 'rb') as f:
-                    scalers[i] = pickle.load(f)
-                logger.info(f"Loaded scaler for parameter {i} from {scaler_file}")
-            except Exception as e:
-                logger.error(f"Failed to load scaler for parameter {i}: {e}")
-        else:
-            logger.warning(f"No scaler found for parameter {i}")
-        if os.path.exists(cumulative_scaler_file):
-            try:
-                with open(cumulative_scaler_file, 'rb') as f:
-                    cumulative_scalers[i] = pickle.load(f)
-                logger.info(f"Loaded cumulative scaler for parameter {i} from {cumulative_scaler_file}")
-            except Exception as e:
-                logger.error(f"Failed to load cumulative scaler for parameter {i}: {e}")
-        else:
-            logger.warning(f"No cumulative scaler found for parameter {i}")
+    if args.use_scaler:
+        for i in range(6):
+            scaler_file = os.path.join(args.cache_dir, f'scaler_param_{i}.pkl')
+            cumulative_scaler_file = os.path.join(args.cache_dir, f'cumulative_scaler_param_{i}.pkl')
+            if os.path.exists(scaler_file):
+                try:
+                    with open(scaler_file, 'rb') as f:
+                        scalers[i] = pickle.load(f)
+                    logger.info(f"Loaded scaler for parameter {i} from {scaler_file}")
+                except Exception as e:
+                    logger.error(f"Failed to load scaler for parameter {i}: {e}")
+            else:
+                logger.warning(f"No scaler found for parameter {i}")
+            if os.path.exists(cumulative_scaler_file):
+                try:
+                    with open(cumulative_scaler_file, 'rb') as f:
+                        cumulative_scalers[i] = pickle.load(f)
+                    logger.info(f"Loaded cumulative scaler for parameter {i} from {cumulative_scaler_file}")
+                except Exception as e:
+                    logger.error(f"Failed to load cumulative scaler for parameter {i}: {e}")
+            else:
+                logger.warning(f"No cumulative scaler found for parameter {i}")
 
     dataset = JawTeethDataset(
         data_dir=args.data_dir,
@@ -132,10 +139,11 @@ def inference(args):
         num_points=args.num_points,
         channels=args.channels,
         split='test',
-        train_ratio=args.train_ratio,
         inference=True,
         cache_dir=args.cache_dir,
-        log_file=args.log_file
+        log_file=args.log_file,
+        use_scaler=args.use_scaler,
+        scaler_type=args.scaler_type
     )
     if len(dataset) == 0:
         logger.error("Dataset is empty")
@@ -175,25 +183,28 @@ def inference(args):
     }
 
     with torch.no_grad():
-        for jaw_id, feats, cumulative_transforms, _ in data_loader:
+        for jaw_id, feats, cumulative_transforms, directions, num_stages in data_loader:
             jaw_id = jaw_id[0]
             feats = feats.to(device)
             cumulative_transforms = transform_cumulative_transformations(
-                cumulative_transforms.cpu().numpy(), cumulative_scalers, logger
+                cumulative_transforms.cpu().numpy(), cumulative_scalers, logger, args.use_scaler
             ).to(device)
+            directions = directions.to(device)
 
             try:
-                pred_transforms, activity_logits, param_activity_logits, stage_activity_logits = model(
+                outputs = model(
                     coordinates=feats,
                     targets=None,
                     cumulative_targets=cumulative_transforms,
                     activity_targets=None,
                     param_activity_targets=None,
-                    num_stages=None,
+                    directions=directions,
+                    num_stages=num_stages,
                     epoch=0,
                     total_epochs=1,
                     training=False
                 )
+                pred_transforms, activity_logits, param_activity_logits, _ = outputs
                 logger.info(f"Generated predictions for Jaw_ID {jaw_id}")
             except Exception as e:
                 logger.error(f"Failed to generate predictions for Jaw_ID {jaw_id}: {e}")
@@ -203,14 +214,15 @@ def inference(args):
             activity_mask = (activity_probs > 0.5).float()
             param_activity_probs = torch.sigmoid(param_activity_logits)
             param_activity_mask = (param_activity_probs > 0.5).float() * activity_mask.unsqueeze(-1)
-            stage_activity_probs = torch.sigmoid(stage_activity_logits).cpu().numpy()[0]
-
+            # print(f'activity_mask: {activity_mask}')
+            # print(f'param_activity_mask: {param_activity_mask}')
+            print(f'pred_transforms: {pred_transforms}')
+            masked_transforms = pred_transforms 
             masked_transforms_np = inverse_transform_transformations(
-                pred_transforms.cpu().numpy(), scalers, logger
+                masked_transforms.cpu().numpy(), scalers, logger, args.use_scaler
             )
-            masked_transforms_np = masked_transforms_np * param_activity_mask.cpu().numpy()
             filtered_transforms, active_stage_indices = filter_transformations(
-                masked_transforms_np[0], stage_activity_probs, logger=logger
+                masked_transforms_np[0], logger=logger
             )
             if len(active_stage_indices) == 0:
                 logger.warning(f"No active stages for Jaw_ID {jaw_id} after filtering")
@@ -237,16 +249,15 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference for Orthodontic Treatment Prediction")
-    parser.add_argument('--data_dir', type=str, default='./Data', help='Path to dataset')
+    parser.add_argument('--data_dir', type=str, default='./Test', help='Path to test dataset folder')
     parser.add_argument('--output_dir', type=str, default='./output_decoder_predictions', help='Base path for output Excel files')
     parser.add_argument('--log_file', type=str, default='./output_decoder/inference_log.txt', help='Path to log file')
     parser.add_argument('--cache_dir', type=str, default='./Scaler', help='Path to cache directory')
     parser.add_argument('--checkpoint_path', type=str, default='./output_decoder/best_model.pth', help='Path to model checkpoint')
-    parser.add_argument('--num_points', type=int, default=256, help='Number of points per tooth')
-    parser.add_argument('--channels', type=int, default=4, help='Number of feature channels')
-    parser.add_argument('--train_ratio', type=float, default=0.8, help='Train/validation split ratio')
-    parser.add_argument('--embed_dim', type=int, default=96, help='Embedding dimension')
-    parser.add_argument('--k', type=int, default=10, help='Number of k in DGCNN')
+    parser.add_argument('--num_points', type=int, default=1000, help='Number of points per tooth')
+    parser.add_argument('--channels', type=int, default=3, help='Number of feature channels')
+    parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
+    parser.add_argument('--k', type=int, default=20, help='Number of k in DGCNN')
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
     parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers in Transformer')
@@ -254,7 +265,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of DataLoader workers')
-    parser.add_argument('--inactive_proportion', type=float, default=0.9, help='Proportion of near-zero values to consider a stage inactive')
+    parser.add_argument('--use_scaler', type=bool, default=False, help='Whether to apply scaler to transformations')
+    parser.add_argument('--scaler_type', type=str, default='robust', choices=['robust', 'standard'], help='Type of scaler (robust or standard)')
 
     args = parser.parse_args()
     os.makedirs(args.cache_dir, exist_ok=True)

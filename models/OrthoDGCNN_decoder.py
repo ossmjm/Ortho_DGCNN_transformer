@@ -3,7 +3,7 @@ import torch.nn as nn
 import logging
 from models.DGCNN import DGCNN
 from models.TransformerDecoder import TransformerDecoder
-from models.PerToothTransformer import PerToothTransformerDecoder
+from models.MLPPredictor import MLPPredictor
 
 class OrthoDGCNNModel(nn.Module):
     def __init__(
@@ -13,28 +13,21 @@ class OrthoDGCNNModel(nn.Module):
         num_points: int = 256,
         channels: int = 3,
         embed_dim: int = 384,
-        teacher_forcing_prob: float = 0.0,
         decoder_layers: int = 1,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         k: int = 20,
-        decoder_type: str = 'per_tooth',
-        per_tooth_layers: int = 4,
-        per_tooth_heads: int = 8,
-        per_tooth_mlp_ratio: float = 4.0
+        decoder_type: str = 'mlp_predictor'
     ):
         super().__init__()
         self.dgcnn = DGCNN(in_channels=channels, embed_dim=embed_dim, num_teeth=num_teeth, num_points=num_points, k=k)
-        if decoder_type == 'per_tooth':
-            self.decoder = PerToothTransformerDecoder(
-                embed_dim=embed_dim,
-                num_teeth=num_teeth,
-                max_stages=max_stages,
-                num_layers=per_tooth_layers,
-                num_heads=per_tooth_heads,
-                mlp_ratio=per_tooth_mlp_ratio
-            )
-        else:
+        
+        # Validate decoder type
+        valid_decoder_types = ['transformer', 'mlp_predictor']
+        if decoder_type not in valid_decoder_types:
+            raise ValueError(f"Invalid decoder_type: {decoder_type}. Must be one of {valid_decoder_types}")
+
+        if decoder_type == 'transformer':
             self.decoder = TransformerDecoder(
                 embed_dim=embed_dim,
                 num_teeth=num_teeth,
@@ -43,11 +36,20 @@ class OrthoDGCNNModel(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio
             )
+        elif decoder_type == 'mlp_predictor':
+            self.decoder = MLPPredictor(
+                embed_dim=embed_dim,
+                num_teeth=num_teeth,
+                max_stages=max_stages,
+                num_heads=num_heads,
+                dropout=0.4  # Match default dropout
+            )
+        
         self.max_stages = max_stages
         self.num_teeth = num_teeth
         self.embed_dim = embed_dim
-        self.teacher_forcing_prob = teacher_forcing_prob
         self.num_points = num_points
+        self.decoder_type = decoder_type
         self.feature_norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
         self._init_weights()
@@ -66,7 +68,7 @@ class OrthoDGCNNModel(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, coordinates, targets=None, cumulative_targets=None, activity_targets=None, param_activity_targets=None, directions=None, num_stages=None, epoch=None, total_epochs=None, val_loss=None, training=True):
+    def forward(self, coordinates, cumulative_targets, num_stages=None, targets=None, directions=None, training=True):
         logger = logging.getLogger('TrainLogger')
         
         expected_shape = (-1, self.num_teeth, self.num_points, 3)
@@ -78,31 +80,23 @@ class OrthoDGCNNModel(nn.Module):
             logger.error("NaN values detected in input coordinates")
             coordinates = torch.nan_to_num(coordinates, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        if targets is not None:
-            expected_targets_shape = (-1, self.max_stages, self.num_teeth, 6)
-            if targets.shape[1:] != torch.Size(expected_targets_shape[1:]):
-                logger.error(f"Invalid targets shape: got {targets.shape}, expected {expected_targets_shape}")
-                raise RuntimeError(f"Targets shape mismatch")
-        if activity_targets is not None:
-            expected_activity_shape = (-1, self.max_stages, self.num_teeth)
-            if activity_targets.shape[1:] != torch.Size(expected_activity_shape[1:]):
-                logger.error(f"Invalid activity_targets shape: got {activity_targets.shape}, expected {expected_activity_shape}")
-                raise RuntimeError(f"Activity_targets shape mismatch")
-        if param_activity_targets is not None:
-            expected_param_activity_shape = (-1, self.max_stages, self.num_teeth, 6)
-            if param_activity_targets.shape[1:] != torch.Size(expected_param_activity_shape[1:]):
-                logger.error(f"Invalid param_activity_targets shape: got {param_activity_targets.shape}, expected {expected_param_activity_shape}")
-                raise RuntimeError(f"Param_activity_targets shape mismatch")
         if cumulative_targets is not None:
             expected_cumulative_shape = (-1, self.num_teeth, 6)
             if cumulative_targets.shape[1:] != torch.Size(expected_cumulative_shape[1:]):
                 logger.error(f"Invalid cumulative_targets shape: got {cumulative_targets.shape}, expected {expected_cumulative_shape}")
                 raise RuntimeError(f"Cumulative_targets shape mismatch")
-        if directions is not None:
-            expected_directions_shape = (-1, self.num_teeth, 6)
-            if directions.shape[1:] != torch.Size(expected_directions_shape[1:]):
-                logger.error(f"Invalid directions shape: got {directions.shape}, expected {expected_directions_shape}")
-                raise RuntimeError(f"Directions shape mismatch")
+        
+        if training and self.decoder_type == 'transformer':
+            if targets is not None:
+                expected_targets_shape = (-1, self.max_stages, self.num_teeth, 6)
+                if targets.shape[1:] != torch.Size(expected_targets_shape[1:]):
+                    logger.error(f"Invalid targets shape: got {targets.shape}, expected {expected_targets_shape}")
+                    raise RuntimeError(f"Targets shape mismatch")
+            if directions is not None:
+                expected_directions_shape = (-1, self.max_stages, self.num_teeth, 6)
+                if directions.shape[1:] != torch.Size(expected_directions_shape[1:]):
+                    logger.error(f"Invalid directions shape: got {directions.shape}, expected {expected_directions_shape}")
+                    raise RuntimeError(f"Directions shape mismatch")
 
         features = self.dgcnn(coordinates)
         
@@ -120,38 +114,35 @@ class OrthoDGCNNModel(nn.Module):
         if not training:
             num_stages = None
         
-        outputs = self.decoder(
-            memory=features,
-            cumulative_transforms=cumulative_targets,
-            directions=directions,
-            num_stages=num_stages,
-            targets=targets,
-            activity_targets=activity_targets,
-            param_activity_targets=param_activity_targets,
-            use_teacher_forcing=self.teacher_forcing_prob if training else 0.0,
-            training=training,
-            epoch=epoch,
-            total_epochs=total_epochs,
-            val_loss=val_loss
-        )
+        logger.debug(f"Using decoder type: {self.decoder_type}")
         
-        transforms_sequence, activity_logits, param_activity_logits, tf_count = outputs
+        if self.decoder_type == 'mlp_predictor':
+            outputs = self.decoder(
+                memory=features,
+                cumulative_transforms=cumulative_targets,
+                num_stages=num_stages
+            )
+            ratios_sequence, directions_sequence = outputs
+        else:
+            outputs = self.decoder(
+                memory=features,
+                cumulative_transforms=cumulative_targets,
+                num_stages=num_stages,
+                targets=targets if training else None,
+                directions=directions if training else None,
+                use_teacher_forcing=self.teacher_forcing_prob if training else 0.0
+            )
+            ratios_sequence, directions_sequence = outputs
         
-        # stage_weights = None
-        # if isinstance(self.decoder, PerToothTransformerDecoder):
-        #     stage_weights = self.decoder.stage_weights
+        if torch.isnan(ratios_sequence).any():
+            logger.error("NaN values detected in ratios_sequence")
+            ratios_sequence = torch.nan_to_num(ratios_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        if torch.isnan(transforms_sequence).any():
-            logger.error("NaN values detected in transforms_sequence")
-            transforms_sequence = torch.nan_to_num(transforms_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(directions_sequence).any():
+            logger.error("NaN values detected in directions_sequence")
+            directions_sequence = torch.nan_to_num(directions_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        logger.debug(f"OrthoDGCNN output shape: transforms_sequence={transforms_sequence.shape}, "
-                    f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
-                    f"teacher_forcing_count={tf_count}")
-                     
-        for i, output in enumerate([transforms_sequence, activity_logits, param_activity_logits]):
-            if torch.isnan(output).any():
-                logger.error(f"NaN values detected in output {i}")
-                output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
-                outputs[i] = output
-        return outputs
+        logger.debug(f"OrthoDGCNN output shape: ratios_sequence={ratios_sequence.shape}, "
+                     f"directions_sequence={directions_sequence.shape}")
+        
+        return [ratios_sequence, directions_sequence]

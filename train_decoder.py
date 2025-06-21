@@ -1,20 +1,14 @@
 import os
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import logging
 import argparse
 from dataset import JawTeethDataset
 from models.OrthoDGCNN_decoder import OrthoDGCNNModel
-from losses_decoder import HybridTransformLoss, ToothActivityLoss, ParamActivityLoss, PaddedLoss, ConsistencyLoss
+from losses_decoder import compute_loss
 from optimizers import Optimizers, LRSchedulers
-from torchmetrics.functional.classification import binary_f1_score
-
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.backends.cudnn.benchmark = True
 
 def setup_logging(log_file):
     logger = logging.getLogger('TrainLogger')
@@ -29,75 +23,18 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def compute_loss(transforms_sequence, activity_logits, param_activity_logits, targets, activity_labels, param_activity_labels, cumulative_transforms, true_num_stages, max_stages, device, logger, args):
-    mse_loss_fn = HybridTransformLoss(
-        weight=args.w_trans,
-        small_error_threshold=args.small_error_threshold,
-        large_delta=args.large_delta,
-        max_error=args.max_error,
-        small_error_scale=args.small_error_scale
-    ).to(device)
-    activity_loss_fn = ToothActivityLoss(weight=args.w_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
-    param_activity_loss_fn = ParamActivityLoss(weight=args.w_param_activity, use_focal=args.use_focal_loss, alpha=args.focal_alpha, gamma=args.focal_gamma).to(device)
-    padded_loss_fn = PaddedLoss(weight=args.w_padded).to(device)
-    consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
-    if args.use_scaler:
-        train_dataset = JawTeethDataset(
-            data_dir=args.data_dir,
-            max_stages=args.max_stages,
-            num_teeth=args.num_teeth,
-            num_points=args.num_points,
-            channels=args.channels,
-            split='train',
-            train_ratio=args.train_ratio,
-            cache_dir=args.cache_dir,
-            log_file=args.log_file,
-            use_scaler=args.use_scaler,
-            scaler_type=args.scaler_type
-        )
-        scalers = train_dataset.get_scalers()
-    else:
-        scalers = None
-    # Warn if any loss weight is zero
-    for w_name, w_value in [
-        ('w_trans', args.w_trans), ('w_activity', args.w_activity), ('w_param_activity', args.w_param_activity),
-        ('w_padded', args.w_padded), ('w_consistency', args.w_consistency)
-    ]:
-        if w_value == 0.0:
-            logger.warning(f"Loss weight {w_name} is set to 0.0; corresponding loss will not contribute to training.")
-
-    transforms_sequence = torch.clamp(transforms_sequence, 0, 40)
-    
-    loss_mse = mse_loss_fn(transforms_sequence, targets, true_num_stages, activity_labels, param_activity_labels)
-    loss_activity, f1_activity = activity_loss_fn(activity_logits, activity_labels, true_num_stages)
-    loss_param_activity, f1_param_activity = param_activity_loss_fn(param_activity_logits, param_activity_labels, activity_labels, true_num_stages)
-    
-    padded_loss = padded_loss_fn(transforms_sequence, true_num_stages, max_stages)
-    consistency_loss = consistency_loss_fn(transforms_sequence, cumulative_transforms, true_num_stages, max_stages, device, activity_labels, param_activity_labels, use_scaler=args.use_scaler, scalers=scalers)
-    
-    losses = {
-        'loss_mse': loss_mse,
-        'loss_activity': loss_activity,
-        'loss_param_activity': loss_param_activity,
-        'padded_loss': padded_loss,
-        'consistency_loss': consistency_loss
-    }
-    for name, loss in losses.items():
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.error(f"{name} is NaN or Inf: {loss.item()}")
-    
-    total_loss = (
-        args.w_trans * loss_mse +
-        args.w_activity * loss_activity +
-        args.w_param_activity * loss_param_activity +
-        args.w_padded * padded_loss +
-        args.w_consistency * consistency_loss
+def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
+    # Call compute_loss from losses_decoder.py
+    total_loss, losses = compute_loss(
+        ratios_sequence=ratios_sequence,
+        directions_sequence=directions_sequence,
+        ratios=ratios,
+        directions=directions,
+        num_stages=num_stages,
+        device=device,
+        args=args
     )
-    
-    if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logger.error(f"Total loss is NaN or Inf: {total_loss.item()}")
-    
-    return total_loss, losses, f1_activity, f1_param_activity, torch.tensor(0.0, device=device)
+    return total_loss, losses
 
 def train(args):
     logger = setup_logging(args.log_file)
@@ -142,7 +79,6 @@ def train(args):
         num_points=args.num_points,
         channels=args.channels,
         embed_dim=args.embed_dim,
-        teacher_forcing_prob=args.teacher_forcing_prob,
         decoder_layers=args.decoder_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
@@ -170,20 +106,12 @@ def train(args):
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['ortho_dgcnn_state_dict'])
             logger.info(f"Loaded full model weights from {args.checkpoint_path}")
-            if 'optimizer_dgcnn_state_dict' in checkpoint and checkpoint['optimizer_dgcnn_state_dict'] is not None:
-                try:
-                    optimizer_dgcnn.load_state_dict(checkpoint['optimizer_dgcnn_state_dict'])
-                    logger.info("Loaded optimizer_dgcnn state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"Failed to load optimizer_dgcnn state: {e}. Resetting optimizer state.")
-                    optimizer_dgcnn.state = {}
-            if 'optimizer_decoder_state_dict' in checkpoint and checkpoint['optimizer_decoder_state_dict'] is not None:
-                try:
-                    optimizer_decoder.load_state_dict(checkpoint['optimizer_decoder_state_dict'])
-                    logger.info("Loaded optimizer_decoder state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"Failed to load optimizer_decoder state: {e}. Resetting optimizer state.")
-                    optimizer_decoder.state = {}
+            if 'optimizer_dgcnn_state_dict' in checkpoint:
+                optimizer_dgcnn.load_state_dict(checkpoint['optimizer_dgcnn_state_dict'])
+                logger.info("Loaded optimizer_dgcnn state from checkpoint")
+            if 'optimizer_decoder_state_dict' in checkpoint:
+                optimizer_decoder.load_state_dict(checkpoint['optimizer_decoder_state_dict'])
+                logger.info("Loaded optimizer_decoder state from checkpoint")
         except Exception as e:
             logger.error(f"Failed to load model weights from {args.checkpoint_path}: {e}")
             raise
@@ -218,18 +146,12 @@ def train(args):
     if args.checkpoint_path and os.path.exists(args.checkpoint_path) and args.use_scheduler:
         try:
             checkpoint = torch.load(args.checkpoint_path, map_location=device)
-            if 'scheduler_dgcnn_state_dict' in checkpoint and checkpoint['scheduler_dgcnn_state_dict'] is not None and scheduler_dgcnn is not None:
-                try:
-                    scheduler_dgcnn.load_state_dict(checkpoint['scheduler_dgcnn_state_dict'])
-                    logger.info("Loaded scheduler_dgcnn state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"Failed to load scheduler_dgcnn state: {e}. Using new scheduler.")
-            if 'scheduler_decoder_state_dict' in checkpoint and checkpoint['scheduler_decoder_state_dict'] is not None and scheduler_decoder is not None:
-                try:
-                    scheduler_decoder.load_state_dict(checkpoint['scheduler_decoder_state_dict'])
-                    logger.info("Loaded scheduler_decoder state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"Failed to load scheduler_decoder state: {e}. Using new scheduler.")
+            if 'scheduler_dgcnn_state_dict' in checkpoint and scheduler_dgcnn:
+                scheduler_dgcnn.load_state_dict(checkpoint['scheduler_dgcnn_state_dict'])
+                logger.info("Loaded scheduler_dgcnn state from checkpoint")
+            if 'scheduler_decoder_state_dict' in checkpoint and scheduler_decoder:
+                scheduler_decoder.load_state_dict(checkpoint['scheduler_decoder_state_dict'])
+                logger.info("Loaded scheduler_decoder state from checkpoint")
         except Exception as e:
             logger.warning(f"Failed to load scheduler states from {args.checkpoint_path}: {e}")
 
@@ -239,68 +161,56 @@ def train(args):
 
     train_loss_history = {
         'total': [],
-        'loss_mse': [],
-        'loss_activity': [],
-        'loss_param_activity': [],
-        'padded_loss': [],
-        'consistency_loss': [],
-        'mean_f1_activity': [],
-        'mean_f1_param_activity': []
+        'loss_trans': [],
+        'loss_padded': [],
+        'loss_consistency': [],
+        'loss_directions': []
     }
     val_loss_history = {
         'total': [],
-        'loss_mse': [],
-        'loss_activity': [],
-        'loss_param_activity': [],
-        'padded_loss': [],
-        'consistency_loss': [],
-        'mean_f1_activity': [],
-        'mean_f1_param_activity': []
+        'loss_trans': [],
+        'loss_padded': [],
+        'loss_consistency': [],
+        'loss_directions': []
     }
+
     for epoch in range(args.epochs):
         model.train()
         train_losses = {
             'total': 0.0,
-            'loss_mse': 0.0,
-            'loss_activity': 0.0,
-            'loss_param_activity': 0.0,
-            'padded_loss': 0.0,
-            'consistency_loss': 0.0
+            'loss_trans': 0.0,
+            'loss_padded': 0.0,
+            'loss_consistency': 0.0,
+            'loss_directions': 0.0
         }
-        train_f1_activity = []
-        train_f1_param_activity = []
-        total_tf_count = 0.0
 
-        for batch_idx, (jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages) in enumerate(train_loader):
-            feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages = [
-                x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages]
+        for batch_idx, (jaw_id, feats, ratios, cumulative_transformations, directions, num_stages) in enumerate(train_loader):
+            feats, ratios, cumulative_transformations, directions, num_stages = [
+                x.to(device) for x in [feats, ratios, cumulative_transformations, directions, num_stages]
             ]
-            logger.debug(f"Batch {batch_idx} shapes: feats={feats.shape}, transforms={transforms.shape}, cumulative_transforms={cumulative_transforms.shape}, directions={directions.shape}, num_stages={num_stages}")
-            
+            logger.debug(f"Batch {batch_idx} shapes: feats={feats.shape}, ratios={ratios.shape}, cumulative_transformations={cumulative_transformations.shape}, directions={directions.shape}, num_stages={num_stages.shape}")
+
             optimizer_dgcnn.zero_grad()
             optimizer_decoder.zero_grad()
 
             outputs = model(
                 coordinates=feats,
-                targets=transforms,
-                cumulative_targets=cumulative_transforms,
-                activity_targets=activity,
-                param_activity_targets=param_activity,
-                directions=directions,
+                cumulative_targets=cumulative_transformations,
                 num_stages=num_stages,
-                epoch=epoch,
-                total_epochs=args.epochs,
-                val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
+                targets=ratios,
+                directions=directions,
                 training=True
             )
-            pred_transforms, activity_logits, param_activity_logits, tf_count = outputs
+            ratios_sequence, directions_sequence = outputs
 
-            total_tf_count += tf_count
-
-            total_loss, losses, f1_activity, f1_param_activity, _ = compute_loss(
-                pred_transforms, activity_logits, param_activity_logits,
-                transforms, activity, param_activity, cumulative_transforms,
-                num_stages, args.max_stages, device, logger, args
+            total_loss, losses = compute_loss(
+                ratios_sequence=ratios_sequence,
+                directions_sequence=directions_sequence,
+                ratios=ratios,
+                directions=directions,
+                num_stages=num_stages,
+                device=device,
+                args=args
             )
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -316,109 +226,83 @@ def train(args):
             train_losses['total'] += total_loss.item()
             for key in losses:
                 train_losses[key] += losses[key].item()
-            train_f1_activity.append(f1_activity.item())
-            train_f1_param_activity.append(f1_param_activity.item())
 
             if batch_idx % 10 == 0:
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
-                            f"Total Loss: {total_loss.item():.4f}, MSE: {losses['loss_mse'].item():.4f}, "
-                            f"Activity: {losses['loss_activity'].item():.4f}, Param Activity: {losses['loss_param_activity'].item():.4f}, "
-                            f"Padded Loss: {losses['padded_loss'].item():.4f}, "
-                            f"Consistency: {losses['consistency_loss'].item():.4f}, "
-                            f"F1 Activity: {f1_activity.item():.4f}, F1 Param Activity: {f1_param_activity.item():.4f}, "
-                            f"TF Count: {tf_count}")
-
-        total_possible_tf_instances = args.num_teeth * (args.max_stages - 1) * args.batch_size * len(train_loader)
-        tf_percentage = (total_tf_count / total_possible_tf_instances) * 100 if total_possible_tf_instances > 0 else 0.0
-        logger.info(f"Epoch {epoch+1}/{args.epochs}, Teacher Forcing Usage: {tf_percentage:.2f}%")
+                            f"Total Loss: {total_loss.item():.4f}, Trans: {losses['loss_trans'].item():.4f}, "
+                            f"Padded: {losses['loss_padded'].item():.4f}, Consistency: {losses['loss_consistency'].item():.4f}, "
+                            f"Directions: {losses['loss_directions'].item():.4f}")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
-            if scheduler_dgcnn is not None:
+            if scheduler_dgcnn:
                 scheduler_dgcnn.step()
-            if scheduler_decoder is not None:
+            if scheduler_decoder:
                 scheduler_decoder.step()
 
         for key in train_losses:
             train_losses[key] /= len(train_loader)
-        mean_train_f1_activity = np.mean(train_f1_activity)
-        mean_train_f1_param_activity = np.mean(train_f1_param_activity)
 
         train_loss_history['total'].append(train_losses['total'])
-        train_loss_history['loss_mse'].append(train_losses['loss_mse'])
-        train_loss_history['loss_activity'].append(train_losses['loss_activity'])
-        train_loss_history['loss_param_activity'].append(train_losses['loss_param_activity'])
-        train_loss_history['padded_loss'].append(train_losses['padded_loss'])
-        train_loss_history['consistency_loss'].append(train_losses['consistency_loss'])
-        train_loss_history['mean_f1_activity'].append(mean_train_f1_activity)
-        train_loss_history['mean_f1_param_activity'].append(mean_train_f1_param_activity)
+        for key in losses:
+            train_loss_history[key].append(train_losses[key])
 
         model.eval()
         val_losses = {
             'total': 0.0,
-            'loss_mse': 0.0,
-            'loss_activity': 0.0,
-            'loss_param_activity': 0.0,
-            'padded_loss': 0.0,
-            'consistency_loss': 0.0
+            'loss_trans': 0.0,
+            'loss_padded': 0.0,
+            'loss_consistency': 0.0,
+            'loss_directions': 0.0
         }
-        val_f1_activity = []
-        val_f1_param_activity = []
 
         with torch.no_grad():
-            for jaw_id, feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages in val_loader:
-                feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages = [
-                    x.to(device) if isinstance(x, torch.Tensor) else x for x in [feats, transforms, cumulative_transforms, activity, param_activity, cumulative_activity, cumulative_param_activity, directions, num_stages]
+            for jaw_id, feats, ratios, cumulative_transformations, directions, num_stages in val_loader:
+                feats, ratios, cumulative_transformations, directions, num_stages = [
+                    x.to(device) for x in [feats, ratios, cumulative_transformations, directions, num_stages]
                 ]
 
                 outputs = model(
                     coordinates=feats,
-                    targets=transforms,
-                    cumulative_targets=cumulative_transforms,
-                    activity_targets=activity,
-                    param_activity_targets=param_activity,
-                    directions=directions,
+                    cumulative_targets=cumulative_transformations,
                     num_stages=num_stages,
-                    epoch=epoch,
-                    total_epochs=args.epochs,
-                    val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
+                    targets=ratios,
+                    directions=directions,
                     training=False
                 )
-                pred_transforms, activity_logits, param_activity_logits, _ = outputs
+                ratios_sequence, directions_sequence = outputs
 
-                total_loss, losses, f1_activity, f1_param_activity, _ = compute_loss(
-                    pred_transforms, activity_logits, param_activity_logits,
-                    transforms, activity, param_activity, cumulative_transforms,
-                    num_stages, args.max_stages, device, logger, args
+                total_loss, losses = compute_loss(
+                    ratios_sequence=ratios_sequence,
+                    directions_sequence=directions_sequence,
+                    ratios=ratios,
+                    directions=directions,
+                    num_stages=num_stages,
+                    device=device,
+                    args=args
                 )
 
                 val_losses['total'] += total_loss.item()
                 for key in losses:
                     val_losses[key] += losses[key].item()
-                val_f1_activity.append(f1_activity.item())
-                val_f1_param_activity.append(f1_param_activity.item())
 
         for key in val_losses:
             val_losses[key] /= len(val_loader)
-        mean_val_f1_activity = np.mean(val_f1_activity)
-        mean_val_f1_param_activity = np.mean(val_f1_param_activity)
 
         if args.use_scheduler and args.scheduler.lower() == 'reduceonplateau':
-            if scheduler_dgcnn is not None:
+            if scheduler_dgcnn:
                 scheduler_dgcnn.step(val_losses['total'])
-            if scheduler_decoder is not None:
+            if scheduler_decoder:
                 scheduler_decoder.step(val_losses['total'])
 
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Train Loss: {train_losses['total']:.4f}, MSE: {train_losses['loss_mse']:.4f}, "
-                    f"Activity: {train_losses['loss_activity']:.4f}, Param Activity: {train_losses['loss_param_activity']:.4f}, "
-                    f"Padded: {train_losses['padded_loss']:.4f}, Consistency: {train_losses['consistency_loss']:.4f}, "
-                    f"Train Mean F1 Activity: {mean_train_f1_activity:.4f}, Train Mean F1 Param Activity: {mean_train_f1_param_activity:.4f}")
+                    f"Train Loss: {train_losses['total']:.4f}, Trans: {train_losses['loss_trans']:.4f}, "
+                    f"Padded: {train_losses['loss_padded']:.4f}, Consistency: {train_losses['loss_consistency']:.4f}, "
+                    f"Directions: {train_losses['loss_directions']:.4f}")
         
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Val Loss: {val_losses['total']:.4f}, MSE: {val_losses['loss_mse']:.4f}, "
-                    f"Activity: {val_losses['loss_activity']:.4f}, Param Activity: {val_losses['loss_param_activity']:.4f}, "
-                    f"Padded: {val_losses['padded_loss']:.4f}, Consistency: {val_losses['consistency_loss']:.4f}, "
-                    f"Val Mean F1 Activity: {mean_val_f1_activity:.4f}, Val Mean F1 Param Activity: {mean_val_f1_param_activity:.4f}")
+                    f"Val Loss: {val_losses['total']:.4f}, Trans: {val_losses['loss_trans']:.4f}, "
+                    f"Padded: {val_losses['loss_padded']:.4f}, Consistency: {val_losses['loss_consistency']:.4f}, "
+                    f"Directions: {val_losses['loss_directions']:.4f}")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
@@ -428,8 +312,8 @@ def train(args):
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
+                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn else None,
+                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder else None,
                 'val_loss': val_losses['total']
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
@@ -437,10 +321,10 @@ def train(args):
 
             for key in train_loss_history:
                 np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
-                logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
+                logger.info(f"Saved train {key} history")
             for key in val_loss_history:
                 np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
-                logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
+                logger.info(f"Saved validation {key} history")
 
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
@@ -458,13 +342,13 @@ def train(args):
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder is not None else None,
+                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn else None,
+                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder else None,
                 'val_loss': best_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
             logger.info(f"Saved best full model at epoch {best_epoch} with val_loss {best_val_loss:.4f}")
-            logger.info(f"Early stopping triggered at epoch {epoch+1} after {args.patience} epochs without improvement")
+            logger.info(f"Early stopping triggered at epoch {epoch+1}")
             break
 
         if epoch == args.epochs - 1:
@@ -476,8 +360,8 @@ def train(args):
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
                 'optimizer_decoder_state_dict': optimizer_decoder.state_dict(),
-                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
-                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_dgcnn is not None else None,
+                'scheduler_dgcnn_state_dict': scheduler_dgcnn.state_dict() if args.use_scheduler and scheduler_dgcnn else None,
+                'scheduler_decoder_state_dict': scheduler_decoder.state_dict() if args.use_scheduler and scheduler_decoder else None,
                 'val_loss': last_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
@@ -485,11 +369,11 @@ def train(args):
 
     for key in train_loss_history:
         np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
-        logger.info(f"Saved train {key} history to {os.path.join(args.output_dir, f'train_{key}_history.npy')}")
+        logger.info(f"Saved train {key} history")
     
     for key in val_loss_history:
         np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
-        logger.info(f"Saved validation {key} history to {os.path.join(args.output_dir, f'val_{key}_history.npy')}")
+        logger.info(f"Saved validation {key} history")
 
     logger.info("Training completed")
 
@@ -500,47 +384,38 @@ if __name__ == "__main__":
     parser.add_argument('--log_file', type=str, default='training_log_decoder.txt', help='Path to log file')
     parser.add_argument('--cache_dir', type=str, default='./cache', help='Path to cache directory')
     parser.add_argument('--pretrained_dgcnn_path', type=str, default=None, help='Path to pretrained DGCNN weights')
-    parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model (optional)')
-    parser.add_argument('--num_points', type=int, default=4000, help='Number of points per tooth')
+    parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint of the whole model')
+    parser.add_argument('--num_points', type=int, default=1000, help='Number of points per tooth')
     parser.add_argument('--channels', type=int, default=3, help='Number of feature channels')
     parser.add_argument('--train_ratio', type=float, default=0.8, help='Train/validation split ratio')
     parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
     parser.add_argument('--k', type=int, default=10, help='Number of k in DGCNN')
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
-    parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers in Transformer')
-    parser.add_argument('--decoder_type', type=str, default='per_tooth', help='Type of used decoder model')
+    parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers')
+    parser.add_argument('--decoder_type', type=str, default='mlp_predictor', help='Decoder type (mlp_predictor or transformer)')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
-    parser.add_argument('--teacher_forcing_prob', type=float, default=0.9, help='Teacher forcing probability')
     parser.add_argument('--max_stages', type=int, default=25, help='Maximum number of stages')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
     parser.add_argument('--w_trans', type=float, default=2.0, help='Weight for transformation loss')
-    parser.add_argument('--w_activity', type=float, default= 2.0, help='Weight for activity loss')
-    parser.add_argument('--w_param_activity', type=float, default=2.0, help='Weight for param activity loss')
     parser.add_argument('--w_padded', type=float, default=1.0, help='Weight for padded loss')
     parser.add_argument('--w_consistency', type=float, default=0.1, help='Weight for consistency loss')
+    parser.add_argument('--w_directions', type=float, default=1.0, help='Weight for direction loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'radam', 'lion', 'sparseadam', 'adan', 'caadam'], help='Optimizer type')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan'], help='Optimizer type')
     parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizer')
-    parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'], help='Learning rate scheduler type')
-    parser.add_argument('--scheduler_eta_min', type=float, default=0.0, help='Minimum learning rate for CosineAnnealing')
+    parser.add_argument('--scheduler', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'], help='Scheduler type')
+    parser.add_argument('--scheduler_eta_min', type=float, default=0.0, help='Minimum learning rate')
     parser.add_argument('--scheduler_factor', type=float, default=0.5, help='Factor for ReduceLROnPlateau')
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau')
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of warmup epochs')
     parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Starting factor for warmup')
-    parser.add_argument('--use_scheduler', type=bool, default=False, help='Whether to use a learning rate scheduler')
-    parser.add_argument('--small_error_threshold', type=float, default=1.0, help='Threshold for small errors in transformation loss')
-    parser.add_argument('--small_error_scale', type=float, default=5.0, help='Scale factor for small errors in transformation loss')
-    parser.add_argument('--large_delta', type=float, default=5.0, help='Delta for large errors in transformation loss')
-    parser.add_argument('--max_error', type=float, default=40.0, help='Maximum error clamp in transformation loss')
-    parser.add_argument('--use_focal_loss', type=bool, default=True, help='Use focal loss for activity losses')
-    parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha parameter for focal loss')
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
-    parser.add_argument('--use_scaler', type=bool, default=False, help='Whether to apply scaler to transformations')
-    parser.add_argument('--scaler_type', type=str, default='robust', choices=['robust', 'standard'], help='Type of scaler (robust or standard)')
+    parser.add_argument('--use_scheduler', type=bool, default=False, help='Use learning rate scheduler')
+    parser.add_argument('--use_scaler', type=bool, default=False, help='Apply scaler to transformations')
+    parser.add_argument('--scaler_type', type=str, default='robust', choices=['robust', 'standard'], help='Scaler type')
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
