@@ -309,9 +309,6 @@ class PerToothTransformerDecoder(nn.Module):
             logger.error(f"Invalid transforms_sequence shape: got {transforms_sequence.shape}, expected {(B, self.max_stages, self.num_teeth, 6)}")
             raise RuntimeError("transforms_sequence shape mismatch")
 
-        cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)
-        transforms_sequence = transforms_sequence * (1 - cumulative_zero_mask)
-
         logger.debug(f"Output stats: transforms_mean={transforms_sequence.mean().item():.4f}, "
                      f"transforms_min={transforms_sequence.min().item():.4f}, "
                      f"transforms_max={transforms_sequence.max().item():.4f}, "

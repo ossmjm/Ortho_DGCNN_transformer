@@ -76,8 +76,8 @@ class JawTeethDataset(Dataset):
             else:
                 raise ValueError(f"Invalid scaler_type: {self.scaler_type}. Must be 'robust' or 'standard'.")
 
-        if self.split not in ['train', 'val']:
-            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' since test cases are handled separately.")
+        if not self.inference and self.split not in ['train', 'val']:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' for training/validation.")
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
@@ -235,22 +235,22 @@ class JawTeethDataset(Dataset):
         return feats if self.inference else (feats, vertices_list, faces_list)
 
     def _initialize_dataset(self):
-        self.logger.info(f"Initializing dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}")
-
-        num_stages_file = os.path.join(self.data_dir, "num_stages.xlsx")
-        num_stages_df = pd.read_excel(num_stages_file, dtype={"Jaw_ID": str}) if not self.inference and os.path.exists(num_stages_file) else pd.DataFrame()
+        self.logger.info(f"Initializing dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}, inference={self.inference}")
 
         cases = [d for d in os.listdir(self.data_dir) if os.path.isdir(os.path.join(self.data_dir, d)) and d.isdigit()]
         self.logger.info(f"Found {len(cases)} cases: {cases}")
 
-        train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
-        if self.split == 'train':
-            self.cases = train_cases
-        else:  # self.split == 'val'
-            self.cases = val_cases
+        if not self.inference:
+            train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
+            self.cases = train_cases if self.split == 'train' else val_cases
+        else:
+            self.cases = cases  # Use all cases for inference
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
-        if self.split == 'train' and not self.inference and self.use_scaler:
+        num_stages_file = os.path.join(self.data_dir, "num_stages.xlsx")
+        num_stages_df = pd.read_excel(num_stages_file, dtype={"Jaw_ID": str}) if not self.inference and os.path.exists(num_stages_file) else pd.DataFrame()
+
+        if not self.inference and self.split == 'train' and self.use_scaler:
             all_transforms = [[] for _ in range(6)]
             columns = [
                 "Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
@@ -472,8 +472,8 @@ class CumulativeJawTeethDataset(Dataset):
             else:
                 raise ValueError(f"Invalid scaler_type: {self.scaler_type}. Must be 'robust' or 'standard'.")
 
-        if self.split not in ['train', 'val']:
-            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' since test cases are handled separately.")
+        if not self.inference and self.split not in ['train', 'val']:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'val' for training/validation.")
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self._initialize_dataset()
@@ -573,16 +573,16 @@ class CumulativeJawTeethDataset(Dataset):
         return torch.stack(feats_list)
 
     def _initialize_dataset(self):
-        self.logger.info(f"Initializing cumulative dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}")
+        self.logger.info(f"Initializing cumulative dataset for split '{self.split}' with use_scaler={self.use_scaler}, scaler_type={self.scaler_type}, inference={self.inference}")
 
         cases = [d for d in os.listdir(self.data_dir) if os.path.isdir(os.path.join(self.data_dir, d)) and d.isdigit()]
         self.logger.info(f"Found {len(cases)} cases: {cases}")
 
-        train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
-        if self.split == 'train':
-            self.cases = train_cases
-        else:  # self.split == 'val'
-            self.cases = val_cases
+        if not self.inference:
+            train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
+            self.cases = train_cases if self.split == 'train' else val_cases
+        else:
+            self.cases = cases  # Use all cases for inference
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
         scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
@@ -595,7 +595,7 @@ class CumulativeJawTeethDataset(Dataset):
             "Mesial/Distal (degrees)",
             "Rotation (degrees)"
         ]
-        if self.split == 'train' and not self.inference and self.use_scaler:
+        if not self.inference and self.split == 'train' and self.use_scaler:
             self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
             all_transforms = []
             for case in self.cases:
