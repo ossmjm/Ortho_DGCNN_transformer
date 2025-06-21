@@ -15,23 +15,36 @@ def binary_focal_loss(logits, targets, alpha=0.25, gamma=2.0, reduction='sum'):
     return loss.sum() if reduction == 'sum' else loss.mean()
 
 class HybridTransformLoss(nn.Module):
-    """Loss for per-stage tooth transformations, using adaptive Huber loss with sparsity term."""
-    def __init__(self, weight=1.0, small_error_threshold=0.5, large_delta=5.0, sparse_weight=0.5, max_error=40.0, small_error_scale=5.0):
+    """Loss for per-stage tooth transformations, using adaptive Huber loss for active elements."""
+    def __init__(self, weight=1.0, small_error_threshold=0.5, large_delta=5.0, max_error=40.0, small_error_scale=5.0):
         super().__init__()
         self.weight = weight
         self.small_error_threshold = small_error_threshold
         self.large_delta = large_delta
-        self.sparse_weight = sparse_weight
         self.max_error = max_error
         self.small_delta = 0.1  # Small delta for high precision
         self.small_error_scale = small_error_scale  # Scale for small errors
 
-    def forward(self, pred, target, activity_mask=None, stage_weights=None):
-        """Compute loss between predicted and target transformations."""
+    def forward(self, pred, target, true_num_stages, activity_labels, param_activity_labels):
+        """Compute loss between predicted and target transformations for active stages, teeth, and parameters."""
         logger = logging.getLogger('TrainLogger')
         if not (torch.all(pred.isfinite()) and torch.all(target.isfinite())):
             logger.error("Pred or target contains NaN/Inf")
             raise ValueError("Pred or target contains NaN/Inf")
+
+        batch_size, max_stages, num_teeth, num_params = pred.shape
+        device = pred.device
+
+        # Create combined activity mask
+        stage_mask = torch.arange(max_stages, device=device).unsqueeze(0).expand(batch_size, max_stages)
+        stage_mask = (stage_mask < true_num_stages.unsqueeze(1)).float().unsqueeze(-1).unsqueeze(-1)
+        tooth_activity_mask = activity_labels.unsqueeze(-1).float()  # [B, max_stages, num_teeth, 1]
+        param_activity_mask = param_activity_labels.float()  # [B, max_stages, num_teeth, num_params]
+        combined_mask = stage_mask * tooth_activity_mask * param_activity_mask
+
+        if not torch.all(combined_mask.isfinite()):
+            logger.error("Combined activity mask contains NaN/Inf")
+            raise ValueError("Combined activity mask contains NaN/Inf")
 
         error = torch.clamp(pred - target, -self.max_error, self.max_error)
         abs_error = torch.abs(error)
@@ -42,7 +55,7 @@ class HybridTransformLoss(nn.Module):
             abs_error < self.small_delta,
             0.5 * (error ** 2) / self.small_delta,
             abs_error - 0.5 * self.small_delta
-        ) * small_mask * self.small_error_scale  # Use small_error_scale
+        ) * small_mask * self.small_error_scale
 
         # Large error Huber loss (tolerate high values)
         large_loss = torch.where(
@@ -51,29 +64,13 @@ class HybridTransformLoss(nn.Module):
             abs_error - 0.5 * self.large_delta
         ) * (1 - small_mask)
 
-        # Sparsity term: penalize non-zero predictions for zero targets
-        sparse_mask = (target == 0).float()
-        sparse_loss = torch.abs(pred) * sparse_mask * self.sparse_weight
+        loss = (small_loss + large_loss) * combined_mask
 
-        loss = small_loss + large_loss + sparse_loss
-
-        if activity_mask is not None:
-            if not torch.all(activity_mask.isfinite()):
-                logger.error("Activity mask contains NaN/Inf")
-                raise ValueError("Activity mask contains NaN/Inf")
-            loss = loss * activity_mask
-
-        if stage_weights is not None:
-            if not torch.all(stage_weights.isfinite()):
-                logger.error("Stage weights contain NaN/Inf")
-                raise ValueError("Stage weights contain NaN/Inf")
-            loss = loss * stage_weights
-
-        num_active = activity_mask.sum() if activity_mask is not None else loss.numel()
+        num_active = combined_mask.sum()
         num_active = max(num_active, 1.0)
         loss = self.weight * loss.sum() / num_active
 
-        logger.debug(f"HybridTransformLoss: small_loss={small_loss.mean().item():.4f}, large_loss={large_loss.mean().item():.4f}, sparse_loss={sparse_loss.mean().item():.4f}, total={loss.item():.4f}")
+        logger.debug(f"HybridTransformLoss: small_loss={small_loss.mean().item():.4f}, large_loss={large_loss.mean().item():.4f}, total={loss.item():.4f}, active_elements={num_active.item()}")
         return loss if loss.isfinite() else torch.tensor(0.0, device=pred.device, requires_grad=True)
 
 class ToothActivityLoss(nn.Module):
@@ -173,68 +170,10 @@ class ParamActivityLoss(nn.Module):
 
         logger.debug(f"ParamActivityLoss: loss={loss.item():.4f}, f1={f1.item():.4f}, active_elements={num_active.item()}, alpha={alpha:.4f}")
         return loss, f1
-    
-class StageActivityLoss(nn.Module):
-    """Loss for predicting binary stage activity with sequential constraint."""
-    def __init__(self, weight=1.0, seq_penalty=0.1, use_focal=True, gamma=2.0):
-        super().__init__()
-        self.weight = weight
-        self.seq_penalty = seq_penalty
-        self.use_focal = use_focal
-        self.gamma = gamma
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
-    def forward(self, logits, true_num_stages):
-        """Compute loss and F1 score for stage activity predictions."""
-        logger = logging.getLogger('TrainLogger')
-        if not torch.all(logits.isfinite()):
-            logger.error("Stage activity logits contain NaN/Inf")
-            raise ValueError("Stage activity logits contain NaN/Inf")
-
-        batch_size, max_stages = logits.shape
-        device = logits.device
-
-        # Label active stages (1) and inactive stages (0)
-        stage_labels = torch.zeros_like(logits, device=device)
-        stage_mask = torch.arange(max_stages, device=device).unsqueeze(0).expand(batch_size, max_stages)
-        active_mask = (stage_mask < true_num_stages.unsqueeze(1))
-        stage_labels[active_mask] = 1.0
-
-        # Debug: Log unique labels to verify
-        logger.debug(f"Stage labels unique values: {torch.unique(stage_labels).tolist()}")
-
-        # Dynamic alpha based on class imbalance
-        pos_ratio = stage_labels.sum() / max(stage_labels.numel(), 1)
-        alpha = 1.0 - pos_ratio if pos_ratio > 0 else 0.5  # Inverse of positive ratio for class weighting
-
-        # Compute loss over all stages
-        if self.use_focal:
-            loss = binary_focal_loss(logits, stage_labels, alpha, self.gamma, reduction='sum')
-        else:
-            loss = self.bce_loss(logits, stage_labels).sum()
-
-        loss = loss / max(logits.numel(), 1.0)
-
-        # Sequential penalty: penalize active stages after inactive ones
-        preds = torch.sigmoid(logits)
-        seq_penalty = torch.zeros(1, device=device)
-        for i in range(max_stages - 1):
-            invalid_seq = (preds[:, i] < 0.5) & (preds[:, i + 1] > 0.5)
-            seq_penalty += invalid_seq.float().sum()
-        seq_penalty = self.seq_penalty * seq_penalty / max(batch_size, 1)
-
-        total_loss = self.weight * (loss + seq_penalty)
-
-        # F1 score over all stages
-        valid_labels = stage_labels
-        logger.debug(f"Valid labels unique values: {torch.unique(valid_labels).tolist()}")
-        f1 = binary_f1_score(preds.flatten(), valid_labels.flatten(), threshold=0.5)
-        logger.debug(f"StageActivityLoss: loss={loss.item():.4f}, seq_penalty={seq_penalty.item():.4f}, total={total_loss.item():.4f}, f1={f1.item():.4f}, total_stages={logits.numel()}, alpha={alpha:.4f}")
-        return total_loss, f1
-    
 class PaddedLoss(nn.Module):
     """Loss to penalize non-zero transformations in padded stages."""
-    def __init__(self, weight=1.0):
+    def __init__(self, weight=2.0):
         super().__init__()
         self.weight = weight
 
@@ -256,13 +195,13 @@ class PaddedLoss(nn.Module):
         return self.weight * loss
 
 class ConsistencyLoss(nn.Module):
-    """Loss to ensure sum of per-stage transformations matches cumulative transforms per tooth and parameter."""
+    """Loss to ensure sum of per-stage transformations matches cumulative transforms for active elements."""
     def __init__(self, weight=1.0):
         super().__init__()
         self.weight = weight
 
-    def forward(self, pred_transforms, cumulative_transforms, num_stages, max_stages, device, use_scaler=False, scalers=None):
-        """Compute MSE loss between summed predictions and cumulative transforms per tooth and parameter."""
+    def forward(self, pred_transforms, cumulative_transforms, num_stages, max_stages, device, activity_labels, param_activity_labels, use_scaler=False, scalers=None):
+        """Compute MSE loss between summed predictions and cumulative transforms for active stages, teeth, and parameters."""
         logger = logging.getLogger('TrainLogger')
         if not (torch.all(pred_transforms.isfinite()) and torch.all(cumulative_transforms.isfinite())):
             logger.error("Pred or cumulative transforms contain NaN/Inf")
@@ -270,12 +209,12 @@ class ConsistencyLoss(nn.Module):
 
         batch_size, _, num_teeth, num_params = pred_transforms.shape
 
-        # Mask valid stages
+        # Create combined activity mask
         stage_mask = torch.arange(max_stages, device=device).unsqueeze(0).expand(batch_size, max_stages)
         stage_mask = (stage_mask < num_stages.unsqueeze(1)).float().unsqueeze(-1).unsqueeze(-1)
-
-        # Activity mask for cumulative transforms
-        active_mask = (cumulative_transforms != 0).float().unsqueeze(1)
+        tooth_activity_mask = activity_labels.unsqueeze(-1).float()  # [B, max_stages, num_teeth, 1]
+        param_activity_mask = param_activity_labels.float()  # [B, max_stages, num_teeth, num_params]
+        combined_mask = stage_mask * tooth_activity_mask * param_activity_mask  # [B, max_stages, num_teeth, num_params]
 
         # Initialize loss
         total_loss = 0.0
@@ -298,21 +237,21 @@ class ConsistencyLoss(nn.Module):
                         raise ValueError(f"Failed to inverse scale parameter {param_idx} for tooth {tooth_idx}: {e}")
 
                 # Sum unscaled (or original) predictions over valid stages
-                masked_preds = preds * stage_mask.squeeze(-1).squeeze(-1)
+                masked_preds = preds * combined_mask[:, :, tooth_idx, param_idx]
                 pred_sum = masked_preds.sum(dim=1)  # Shape: (batch_size,)
 
                 target = cumulative_transforms[:, tooth_idx, param_idx]  # Shape: (batch_size,)
+                target = target * (cumulative_transforms[:, tooth_idx, param_idx] != 0).float()
 
-                # Apply active mask
-                active = active_mask[:, 0, tooth_idx, param_idx]
-                loss = F.mse_loss(pred_sum * active, target * active, reduction='sum') / max(active.sum(), 1)
+                # Compute MSE loss
+                loss = F.mse_loss(pred_sum, target, reduction='sum') / max(combined_mask[:, :, tooth_idx, param_idx].sum(), 1)
 
                 total_loss += loss
 
-                # Log for debugging
+                # Detailed logging
                 logger.debug(f"ConsistencyLoss tooth {tooth_idx} param {param_idx}: "
                              f"loss={loss.item():.4f}, pred_sum_mean={pred_sum.mean().item():.4f}, "
-                             f"target_mean={target.mean().item():.4f}, active_count={active.sum().item()}")
+                             f"target_mean={target.mean().item():.4f}, active_count={combined_mask[:, :, tooth_idx, param_idx].sum().item()}")
 
                 count += 1
 

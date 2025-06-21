@@ -50,11 +50,6 @@ class PerToothTransformerDecoder(nn.Module):
         ])
 
         # Enhanced MLP heads
-        self.stage_activity_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 256), nn.GELU(),
-            nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, 1)
-        )
         self.activity_mlp = nn.Sequential(
             nn.Linear(embed_dim, 256), nn.GELU(),
             nn.Linear(256, 128), nn.GELU(),
@@ -166,7 +161,6 @@ class PerToothTransformerDecoder(nn.Module):
         activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, device=device)
         param_activity_logits = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         param_activity_masks = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
-        stage_activity_logits = torch.zeros(B, self.max_stages, device=device)
 
         # Initialize previous sequences as lists to avoid inplace modifications
         prev_transform_seq = [torch.zeros(B, 6, device=device) for _ in range(self.max_stages)]
@@ -176,19 +170,18 @@ class PerToothTransformerDecoder(nn.Module):
         # Initialize teacher forcing counter
         tf_count = 0
 
-        # Collect tooth outputs for stage activity
-        tooth_outputs = []
-
         for tooth_idx in range(self.num_teeth):
             for stage_idx in range(self.max_stages):
-                # Simplified teacher forcing logic
-                tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
-                effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else 1.0)
-                batch_tf_mask = (stage_idx > 0) & (stage_idx <= num_stages) & (torch.rand(B, device=device) < effective_tf_prob) if num_stages is not None else torch.zeros(B, dtype=torch.bool, device=device)
+                # Single teacher forcing probability for all target types
+                tf_prob = self._get_teacher_forcing_params(
+                    epoch, total_epochs, stage_idx, num_stages, val_loss)
+                effective_tf_prob = min(tf_prob, use_teacher_forcing if isinstance(use_teacher_forcing, float) else True)
+                batch_tf_mask = (torch.rand(B, device=device) < effective_tf_prob)
                 use_tf = training and batch_tf_mask.any().item()
                 if use_tf:
                     tf_count += batch_tf_mask.sum().item()
-                    logger.debug(f"Applying teacher forcing for tooth {tooth_idx}, stage {stage_idx}, batch_tf_mask={batch_tf_mask.sum().item()}/{B}")
+                    logger.debug(f"Applying teacher forcing for tooth {tooth_idx}, stage {stage_idx}, "
+                                 f"batch_tf_mask={batch_tf_mask.sum().item()}/{B}")
 
                 start_idx = 0
                 if use_tf and targets is not None:
@@ -226,7 +219,7 @@ class PerToothTransformerDecoder(nn.Module):
                 else:
                     predicted_activity_prev = torch.stack(prev_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 1, device=device)
                     embedded_activity = self.activity_target_embed(predicted_activity_prev.float() if predicted_activity_prev.shape[1] > 0 else torch.zeros(B, 1, device=device).float())
-                    if predicted_prev.shape[1] > 0:
+                    if predicted_activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_activity = self.activity_norm(embedded_activity)
                         if embedded_activity.isnan().any():
@@ -247,8 +240,8 @@ class PerToothTransformerDecoder(nn.Module):
                     embedded_param_activity = embedded_param_activity.squeeze(1).clamp(0, 30)
                 else:
                     predicted_param_activity_prev = torch.stack(prev_param_activity_seq[start_idx:stage_idx], dim=1) if stage_idx > start_idx else torch.zeros(B, 0, 6, device=device)
-                    embedded_param_activity = self.param_activity_target_embed(predicted_param_activity_prev.float() if predicted_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
-                    if predicted_prev.shape[1] > 0:
+                    embedded_param_activity = self.param_activity_target_embed(predicted_param_activity_prev.float() if predicted_param_activity_prev.shape[1] > 0 else torch.zeros(B, 6, device=device).float())
+                    if predicted_param_activity_prev.shape[1] > 0:
                         query = self.pos_embed[:, stage_idx, :].expand(B, 1, -1)
                         embedded_param_activity = self.param_activity_norm(embedded_param_activity)
                         if embedded_param_activity.isnan().any():
@@ -271,8 +264,6 @@ class PerToothTransformerDecoder(nn.Module):
 
                 output = self.tooth_decoders[tooth_idx](tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
                 output = self.final_norm(output.squeeze(1))
-
-                tooth_outputs.append(output)  # Collect for stage activity
 
                 activity_mlp_out = self.activity_mlp(output)
                 param_activity_mlp_out = self.param_activity_mlp(output)
@@ -313,13 +304,6 @@ class PerToothTransformerDecoder(nn.Module):
                     new_param_activity_seq[batch_tf_mask] = tf_updates
                     prev_param_activity_seq[stage_idx] = new_param_activity_seq
 
-            # Compute stage_activity_logits after processing all teeth for the stage
-            if tooth_outputs:
-                stage_output = torch.stack(tooth_outputs[-self.num_teeth:], dim=1)  # Shape: (B, num_teeth, embed_dim)
-                stage_output = stage_output.mean(dim=1)  # Aggregate across teeth: (B, embed_dim)
-                stage_activity_logit = self.stage_activity_mlp(stage_output).squeeze(-1)
-                stage_activity_logits[:, stage_idx] = stage_activity_logit
-
         # Validate transforms_sequence shape
         if transforms_sequence.shape != (B, self.max_stages, self.num_teeth, 6):
             logger.error(f"Invalid transforms_sequence shape: got {transforms_sequence.shape}, expected {(B, self.max_stages, self.num_teeth, 6)}")
@@ -332,7 +316,6 @@ class PerToothTransformerDecoder(nn.Module):
                      f"transforms_min={transforms_sequence.min().item():.4f}, "
                      f"transforms_max={transforms_sequence.max().item():.4f}, "
                      f"activity_logits_mean={activity_logits.mean().item():.4f}, "
-                     f"param_activity_logits_mean={param_activity_logits.mean().item():.4f}, "
-                     f"stage_activity_logits_mean={stage_activity_logits.mean().item():.4f}")
+                     f"param_activity_logits_mean={param_activity_logits.mean().item():.4f}")
 
-        return [transforms_sequence, activity_logits, param_activity_logits, stage_activity_logits, tf_count]
+        return [transforms_sequence, activity_logits, param_activity_logits, tf_count]
