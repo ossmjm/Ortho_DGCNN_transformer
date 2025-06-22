@@ -297,6 +297,10 @@ def train(args):
 
         for key in val_losses:
             val_losses[key] /= len(val_loader)
+        
+        val_loss_history['total'].append(val_losses['total'])
+        for key in losses:
+            val_loss_history[key].append(val_losses[key])        
 
         if args.use_scheduler and args.scheduler.lower() == 'reduceonplateau':
             if scheduler_dgcnn:
@@ -359,6 +363,13 @@ def train(args):
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
             logger.info(f"Saved best full model at epoch {best_epoch} with val_loss {best_val_loss:.4f}")
             logger.info(f"Early stopping triggered at epoch {epoch+1}")
+            for key in train_loss_history:
+                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
+                logger.info(f"Saved train {key} history")
+            for key in val_loss_history:
+                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
+                logger.info(f"Saved validation {key} history")
+
             break
 
         if epoch == args.epochs - 1:
