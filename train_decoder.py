@@ -82,12 +82,13 @@ def train(args):
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         k=args.k,
-        decoder_type=args.decoder_type
+        decoder_type=args.decoder_type,
+        encoder_type=args.encoder_type
     ).to(device)
 
     optimizer_dgcnn = Optimizers(
         optimizer_name=args.optimizer,
-        parameters=model.dgcnn.parameters(),
+        parameters=model.encoder.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=args.optimizer_betas
@@ -116,7 +117,7 @@ def train(args):
             raise
     elif args.pretrained_dgcnn_path and os.path.exists(args.pretrained_dgcnn_path):
         checkpoint = torch.load(args.pretrained_dgcnn_path, map_location=device)
-        model.dgcnn.load_state_dict(checkpoint['model_state_dict'])
+        model.encoder.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"Loaded pretrained DGCNN weights from {args.pretrained_dgcnn_path}")
 
     scheduler_dgcnn = LRSchedulers(
@@ -223,7 +224,7 @@ def train(args):
                 continue
 
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.dgcnn.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), max_norm=0.5)
             torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=0.5)
             optimizer_dgcnn.step()
             optimizer_decoder.step()
@@ -316,7 +317,7 @@ def train(args):
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
                 'epoch': epoch + 1,
-                'dgcnn_state_dict': model.dgcnn.state_dict(),
+                'dgcnn_state_dict': model.encoder.state_dict(),
                 'decoder_state_dict': model.decoder.state_dict(),
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
@@ -346,7 +347,7 @@ def train(args):
         if patience_counter >= args.patience:
             checkpoint = {
                 'epoch': best_epoch,
-                'dgcnn_state_dict': model.dgcnn.state_dict(),
+                'dgcnn_state_dict': model.encoder.state_dict(),
                 'decoder_state_dict': model.decoder.state_dict(),
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
@@ -364,7 +365,7 @@ def train(args):
             last_val_loss = val_losses['total']
             checkpoint = {
                 'epoch': epoch + 1,
-                'dgcnn_state_dict': model.dgcnn.state_dict(),
+                'dgcnn_state_dict': model.encoder.state_dict(),
                 'decoder_state_dict': model.decoder.state_dict(),
                 'ortho_dgcnn_state_dict': model.state_dict(),
                 'optimizer_dgcnn_state_dict': optimizer_dgcnn.state_dict(),
@@ -402,7 +403,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
     parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers')
-    parser.add_argument('--decoder_type', type=str, default='mlp_predictor', help='Decoder type (mlp_predictor or transformer)')
+    parser.add_argument('--decoder_type', type=str, default='per_tooth', help='Decoder type (mlp_predictor or transformer)')
+    parser.add_argument('--encoder_type', type=str, default='dgcnn', help='Encoder type (DGCNN or pointnet++)')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
