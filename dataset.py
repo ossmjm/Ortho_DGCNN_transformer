@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler, StandardScaler
 import logging
 import re
+import open3d as o3d  # Added for curvature-aware sampling
 
 def setup_logging(log_file):
     logger = logging.getLogger('DatasetLogger')
@@ -34,6 +35,34 @@ def clean_numeric(value):
         return float(value) if value else 0.0
     except ValueError:
         return 0.0
+
+# Added function for curvature-aware sampling
+def curvature_aware_sampling(points, n_points, logger):
+    if len(points) <= n_points:
+        return points
+    try:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        # Estimate normals for curvature computation
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+        pcd.estimate_covariances()
+        curvatures = []
+        for cov in pcd.covariances:
+            eigvals = np.linalg.eigvals(cov)
+            curvature = eigvals.min() / (eigvals.sum() + 1e-6)  # Approximate curvature
+            curvatures.append(curvature)
+        curvatures = np.array(curvatures)
+        # Select 70% high-curvature points, 30% uniform
+        n_curvature = int(n_points * 0.7)
+        curvature_indices = np.argsort(curvatures)[-n_curvature:]
+        uniform_indices = np.random.choice(len(points), n_points - n_curvature, replace=False)
+        indices = np.concatenate([curvature_indices, uniform_indices])
+        np.random.shuffle(indices)  # Avoid bias in order
+        return points[indices]
+    except Exception as e:
+        logger.warning(f"Curvature-aware sampling failed: {e}. Falling back to random sampling.")
+        indices = np.random.choice(len(points), n_points, replace=False)
+        return points[indices]
 
 class JawTeethDataset(Dataset):
     def __init__(
@@ -67,7 +96,7 @@ class JawTeethDataset(Dataset):
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
-        self.scalers = [None for _ in range(6)]  # For cumulative transformations
+        self.scalers = [None for _ in range(6)]
         if self.use_scaler:
             if self.scaler_type == 'robust':
                 self.scalers = [RobustScaler() for _ in range(6)]
@@ -111,10 +140,8 @@ class JawTeethDataset(Dataset):
         for col in columns:
             df[col] = df[col].apply(clean_numeric)
             if is_cumulative:
-                # Keep signed values for cumulative_transformations
                 df[col] = df[col].replace([float('inf'), -float('inf')], 0.0)
             else:
-                # Apply absolute values for stage-wise transformations
                 df[col] = df[col].abs()
                 df[col] = df[col].replace([float('inf'), -float('inf')], 0.0)
             if (df[col] < 0).any() and not is_cumulative:
@@ -126,7 +153,7 @@ class JawTeethDataset(Dataset):
     def _load_transformations(self, jaw_id, transform_df, num_stages_df, cumulative_df):
         transformations = torch.zeros(self.max_stages, self.num_teeth, 6)
         ratios = torch.zeros(self.max_stages, self.num_teeth, 6)
-        directions = torch.ones(self.max_stages, self.num_teeth, 6)  # Per stage
+        directions = torch.ones(self.max_stages, self.num_teeth, 6)
         cumulative_transformations = torch.zeros(self.num_teeth, 6)
 
         num_stages_data = num_stages_df[num_stages_df["Jaw_ID"] == jaw_id]
@@ -160,11 +187,10 @@ class JawTeethDataset(Dataset):
                     row["Rotation (degrees)"]
                 ], dtype=torch.float32)
 
-        # Handle zero net movement cases (Solution 1)
         zero_net_cases = [
-            {'jaw_id': '076', 'tooth': '31', 'param_idx': 0},  # Left/Right (mm)
-            {'jaw_id': '130', 'tooth': '32', 'param_idx': 1},  # Forward/Backward (mm)
-            {'jaw_id': '226', 'tooth': '32', 'param_idx': 1}   # Forward/Backward (mm)
+            {'jaw_id': '076', 'tooth': '31', 'param_idx': 0},
+            {'jaw_id': '130', 'tooth': '32', 'param_idx': 1},
+            {'jaw_id': '226', 'tooth': '32', 'param_idx': 1}
         ]
         for case in zero_net_cases:
             if jaw_id == case['jaw_id'] and case['tooth'] in self.FDI_TO_INDEX:
@@ -175,8 +201,7 @@ class JawTeethDataset(Dataset):
                     ratios[:num_stages, tooth_idx, param_idx] = 0.0
                     self.logger.warning(f"Applied Solution 1 for Jaw_ID {jaw_id}, Tooth {case['tooth']}, Parameter {param_idx}: Set transformations and ratios to 0")
 
-        # Compute total absolute movement and ratios
-        total_abs_movement = torch.sum(torch.abs(transformations[:num_stages]), dim=0)  # [num_teeth, 6]
+        total_abs_movement = torch.sum(torch.abs(transformations[:num_stages]), dim=0)
         for t in range(self.num_teeth):
             for p in range(6):
                 if total_abs_movement[t, p] > 1e-6:
@@ -188,7 +213,6 @@ class JawTeethDataset(Dataset):
                 else:
                     ratios[:num_stages, t, p] = 0.0
 
-        # Apply scaling to cumulative_transformations
         if self.use_scaler and not self.inference:
             for p in range(6):
                 if self.scalers[p] is not None:
@@ -215,7 +239,6 @@ class JawTeethDataset(Dataset):
                     row["Rotation (degrees)"]
                 ], dtype=torch.float32)
 
-        # Apply inverse scaling in inference if use_scaler=True
         if self.inference and self.use_scaler:
             for p in range(6):
                 if self.scalers[p] is not None:
@@ -258,11 +281,11 @@ class JawTeethDataset(Dataset):
                     vertices = np.zeros((self.num_points, 3), dtype=np.float32)
                     faces = np.zeros((0, 3), dtype=np.int64)
                 else:
-                    np.random.seed(42)
+                    # Replaced random sampling with curvature-aware sampling
                     if len(vertices) > self.num_points:
-                        indices = np.random.choice(len(vertices), self.num_points, replace=False)
-                        points = vertices[indices]
-                        vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
+                        points = curvature_aware_sampling(vertices, self.num_points, self.logger)
+                        # Update faces to match sampled points
+                        vertex_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(np.argsort(vertices, axis=0)[:, 0].argsort()[points[:, 0].argsort()])}
                         faces = np.array([[vertex_mapping.get(idx, 0) for idx in face]
                                         for face in faces if all(idx in vertex_mapping for idx in face)], dtype=np.int64)
                     else:
@@ -615,17 +638,20 @@ class CumulativeJawTeethDataset(Dataset):
                 tooth_data = teeth_data[fdi]
                 vertices = np.array(tooth_data.get("v", []), dtype=np.float32)
 
-                np.random.seed(42)
-                if len(vertices) > self.num_points:
-                    indices = np.random.choice(len(vertices), self.num_points, replace=False)
-                    points = vertices[indices]
+                if len(vertices) == 0:
+                    self.logger.warning(f"Tooth {fdi} has no vertices in JSON file {json_file}")
+                    feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
                 else:
-                    points = vertices
-                    if len(points) < self.num_points:
-                        points = np.pad(points, ((0, self.num_points - len(points)), (0, 0)), mode='constant')[:self.num_points]
-                
-                feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
-                feats[:, :3] = torch.tensor(points, dtype=torch.float32)
+                    # Replaced random sampling with curvature-aware sampling
+                    if len(vertices) > self.num_points:
+                        points = curvature_aware_sampling(vertices, self.num_points, self.logger)
+                    else:
+                        points = vertices
+                        if len(points) < self.num_points:
+                            points = np.pad(points, ((0, self.num_points - len(points)), (0, 0)), mode='constant')[:self.num_points]
+                    
+                    feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
+                    feats[:, :3] = torch.tensor(points, dtype=torch.float32)
 
             feats_list[tooth_idx] = feats
 
@@ -641,7 +667,7 @@ class CumulativeJawTeethDataset(Dataset):
             train_cases, val_cases = train_test_split(cases, train_size=self.train_ratio, random_state=42)
             self.cases = train_cases if self.split == 'train' else val_cases
         else:
-            self.cases = cases  # Use all cases for inference
+            self.cases = cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
         scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
