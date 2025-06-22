@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 
 class TransformLoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self):
         super().__init__()
-        self.weight = weight
         self.kl_loss = nn.KLDivLoss(reduction='none')
 
     def forward(self, ratios_sequence, ratios, num_stages, device):
@@ -25,7 +24,7 @@ class TransformLoss(nn.Module):
         pred = torch.log(ratios_sequence.clamp(min=1e-6))  # [B, S, T, P]
         target = ratios.clamp(min=1e-6)  # [B, S, T, P]
         loss = (self.kl_loss(pred, target) * mask.float()).sum() / num_active  # Scalar
-        return self.weight * loss  # Weighted scalar loss
+        return loss  # Weighted scalar loss
 
 class PaddedLoss(nn.Module):
     def __init__(self, weight=1.0):
@@ -46,12 +45,11 @@ class PaddedLoss(nn.Module):
         target = torch.zeros_like(ratios_sequence, device=device)
         pred = ratios_sequence.clamp(min=0.0, max=1.0)  # [B, S, T, P]
         loss = (self.mse_loss(pred, target) * padded_mask.float()).sum() / num_padded  # Scalar
-        return self.weight * loss  # Weighted scalar loss
+        return loss  # Weighted scalar loss
 
 class ConsistencyLoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self):
         super().__init__()
-        self.weight = weight
         self.mse_loss = nn.MSELoss(reduction='none')
 
     def forward(self, ratios_sequence, ratios, num_stages, device):
@@ -74,12 +72,11 @@ class ConsistencyLoss(nn.Module):
         # Target: [B, T, P], 1.0 for active teeth/params, 0.0 otherwise
         target = torch.ones_like(ratios_sum, device=device) * active_tp_mask.float()
         loss = (self.mse_loss(pred, target) * active_tp_mask.float()).sum() / num_active_tp  # Scalar
-        return self.weight * loss  # Weighted scalar loss
+        return loss  # Weighted scalar loss
 
 class DirectionLoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self):
         super().__init__()
-        self.weight = weight
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, directions_sequence, directions, ratios, num_stages, device):
@@ -119,16 +116,16 @@ class DirectionLoss(nn.Module):
         recall = tp / (tp + fn + 1e-6)  # Avoid division by zero
         f1 = 2 * (precision * recall) / (precision + recall + 1e-6)  # F1 score
 
-        return self.weight * loss, f1  # Return weighted loss and F1 score
+        return loss, f1  # Return weighted loss and F1 score
 
 def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
     # ratios_sequence, directions_sequence, ratios, directions: [B, S, T, P]
     # num_stages: [B]
     # args: contains w_trans, w_padded, w_consistency, w_directions
-    transform_loss_fn = TransformLoss(weight=args.w_trans).to(device)
-    padded_loss_fn = PaddedLoss(weight=args.w_padded).to(device)
-    consistency_loss_fn = ConsistencyLoss(weight=args.w_consistency).to(device)
-    direction_loss_fn = DirectionLoss(weight=args.w_directions).to(device)
+    transform_loss_fn = TransformLoss().to(device)
+    padded_loss_fn = PaddedLoss().to(device)
+    consistency_loss_fn = ConsistencyLoss().to(device)
+    direction_loss_fn = DirectionLoss().to(device)
 
     loss_trans = transform_loss_fn(ratios_sequence, ratios, num_stages, device)
     loss_padded = padded_loss_fn(ratios_sequence, num_stages, device)
@@ -142,6 +139,6 @@ def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_s
         'loss_directions': loss_directions,
         'loss_directions_f1': f1_directions
     }
+    total_loss = loss_trans * args.w_trans + loss_padded * args.w_padded + loss_consistency * args.w_consistency + loss_directions * args.w_directions
 
-    total_loss = sum(l for k, l in losses.items() if k != 'loss_directions_f1')  # Exclude F1 from total loss
     return total_loss, losses
