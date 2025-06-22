@@ -73,13 +73,13 @@ class TransformerDecoder(nn.Module):
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
         logger = logging.getLogger('TrainLogger')
-        if val_loss is not None:
-            normalized_loss = 1 - torch.exp(torch.tensor(-val_loss / 2.0))
-            tf_prob = base_tf_prob * normalized_loss.item()
-            tf_prob = min(max(tf_prob, 0.3), 0.95)
-        else:
-            progress = epoch / total_epochs
-            tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
+        # if val_loss is not None:
+        #     normalized_loss = 1 - torch.exp(torch.tensor(-val_loss / 2.0))
+        #     tf_prob = base_tf_prob * normalized_loss.item()
+        #     tf_prob = min(max(tf_prob, 0.3), 0.95)
+        # else:
+        progress = epoch / total_epochs
+        tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
         logger.debug(f"Teacher forcing prob: epoch={epoch}, stage_idx={stage_idx}, tf_prob={tf_prob:.4f}")
         return tf_prob
 

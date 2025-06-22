@@ -59,17 +59,70 @@ def transform_cumulative_transformations(transformations, scalers, logger, use_s
         logger.error(f"Failed to transform cumulative transformations: {e}")
         return torch.tensor(transformations, dtype=torch.float32)
 
+def compute_real_transformations(ratios, directions, cumulative_transforms, logger):
+    """
+    Compute real transformation values from ratios and directions using:
+    total_movement = net_movement / sum(predicted_ratios * directions)
+    Apply only to non-zero cumulative transformations.
+    Filter stages with absolute values < 1e-4.
+    """
+    B, S, T, P = ratios.shape  # [batch, stages, teeth, params]
+    device = ratios.device
+    real_transforms = torch.zeros_like(ratios)  # [B, S, T, P]
+    active_stages_mask = torch.ones(B, S, dtype=torch.bool, device=device)  # [B, S]
+
+    # Convert directions to ±1
+    directions_binary = torch.where(torch.sigmoid(directions) > 0.5, torch.tensor(1.0, device=device), torch.tensor(-1.0, device=device))  # [B, S, T, P]
+
+    # Mask for non-zero cumulative transformations
+    non_zero_mask = (cumulative_transforms.abs() > 1e-6).float().unsqueeze(1)  # [B, 1, T, P]
+
+    for b in range(B):
+        for t in range(T):
+            for p in range(P):
+                if non_zero_mask[b, 0, t, p] == 0:
+                    real_transforms[b, :, t, p] = 0.0
+                    continue
+                net_movement = cumulative_transforms[b, t, p]  # Scalar
+                ratios_t_p = ratios[b, :, t, p]  # [S]
+                directions_t_p = directions_binary[b, :, t, p]  # [S]
+                denominator = (ratios_t_p * directions_t_p).sum()  # Scalar
+                if abs(denominator) < 1e-6:
+                    logger.warning(f"Zero or near-zero denominator for Jaw_ID batch {b}, Tooth {t}, Param {p}; setting transformations to zero")
+                    real_transforms[b, :, t, p] = 0.0
+                    continue
+                total_movement = net_movement / denominator  # Scalar
+                logger.debug(f"Computed total_movement={total_movement:.4f} for batch {b}, Tooth {t}, Param {p}")
+                real_transforms[b, :, t, p] = ratios_t_p * directions_t_p * total_movement  # [S]
+
+    # Apply non-zero mask
+    real_transforms = real_transforms * non_zero_mask  # [B, S, T, P]
+
+    # Filter stages where all absolute values are < 1e-4
+    stage_active = (real_transforms.abs() >= 1e-4).any(dim=(2, 3))  # [B, S]
+    active_stages_mask = stage_active  # [B, S]
+    if not stage_active.any():
+        logger.warning("All stages have transformations < 1e-4; no active stages")
+        return real_transforms, torch.tensor([], dtype=torch.long, device=device)
+
+    active_stage_indices = [torch.where(stage_active[b])[0] for b in range(B)]  # List of [S_active] per batch
+    logger.info(f"Filtered to active stages: {[idx.tolist() for idx in active_stage_indices]}")
+    return real_transforms, active_stages_mask
+
 def filter_transformations(transformations, logger=None):
-    """Filter out stages where all transformation values are less than 0.1."""
-    active_stages = np.any(np.abs(transformations) >= 0.1, axis=(1, 2))
+    """Filter out stages where fewer than 5 transformation values have absolute values >= 1e-3."""
+    # Count values with |value| >= 1e-3 per stage
+    significant_values = np.abs(transformations) >= 1e-3  # [stages, teeth, params]
+    count_significant = np.sum(significant_values, axis=(1, 2))  # [stages]
+    active_stages = count_significant >= 5  # Stages with at least 5 significant values
     if not np.any(active_stages):
         if logger:
-            logger.warning("All stages have transformations with absolute values < 0.1")
+            logger.warning("All stages have fewer than 5 transformation values with absolute values >= 1e-3")
         return transformations, np.array([])
     filtered_transforms = transformations[active_stages]
     active_stage_indices = np.where(active_stages)[0]
     if logger:
-        logger.info(f"Filtered to {len(active_stage_indices)} active stages: {active_stage_indices + 1}")
+        logger.info(f"Filtered to {len(active_stage_indices)} active stages with at least 5 values >= 1e-3: {active_stage_indices + 1}")
     return filtered_transforms, active_stage_indices
 
 def create_output_dataframe(jaw_id, transformations, active_stage_indices, fdi_to_index, logger):
@@ -157,7 +210,6 @@ def inference(args):
         num_points=args.num_points,
         channels=args.channels,
         embed_dim=args.embed_dim,
-        teacher_forcing_prob=0.0,
         decoder_layers=args.decoder_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
@@ -183,51 +235,46 @@ def inference(args):
     }
 
     with torch.no_grad():
-        for jaw_id, feats, cumulative_transforms, directions, num_stages in data_loader:
+        for jaw_id, feats, cumulative_transforms in data_loader:
             jaw_id = jaw_id[0]
-            feats = feats.to(device)
-            cumulative_transforms = transform_cumulative_transformations(
-                cumulative_transforms.cpu().numpy(), cumulative_scalers, logger, args.use_scaler
-            ).to(device)
-            directions = directions.to(device)
+            feats = feats.to(device)  # [B, num_teeth, num_points, channels]
+
+            # Inverse scale cumulative_transformations if use_scaler=True
+            cumulative_transforms_np = cumulative_transforms.cpu().numpy()  # [B, num_teeth, 6]
+            if args.use_scaler:
+                cumulative_transforms_np = inverse_transform_transformations(
+                    cumulative_transforms_np, scalers, logger, args.use_scaler
+                )
+            cumulative_transforms = torch.tensor(cumulative_transforms_np, dtype=torch.float32, device=device)
 
             try:
                 outputs = model(
                     coordinates=feats,
-                    targets=None,
                     cumulative_targets=cumulative_transforms,
-                    activity_targets=None,
-                    param_activity_targets=None,
-                    directions=directions,
-                    num_stages=num_stages,
+                    targets=None,
+                    training=False,
                     epoch=0,
                     total_epochs=1,
-                    training=False
+                    val_loss=None
                 )
-                pred_transforms, activity_logits, param_activity_logits, _ = outputs
+                ratios_sequence, directions_sequence = outputs  # [B, max_stages, num_teeth, 6]
                 logger.info(f"Generated predictions for Jaw_ID {jaw_id}")
             except Exception as e:
                 logger.error(f"Failed to generate predictions for Jaw_ID {jaw_id}: {e}")
                 continue
 
-            activity_probs = torch.sigmoid(activity_logits)
-            activity_mask = (activity_probs > 0.5).float()
-            param_activity_probs = torch.sigmoid(param_activity_logits)
-            param_activity_mask = (param_activity_probs > 0.5).float() * activity_mask.unsqueeze(-1)
-            # print(f'activity_mask: {activity_mask}')
-            # print(f'param_activity_mask: {param_activity_mask}')
-            print(f'pred_transforms: {pred_transforms}')
-            masked_transforms = pred_transforms 
-            masked_transforms_np = inverse_transform_transformations(
-                masked_transforms.cpu().numpy(), scalers, logger, args.use_scaler
-            )
-            filtered_transforms, active_stage_indices = filter_transformations(
-                masked_transforms_np[0], logger=logger
-            )
+            # Compute real transformations
+            real_transforms, active_stages_mask = compute_real_transformations(
+                ratios_sequence, directions_sequence, cumulative_transforms, logger
+            )  # [B, max_stages, num_teeth, 6], [B, max_stages]
+
+            # Convert to numpy and select active stages
+            real_transforms_np = real_transforms.cpu().numpy()[0]  # [max_stages, num_teeth, 6]
+            active_stage_indices = torch.where(active_stages_mask[0])[0].cpu().numpy()  # [S_active]
             if len(active_stage_indices) == 0:
                 logger.warning(f"No active stages for Jaw_ID {jaw_id} after filtering")
                 continue
-            filtered_transforms = torch.tensor(filtered_transforms, dtype=torch.float32)
+            filtered_transforms = real_transforms_np[active_stage_indices]  # [S_active, num_teeth, 6]
 
             df = create_output_dataframe(
                 jaw_id, filtered_transforms, active_stage_indices, fdi_to_index, logger
