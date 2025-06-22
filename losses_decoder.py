@@ -80,10 +80,10 @@ class DirectionLoss(nn.Module):
     def __init__(self, weight=1.0):
         super().__init__()
         self.weight = weight
-        self.bce_loss = nn.BCELoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, directions_sequence, directions, ratios, num_stages, device):
-        # directions_sequence: [B, S, T, P], predicted probabilities (sigmoid-applied)
+        # directions_sequence: [B, S, T, P], predicted logits (pre-sigmoid)
         # directions: [B, S, T, P], ground truth probabilities (0 or 1)
         # ratios: [B, S, T, P], for activity mask
         # num_stages: [B], number of active stages
@@ -97,19 +97,29 @@ class DirectionLoss(nn.Module):
         mask = stage_mask & activity_mask
         num_active = mask.sum().clamp(min=1)  # Scalar, number of active elements
 
-        # Compute class weights based on masked directions
+        # Compute pos_weight for class imbalance
         pos_count = (directions[mask] > 0.5).float().sum().clamp(min=1)  # Scalar, count of positives
         neg_count = (directions[mask] <= 0.5).float().sum().clamp(min=1)  # Scalar, count of negatives
-        pos_weight = neg_count / (pos_count + neg_count)  # Scalar, weight for positives
-        neg_weight = pos_count / (pos_count + neg_count)  # Scalar, weight for negatives
-        # Weight tensor: [B, S, T, P], pos_weight for 1, neg_weight for 0
-        weights = torch.where(directions > 0.5, pos_weight, neg_weight).to(device)
+        pos_weight = neg_count / pos_count  # Scalar, weight for positives
+        weights = torch.ones_like(directions, device=device) * pos_weight  # [B, S, T, P]
 
-        # Compute weighted BCE
-        pred = directions_sequence.clamp(min=0.0, max=1.0)  # [B, S, T, P]
-        target = directions.clamp(min=0.0, max=1.0)  # [B, S, T, P]
+        # Compute weighted BCE with logits
+        pred = directions_sequence  # [B, S, T, P], logits
+        target = directions  # [B, S, T, P]
         loss = (self.bce_loss(pred, target) * weights * mask.float()).sum() / num_active  # Scalar
-        return self.weight * loss  # Weighted scalar loss
+
+        # Compute F1 score for active elements
+        pred_probs = torch.sigmoid(pred)  # [B, S, T, P], probabilities
+        pred_binary = (pred_probs > 0.5).float()  # [B, S, T, P], binary predictions
+        true_binary = (target > 0.5).float()  # [B, S, T, P], binary ground truth
+        tp = (pred_binary * true_binary * mask.float()).sum()  # True positives
+        fp = (pred_binary * (1 - true_binary) * mask.float()).sum()  # False positives
+        fn = ((1 - pred_binary) * true_binary * mask.float()).sum()  # False negatives
+        precision = tp / (tp + fp + 1e-6)  # Avoid division by zero
+        recall = tp / (tp + fn + 1e-6)  # Avoid division by zero
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-6)  # F1 score
+
+        return self.weight * loss, f1  # Return weighted loss and F1 score
 
 def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
     # ratios_sequence, directions_sequence, ratios, directions: [B, S, T, P]
@@ -123,15 +133,15 @@ def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_s
     loss_trans = transform_loss_fn(ratios_sequence, ratios, num_stages, device)
     loss_padded = padded_loss_fn(ratios_sequence, num_stages, device)
     loss_consistency = consistency_loss_fn(ratios_sequence, ratios, num_stages, device)
-    loss_directions = direction_loss_fn(directions_sequence, directions, ratios, num_stages, device)
+    loss_directions, f1_directions = direction_loss_fn(directions_sequence, directions, ratios, num_stages, device)
 
     losses = {
         'loss_trans': loss_trans,
         'loss_padded': loss_padded,
         'loss_consistency': loss_consistency,
-        'loss_directions': loss_directions
+        'loss_directions': loss_directions,
+        'loss_directions_f1': f1_directions
     }
 
-    total_loss = sum(losses.values())
-    # Return: total_loss, losses dict, three placeholder zeros
+    total_loss = sum(l for k, l in losses.items() if k != 'loss_directions_f1')  # Exclude F1 from total loss
     return total_loss, losses

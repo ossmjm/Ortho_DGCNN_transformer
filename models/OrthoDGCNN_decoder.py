@@ -42,7 +42,7 @@ class OrthoDGCNNModel(nn.Module):
                 num_teeth=num_teeth,
                 max_stages=max_stages,
                 num_heads=num_heads,
-                dropout=0.4  # Match default dropout
+                dropout=0.4
             )
         
         self.max_stages = max_stages
@@ -68,7 +68,7 @@ class OrthoDGCNNModel(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, coordinates, cumulative_targets, num_stages=None, targets=None, directions=None, training=True):
+    def forward(self, coordinates, cumulative_targets, num_stages=None, targets=None, directions=None, training=True, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
         
         expected_shape = (-1, self.num_teeth, self.num_points, 3)
@@ -86,7 +86,7 @@ class OrthoDGCNNModel(nn.Module):
                 logger.error(f"Invalid cumulative_targets shape: got {cumulative_targets.shape}, expected {expected_cumulative_shape}")
                 raise RuntimeError(f"Cumulative_targets shape mismatch")
         
-        if training and self.decoder_type == 'transformer':
+        if training:
             if targets is not None:
                 expected_targets_shape = (-1, self.max_stages, self.num_teeth, 6)
                 if targets.shape[1:] != torch.Size(expected_targets_shape[1:]):
@@ -116,23 +116,18 @@ class OrthoDGCNNModel(nn.Module):
         
         logger.debug(f"Using decoder type: {self.decoder_type}")
         
-        if self.decoder_type == 'mlp_predictor':
-            outputs = self.decoder(
-                memory=features,
-                cumulative_transforms=cumulative_targets,
-                num_stages=num_stages
-            )
-            ratios_sequence, directions_sequence = outputs
-        else:
-            outputs = self.decoder(
-                memory=features,
-                cumulative_transforms=cumulative_targets,
-                num_stages=num_stages,
-                targets=targets if training else None,
-                directions=directions if training else None,
-                use_teacher_forcing=self.teacher_forcing_prob if training else 0.0
-            )
-            ratios_sequence, directions_sequence = outputs
+        outputs = self.decoder(
+            memory=features,
+            cumulative_transforms=cumulative_targets,
+            num_stages=num_stages,
+            targets=targets,
+            directions=directions,
+            training=training,
+            epoch=epoch,
+            total_epochs=total_epochs,
+            val_loss=val_loss
+        )
+        ratios_sequence, directions_sequence = outputs
         
         if torch.isnan(ratios_sequence).any():
             logger.error("NaN values detected in ratios_sequence")

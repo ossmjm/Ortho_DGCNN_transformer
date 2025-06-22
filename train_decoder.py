@@ -23,8 +23,7 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
-    # Call compute_loss from losses_decoder.py
+def loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
     total_loss, losses = compute_loss(
         ratios_sequence=ratios_sequence,
         directions_sequence=directions_sequence,
@@ -164,14 +163,16 @@ def train(args):
         'loss_trans': [],
         'loss_padded': [],
         'loss_consistency': [],
-        'loss_directions': []
+        'loss_directions': [],
+        'loss_directions_f1': []
     }
     val_loss_history = {
         'total': [],
         'loss_trans': [],
         'loss_padded': [],
         'loss_consistency': [],
-        'loss_directions': []
+        'loss_directions': [],
+        'loss_directions_f1': []
     }
 
     for epoch in range(args.epochs):
@@ -181,7 +182,8 @@ def train(args):
             'loss_trans': 0.0,
             'loss_padded': 0.0,
             'loss_consistency': 0.0,
-            'loss_directions': 0.0
+            'loss_directions': 0.0,
+            'loss_directions_f1': 0.0
         }
 
         for batch_idx, (jaw_id, feats, ratios, cumulative_transformations, directions, num_stages) in enumerate(train_loader):
@@ -199,11 +201,14 @@ def train(args):
                 num_stages=num_stages,
                 targets=ratios,
                 directions=directions,
-                training=True
+                training=True,
+                epoch=epoch,
+                total_epochs=args.epochs,
+                val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
             )
             ratios_sequence, directions_sequence = outputs
 
-            total_loss, losses = compute_loss(
+            total_loss, losses = loss(
                 ratios_sequence=ratios_sequence,
                 directions_sequence=directions_sequence,
                 ratios=ratios,
@@ -231,7 +236,7 @@ def train(args):
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, Trans: {losses['loss_trans'].item():.4f}, "
                             f"Padded: {losses['loss_padded'].item():.4f}, Consistency: {losses['loss_consistency'].item():.4f}, "
-                            f"Directions: {losses['loss_directions'].item():.4f}")
+                            f"Directions: {losses['loss_directions'].item():.4f}, Directions F1: {losses['loss_directions_f1'].item():.4f}")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn:
@@ -252,7 +257,8 @@ def train(args):
             'loss_trans': 0.0,
             'loss_padded': 0.0,
             'loss_consistency': 0.0,
-            'loss_directions': 0.0
+            'loss_directions': 0.0,
+            'loss_directions_f1': 0.0
         }
 
         with torch.no_grad():
@@ -267,7 +273,10 @@ def train(args):
                     num_stages=num_stages,
                     targets=ratios,
                     directions=directions,
-                    training=False
+                    training=False,
+                    epoch=epoch,
+                    total_epochs=args.epochs,
+                    val_loss=best_val_loss if best_val_loss != float('inf') else None
                 )
                 ratios_sequence, directions_sequence = outputs
 
@@ -297,12 +306,12 @@ def train(args):
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Train Loss: {train_losses['total']:.4f}, Trans: {train_losses['loss_trans']:.4f}, "
                     f"Padded: {train_losses['loss_padded']:.4f}, Consistency: {train_losses['loss_consistency']:.4f}, "
-                    f"Directions: {train_losses['loss_directions']:.4f}")
+                    f"Directions: {train_losses['loss_directions']:.4f}, Directions F1: {train_losses['loss_directions_f1']:.4f}")
         
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Val Loss: {val_losses['total']:.4f}, Trans: {val_losses['loss_trans']:.4f}, "
                     f"Padded: {val_losses['loss_padded']:.4f}, Consistency: {val_losses['loss_consistency']:.4f}, "
-                    f"Directions: {val_losses['loss_directions']:.4f}")
+                    f"Directions: {val_losses['loss_directions']:.4f}, Directions F1: {val_losses['loss_directions_f1']:.4f}")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
