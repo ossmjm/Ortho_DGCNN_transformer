@@ -71,18 +71,29 @@ class TransformerDecoder(nn.Module):
             elif isinstance(m, nn.Parameter):
                 nn.init.trunc_normal_(m, std=0.01)
 
-    def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, num_stages, val_loss=None, base_tf_prob=0.9):
+    def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, val_loss=None, base_tf_prob=0.95):
         logger = logging.getLogger('TrainLogger')
-        # if val_loss is not None:
-        #     normalized_loss = 1 - torch.exp(torch.tensor(-val_loss / 2.0))
-        #     tf_prob = base_tf_prob * normalized_loss.item()
-        #     tf_prob = min(max(tf_prob, 0.3), 0.95)
-        # else:
-        progress = epoch / total_epochs
-        tf_prob = max(0.3, base_tf_prob - 0.6 * progress)
-        logger.debug(f"Teacher forcing prob: epoch={epoch}, stage_idx={stage_idx}, tf_prob={tf_prob:.4f}")
+        min_tf_prob = 0.3
+        min_loss = 0.05
+        max_loss = 0.6
+        
+        if val_loss is not None:
+            # Linear normalization of val_loss
+            normalized_loss = 2 * (val_loss - min_loss) / (max_loss - min_loss)
+            normalized_loss = max(0.0, min(1.0, normalized_loss))  # Clip to [0, 1]
+            tf_prob = min_tf_prob + (base_tf_prob - min_tf_prob) * normalized_loss
+            tf_prob = min(max(tf_prob, min_tf_prob), base_tf_prob)
+            
+            if val_loss < min_loss or val_loss > max_loss:
+                logger.warning(f"val_loss {val_loss:.4f} outside expected range [{min_loss}, {max_loss}]; tf_prob clipped to {tf_prob:.4f}")
+        else:
+            # Fallback to epoch-based scheduling
+            progress = epoch / total_epochs
+            tf_prob = max(min_tf_prob, base_tf_prob - 0.6 * progress)
+        
+        logger.debug(f"Teacher forcing prob: epoch={epoch}, stage_idx={stage_idx}, val_loss={val_loss if val_loss is not None else 'None'}, tf_prob={tf_prob:.4f}")
         return tf_prob
-
+    
     def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, directions=None, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
         B = memory.size(0)
@@ -132,7 +143,7 @@ class TransformerDecoder(nn.Module):
         prev_directions_seq = []
         stage_outputs = []
         for stage_idx in range(self.max_stages):
-            tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, num_stages, val_loss)
+            tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, val_loss)
             effective_tf_prob = tf_prob if training else 0.0
             use_tf = training and stage_idx > 0 and torch.rand(1).item() < effective_tf_prob
 

@@ -414,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio in Transformer')
     parser.add_argument('--decoder_layers', type=int, default=1, help='Number of decoder layers')
-    parser.add_argument('--decoder_type', type=str, default='per_tooth', help='Decoder type (mlp_predictor or transformer)')
+    parser.add_argument('--decoder_type', type=str, default='per_tooth', help='Decoder type (per_tooth or transformer)')
     parser.add_argument('--encoder_type', type=str, default='dgcnn', help='Encoder type (DGCNN or pointnet++)')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')

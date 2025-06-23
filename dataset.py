@@ -488,7 +488,6 @@ class JawTeethDataset(Dataset):
     def get_scalers(self):
         """Return the parameter-specific scalers for external use (e.g., inference)."""
         return self.scalers
-
 class CumulativeJawTeethDataset(Dataset):
     def __init__(
         self,
@@ -519,12 +518,12 @@ class CumulativeJawTeethDataset(Dataset):
             "31": 0, "32": 1, "33": 2, "34": 3, "35": 4, "36": 5, "37": 6,
             "41": 7, "42": 8, "43": 9, "44": 10, "45": 11, "46": 12, "47": 13
         }
-        self.scaler = None
+        self.scalers = [None] * 6  # Initialize list for 6 scalers
         if self.use_scaler:
             if self.scaler_type == 'robust':
-                self.scaler = RobustScaler()
+                self.scalers = [RobustScaler() for _ in range(6)]
             elif self.scaler_type == 'standard':
-                self.scaler = StandardScaler()
+                self.scalers = [StandardScaler() for _ in range(6)]
             else:
                 raise ValueError(f"Invalid scaler_type: {self.scaler_type}. Must be 'robust' or 'standard'.")
 
@@ -567,19 +566,6 @@ class CumulativeJawTeethDataset(Dataset):
         for col in columns:
             df[col] = df[col].apply(clean_numeric)
             df[col] = df[col].replace([float('inf'), -float('inf')], 0.0)
-            if (df[col] < 0).any():
-                self.logger.warning(f"Negative values detected in {col} for Jaw_ID {jaw_id}: {(df[col] < 0).sum()} instances")
-
-        if self.use_scaler and self.scaler is not None and not self.inference and not skip_scaling:
-            try:
-                data = df[columns]
-                scaled_data = self.scaler.transform(data)
-                df[columns] = scaled_data
-                self.logger.debug(f"Applied {self.scaler_type.capitalize()}Scaler to transformations for Jaw_ID {jaw_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to apply {self.scaler_type.capitalize()}Scaler for Jaw_ID {jaw_id}: {e}; using unscaled data")
-        else:
-            self.logger.debug(f"No scaling applied for Jaw_ID {jaw_id}: use_scaler={self.use_scaler}, inference={self.inference}, skip_scaling={skip_scaling}")
 
         return df
 
@@ -597,27 +583,34 @@ class CumulativeJawTeethDataset(Dataset):
                     row["Rotation (degrees)"]
                 ], dtype=torch.float32)
 
+        # Compute cumulative_activity and cumulative_param_activity before scaling
+        activity_threshold = 1e-6
+        cumulative_param_activity = (torch.abs(cumulative_transformations) > activity_threshold).float()  # Shape: (num_teeth, 6)
+        cumulative_activity = (cumulative_param_activity.sum(dim=1) > 0).float()  # Shape: (num_teeth)
+        if cumulative_activity.sum() == 0:
+            self.logger.warning(f"No active teeth detected for Jaw_ID {jaw_id}; all cumulative_activity values are 0")
+
         if self.use_scaler and not self.inference:
             for p in range(6):
-                if self.scaler is not None:
+                if self.scalers[p] is not None:
                     try:
                         data = cumulative_transformations[:, p].unsqueeze(1).numpy()
-                        scaled_data = self.scaler.transform(data)
+                        scaled_data = self.scalers[p].transform(data)
                         cumulative_transformations[:, p] = torch.tensor(scaled_data.flatten(), dtype=torch.float32)
                     except Exception as e:
                         self.logger.error(f"Failed to scale parameter {p} for Jaw_ID {jaw_id}: {e}")
 
         if self.inference and self.use_scaler:
             for p in range(6):
-                if self.scaler is not None:
+                if self.scalers[p] is not None:
                     try:
                         data = cumulative_transformations[:, p].unsqueeze(1).numpy()
-                        inverse_scaled_data = self.scaler.inverse_transform(data)
+                        inverse_scaled_data = self.scalers[p].inverse_transform(data)
                         cumulative_transformations[:, p] = torch.tensor(inverse_scaled_data.flatten(), dtype=torch.float32)
                     except Exception as e:
                         self.logger.error(f"Failed to inverse scale parameter {p} for Jaw_ID {jaw_id}: {e}")
 
-        return cumulative_transformations
+        return cumulative_transformations, cumulative_activity, cumulative_param_activity
 
     def _preprocess_json(self, json_file, jaw_id):
         try:
@@ -642,7 +635,6 @@ class CumulativeJawTeethDataset(Dataset):
                     self.logger.warning(f"Tooth {fdi} has no vertices in JSON file {json_file}")
                     feats = torch.zeros(self.num_points, self.channels, dtype=torch.float32)
                 else:
-                    # Replaced random sampling with curvature-aware sampling
                     if len(vertices) > self.num_points:
                         points = curvature_aware_sampling(vertices, self.num_points, self.logger)
                     else:
@@ -670,8 +662,6 @@ class CumulativeJawTeethDataset(Dataset):
             self.cases = cases
         self.logger.info(f"Selected {len(self.cases)} cases for split '{self.split}': {self.cases}")
 
-        scaler_file = os.path.join(self.cache_dir, 'scaler.pkl')
-        self.logger.debug(f"Checking scaler file: {scaler_file}")
         columns = [
             "Left/Right (mm",
             "Forward/Backward (mm)",
@@ -681,8 +671,7 @@ class CumulativeJawTeethDataset(Dataset):
             "Rotation (degrees)"
         ]
         if not self.inference and self.split == 'train' and self.use_scaler:
-            self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
-            all_transforms = []
+            all_transforms = [[] for _ in range(6)]
             for case in self.cases:
                 cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
                 if os.path.exists(cumulative_file):
@@ -690,41 +679,47 @@ class CumulativeJawTeethDataset(Dataset):
                         self.logger.debug(f"Loading cumulative_transformations.xlsx for case {case}: {cumulative_file}")
                         df = pd.read_excel(cumulative_file, dtype={"Jaw_ID": str, "Tooth_ID": str})
                         self.logger.debug(f"Loaded cumulative_transformations.xlsx for case {case}, rows: {len(df)}")
-                        df = self._preprocess_excel(df, case, skip_scaling=True)
+                        df = self._preprocess_excel(df, case)
                         if df is not None and not df.empty:
-                            all_transforms.append(df[columns])
+                            for i, col in enumerate(columns):
+                                all_transforms[i].append(df[[col]].values)
                         else:
                             self.logger.warning(f"No valid data after preprocessing cumulative_transformations.xlsx for case {case}")
                     except Exception as e:
                         self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
                 else:
                     self.logger.warning(f"cumulative_transformations.xlsx not found for case {case}: {cumulative_file}")
-            if all_transforms:
-                all_transforms = pd.concat(all_transforms, ignore_index=True)
-                try:
-                    self.scaler.fit(all_transforms)
-                    with open(scaler_file, 'wb') as f:
-                        pickle.dump(self.scaler, f)
-                    self.logger.info(f"Saved {self.scaler_type.capitalize()}Scaler to {scaler_file}")
-                except Exception as e:
-                    self.logger.error(f"Failed to fit or save {self.scaler_type.capitalize()}Scaler: {e}")
-                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
-            else:
-                self.logger.warning(f"No valid transformation data to fit {self.scaler_type.capitalize()}Scaler; using default scaler")
-                self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
+            for i in range(6):
+                if all_transforms[i]:
+                    data = np.concatenate(all_transforms[i], axis=0)
+                    try:
+                        self.scalers[i].fit(data)
+                        scaler_file = os.path.join(self.cache_dir, f'scaler_param_{i}.pkl')
+                        with open(scaler_file, 'wb') as f:
+                            pickle.dump(self.scalers[i], f)
+                        self.logger.info(f"Saved scaler for parameter {columns[i]} to {scaler_file}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to fit or save scaler for parameter {columns[i]}: {e}")
+                        self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
+                else:
+                    self.logger.warning(f"No valid transformation data for parameter {columns[i]} to fit scaler")
+                    self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
         else:
-            if os.path.exists(scaler_file) and self.use_scaler:
-                try:
-                    with open(scaler_file, 'rb') as f:
-                        self.scaler = pickle.load(f)
-                    self.logger.info(f"Loaded {self.scaler_type.capitalize()}Scaler from {scaler_file}")
-                except Exception as e:
-                    self.logger.error(f"Failed to load {self.scaler_type.capitalize()}Scaler from {scaler_file}: {e}")
-                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
-            else:
-                if self.use_scaler:
-                    self.logger.warning(f"No {self.scaler_type.capitalize()}Scaler file found at {scaler_file}; using default scaler")
-                    self.scaler = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
+            for i in range(6):
+                scaler_file = os.path.join(self.cache_dir, f'scaler_param_{i}.pkl')
+                self.logger.debug(f"Checking scaler file: {scaler_file}")
+                if os.path.exists(scaler_file) and self.use_scaler:
+                    try:
+                        with open(scaler_file, 'rb') as f:
+                            self.scalers[i] = pickle.load(f)
+                        self.logger.info(f"Loaded scaler for parameter {i} from {scaler_file}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to load scaler for parameter {i} from {scaler_file}: {e}")
+                        self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
+                else:
+                    if self.use_scaler:
+                        self.logger.warning(f"No scaler file found for parameter {i} at {scaler_file}; using default scaler")
+                        self.scalers[i] = RobustScaler() if self.scaler_type == 'robust' else StandardScaler()
 
         self.data = []
 
@@ -760,9 +755,9 @@ class CumulativeJawTeethDataset(Dataset):
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
 
             cumulative_data = self._preprocess_excel(cumulative_df, case) if not self.inference else None
-            cumulative_transformations = self._load_transformations(
+            cumulative_transformations, cumulative_activity, cumulative_param_activity = self._load_transformations(
                 case, cumulative_data
-            ) if not self.inference else torch.zeros(self.num_teeth, 6)
+            ) if not self.inference else (torch.zeros(self.num_teeth, 6), torch.zeros(self.num_teeth), torch.zeros(self.num_teeth, 6))
 
             feats = self._preprocess_json(json_file, case)
             if feats is None:
@@ -772,7 +767,9 @@ class CumulativeJawTeethDataset(Dataset):
             case_data = {
                 'jaw_id': case,
                 'feats': feats,
-                'cumulative_transformations': cumulative_transformations
+                'cumulative_transformations': cumulative_transformations,
+                'cumulative_activity': cumulative_activity,
+                'cumulative_param_activity': cumulative_param_activity
             }
             try:
                 with open(cache_file, 'wb') as f:
@@ -798,5 +795,11 @@ class CumulativeJawTeethDataset(Dataset):
         return (
             data['jaw_id'],
             data['feats'],
-            data['cumulative_transformations']
+            data['cumulative_transformations'],
+            data['cumulative_activity'],
+            data['cumulative_param_activity']
         )
+
+    def get_scalers(self):
+        """Return the parameter-specific scalers for external use (e.g., inference)."""
+        return self.scalers
