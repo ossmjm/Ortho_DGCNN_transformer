@@ -150,7 +150,7 @@ class OrthoDGCNNModel(nn.Module):
             total_epochs=total_epochs,
             val_loss=val_loss
         )
-        ratios_sequence, directions_sequence = outputs
+        ratios_sequence, directions_sequence, num_stages_logits= outputs
 
         if torch.isnan(ratios_sequence).any():
             logger.error("NaN values detected in ratios_sequence")
@@ -159,8 +159,13 @@ class OrthoDGCNNModel(nn.Module):
         if torch.isnan(directions_sequence).any():
             logger.error("NaN values detected in directions_sequence")
             directions_sequence = torch.nan_to_num(directions_sequence, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        if torch.isnan(num_stages_logits).any():
+            logger.error("NaN values detected in num_stages_logits")
+            num_stages_logits = torch.nan_to_num(num_stages_logits, nan=0.0, posinf=1.0, neginf=-1.0)
 
         logger.debug(f"OrthoPointNet2DGCNN output shape: ratios_sequence={ratios_sequence.shape}, "
-                     f"directions_sequence={directions_sequence.shape}")
+                     f"directions_sequence={directions_sequence.shape},"
+                     f"num_stage_logits={num_stages_logits.shape},")
 
-        return [ratios_sequence, directions_sequence]
+        return [ratios_sequence, directions_sequence, num_stages_logits]

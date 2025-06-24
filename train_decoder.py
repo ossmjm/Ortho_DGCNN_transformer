@@ -23,18 +23,6 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
-def loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
-    total_loss, losses = compute_loss(
-        ratios_sequence=ratios_sequence,
-        directions_sequence=directions_sequence,
-        ratios=ratios,
-        directions=directions,
-        num_stages=num_stages,
-        device=device,
-        args=args
-    )
-    return total_loss, losses
-
 def train(args):
     logger = setup_logging(args.log_file)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -165,7 +153,9 @@ def train(args):
         'loss_padded': [],
         'loss_consistency': [],
         'loss_directions': [],
-        'loss_directions_f1': []
+        'loss_directions_f1': [],
+        'loss_num_stages': [],
+        'loss_num_stages_f1': []
     }
     val_loss_history = {
         'total': [],
@@ -173,7 +163,9 @@ def train(args):
         'loss_padded': [],
         'loss_consistency': [],
         'loss_directions': [],
-        'loss_directions_f1': []
+        'loss_directions_f1': [],
+        'loss_num_stages': [],
+        'loss_num_stages_f1': []
     }
 
     for epoch in range(args.epochs):
@@ -184,7 +176,9 @@ def train(args):
             'loss_padded': 0.0,
             'loss_consistency': 0.0,
             'loss_directions': 0.0,
-            'loss_directions_f1': 0.0
+            'loss_directions_f1': 0.0,
+            'loss_num_stages': 0.0,
+            'loss_num_stages_f1': 0.0
         }
 
         for batch_idx, (jaw_id, feats, ratios, cumulative_transformations, directions, num_stages) in enumerate(train_loader):
@@ -207,14 +201,15 @@ def train(args):
                 total_epochs=args.epochs,
                 val_loss=val_loss_history['total'][-1] if val_loss_history['total'] else None,
             )
-            ratios_sequence, directions_sequence = outputs
+            ratios_sequence, directions_sequence, num_stages_logits = outputs
 
-            total_loss, losses = loss(
+            total_loss, losses = compute_loss(
                 ratios_sequence=ratios_sequence,
                 directions_sequence=directions_sequence,
                 ratios=ratios,
                 directions=directions,
                 num_stages=num_stages,
+                num_stages_logits = num_stages_logits,
                 device=device,
                 args=args
             )
@@ -237,7 +232,8 @@ def train(args):
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, Trans: {losses['loss_trans'].item():.4f}, "
                             f"Padded: {losses['loss_padded'].item():.4f}, Consistency: {losses['loss_consistency'].item():.4f}, "
-                            f"Directions: {losses['loss_directions'].item():.4f}, Directions F1: {losses['loss_directions_f1'].item():.4f}")
+                            f"Directions: {losses['loss_directions'].item():.4f}, Directions F1: {losses['loss_directions_f1'].item():.4f},"
+                            f"Num_stages: {losses['loss_num_stages'].item():.4f}, Num_stages F1: {losses['loss_num_stages_f1'].item():.4f}")
 
         if args.use_scheduler and args.scheduler.lower() != 'reduceonplateau':
             if scheduler_dgcnn:
@@ -259,7 +255,9 @@ def train(args):
             'loss_padded': 0.0,
             'loss_consistency': 0.0,
             'loss_directions': 0.0,
-            'loss_directions_f1': 0.0
+            'loss_directions_f1': 0.0,
+            'loss_num_stages': 0.0,
+            'loss_num_stages_f1': 0.0
         }
 
         with torch.no_grad():
@@ -279,7 +277,7 @@ def train(args):
                     total_epochs=args.epochs,
                     val_loss=best_val_loss if best_val_loss != float('inf') else None
                 )
-                ratios_sequence, directions_sequence = outputs
+                ratios_sequence, directions_sequence, num_stages_logits = outputs
 
                 total_loss, losses = compute_loss(
                     ratios_sequence=ratios_sequence,
@@ -287,6 +285,7 @@ def train(args):
                     ratios=ratios,
                     directions=directions,
                     num_stages=num_stages,
+                    num_stages_logits=num_stages_logits,
                     device=device,
                     args=args
                 )
@@ -311,12 +310,14 @@ def train(args):
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Train Loss: {train_losses['total']:.4f}, Trans: {train_losses['loss_trans']:.4f}, "
                     f"Padded: {train_losses['loss_padded']:.4f}, Consistency: {train_losses['loss_consistency']:.4f}, "
-                    f"Directions: {train_losses['loss_directions']:.4f}, Directions F1: {train_losses['loss_directions_f1']:.4f}")
+                    f"Directions: {train_losses['loss_directions']:.4f}, Directions F1: {train_losses['loss_directions_f1']:.4f},"
+                    f"Num_stages: {train_losses['loss_num_stages']:.4f}, Num_stages F1: {train_losses['loss_num_stages_f1']:.4f}")
         
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Val Loss: {val_losses['total']:.4f}, Trans: {val_losses['loss_trans']:.4f}, "
                     f"Padded: {val_losses['loss_padded']:.4f}, Consistency: {val_losses['loss_consistency']:.4f}, "
-                    f"Directions: {val_losses['loss_directions']:.4f}, Directions F1: {val_losses['loss_directions_f1']:.4f}")
+                    f"Directions: {val_losses['loss_directions']:.4f}, Directions F1: {val_losses['loss_directions_f1']:.4f},"
+                    f"Num_stages: {val_losses['loss_num_stages']:.4f}, Num_stages F1: {val_losses['loss_num_stages_f1']:.4f}")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
@@ -426,6 +427,7 @@ if __name__ == "__main__":
     parser.add_argument('--w_padded', type=float, default=1.0, help='Weight for padded loss')
     parser.add_argument('--w_consistency', type=float, default=0.1, help='Weight for consistency loss')
     parser.add_argument('--w_directions', type=float, default=1.0, help='Weight for direction loss')
+    parser.add_argument('--w_num_stages', type=float, default=1.0, help='Weight for num_stages loss')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan'], help='Optimizer type')
     parser.add_argument('--optimizer_betas', type=float, nargs=2, default=[0.9, 0.999], help='Betas for optimizer')

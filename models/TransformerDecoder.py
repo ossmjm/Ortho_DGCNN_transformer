@@ -8,6 +8,7 @@ class GRUDecoder(nn.Module):
         self.embed_dim = embed_dim
         self.num_teeth = num_teeth
         self.max_stages = max_stages
+        self.num_classes = 21  # Number of classes for num_stages (0 to 20)
         
         # Positional embeddings for stages
         self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))  # Independent of batch size
@@ -42,6 +43,16 @@ class GRUDecoder(nn.Module):
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(256, max_stages * 6)  # Predict directions logits for all stages
+        )
+        # New head for num_stages classification, matching ratio_head complexity
+        self.num_stages_head = nn.Sequential(
+            nn.Linear(embed_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, self.num_classes)  # Predict logits for 21 classes (0 to 20)
         )
         
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-4)
@@ -203,6 +214,11 @@ class GRUDecoder(nn.Module):
         directions = directions.view(B, self.max_stages, self.num_teeth, self.max_stages, 6)[:, :, :, 0, :]  # [B, max_stages, num_teeth, 6]
         directions_sequence = directions  # Logits, no sigmoid applied
 
+        # Predict num_stages, shape [B, num_classes]
+        # Aggregate stage_outputs across stages and teeth: [B, embed_dim]
+        stage_outputs_agg = stage_outputs.mean(dim=[1, 2])  # [B, embed_dim]
+        num_stages_logits = self.num_stages_head(stage_outputs_agg)  # [B, 21]
+
         # Update previous sequences with predictions
         prev_ratios_seq = [r.detach() for r in torch.unbind(ratios_sequence, dim=1)]  # List of [B, num_teeth, 6]
         prev_directions_seq = [d.detach() for d in torch.unbind(directions_sequence, dim=1)]  # List of [B, num_teeth, 6]
@@ -214,5 +230,6 @@ class GRUDecoder(nn.Module):
 
         logger.debug(f"Ratios sequence mean: {ratios_sequence.mean().item():.4f}")
         logger.debug(f"Directions sequence mean: {directions_sequence.mean().item():.4f}")
+        logger.debug(f"Num stages logits mean: {num_stages_logits.mean().item():.4f}")
 
-        return [ratios_sequence, directions_sequence]
+        return [ratios_sequence, directions_sequence, num_stages_logits]
