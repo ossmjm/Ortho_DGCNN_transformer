@@ -10,7 +10,7 @@ class GRUDecoder(nn.Module):
         self.max_stages = max_stages
         
         # Positional embeddings for stages
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_stages, embed_dim))  # Independent of batch size
         self.cumulative_embed = nn.Linear(6, embed_dim)
         self.ratio_embed = nn.Linear(6, embed_dim)  # Separate embedding for teacher-forced ratios
         self.direction_embed = nn.Linear(6, embed_dim)  # Separate embedding for teacher-forced directions
@@ -46,7 +46,7 @@ class GRUDecoder(nn.Module):
         
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-4)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-4)
-        self.tooth_pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim))
+        self.tooth_pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim))  # Independent of batch size
         
         # Initialize weights
         self._init_weights()
@@ -93,10 +93,10 @@ class GRUDecoder(nn.Module):
     
     def forward(self, memory, cumulative_transforms, num_stages=None, targets=None, directions=None, training=False, epoch=0, total_epochs=100, val_loss=None):
         logger = logging.getLogger('TrainLogger')
-        B = memory.size(0)
+        B = memory.size(0)  # Dynamically extract batch size
         device = memory.device
 
-        # Validate input shapes
+        # Validate input shapes, flexible to any B
         expected_memory_shape = (B, self.num_teeth, self.embed_dim)
         expected_cumulative_shape = (B, self.num_teeth, 6)
         if memory.shape != expected_memory_shape:
@@ -124,19 +124,20 @@ class GRUDecoder(nn.Module):
         if directions is not None:
             directions = torch.nan_to_num(directions, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Initialize outputs
+        # Initialize outputs, shape [B, max_stages, num_teeth, 6]
         ratios_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         directions_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
 
-        # Cumulative embedding
-        cumulative_embed = self.cumulative_embed(cumulative_transforms)  # [B, num_teeth, embed_dim]
+        # Cumulative embedding, shape [B, num_teeth, embed_dim]
+        cumulative_embed = self.cumulative_embed(cumulative_transforms)
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # Prepare GRU input
         stage_outputs = []
         prev_ratios_seq = []
         prev_directions_seq = []
-        hidden = torch.zeros(1, B * self.num_teeth, self.embed_dim, device=device)  # GRU hidden state
+        # Hidden state, shape [num_layers, B * num_teeth, embed_dim], flexible to any B
+        hidden = torch.zeros(self.gru.num_layers, B * self.num_teeth, self.embed_dim, device=device)
 
         for stage_idx in range(self.max_stages):
             tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, val_loss)
@@ -169,15 +170,15 @@ class GRUDecoder(nn.Module):
                 else:
                     embedded_prev = self.ratio_embed(torch.zeros(B, self.num_teeth, 6, device=device))  # [B, num_teeth, embed_dim]
 
-            # Combine embeddings
+            # Combine embeddings, shape [B, num_teeth, embed_dim]
             pos_embed = self.pos_embed[:, stage_idx, :].unsqueeze(1).expand(-1, self.num_teeth, -1)
-            tooth_pos = self.tooth_pos_embed.expand(B, -1, -1)
-            tgt = embedded_prev + pos_embed + tooth_pos + cumulative_embed  # [B, num_teeth, embed_dim]
+            tooth_pos = self.tooth_pos_embed.expand(B, -1, -1)  # Expand to batch size
+            tgt = embedded_prev + pos_embed + tooth_pos + cumulative_embed
             tgt = self.pre_norm(tgt)
 
             # GRU forward pass
             tgt = tgt.view(B * self.num_teeth, 1, self.embed_dim)  # [B * num_teeth, 1, embed_dim]
-            output, hidden = self.gru(tgt, hidden)  # output: [B * num_teeth, 1, embed_dim], hidden: [1, B * num_teeth, embed_dim]
+            output, hidden = self.gru(tgt, hidden)  # output: [B * num_teeth, 1, embed_dim], hidden: [num_layers, B * num_teeth, embed_dim]
             output = output.view(B, self.num_teeth, self.embed_dim)  # [B, num_teeth, embed_dim]
             output = self.final_norm(output)
             stage_outputs.append(output)
@@ -185,26 +186,26 @@ class GRUDecoder(nn.Module):
             # Update previous sequences for teacher forcing
             if use_tf and stage_idx < self.max_stages - 1:
                 if targets is not None:
-                    prev_ratios_seq.append(targets[:, stage_idx, :, :])
+                    prev_ratios_seq.append(targets[:, stage_idx, :, :])  # [B, num_teeth, 6]
                 if directions is not None:
-                    prev_directions_seq.append(directions[:, stage_idx, :, :])
+                    prev_directions_seq.append(directions[:, stage_idx, :, :])  # [B, num_teeth, 6]
 
-        # Stack outputs across stages
-        stage_outputs = torch.stack(stage_outputs, dim=1)  # [B, max_stages, num_teeth, embed_dim]
+        # Stack outputs across stages, shape [B, max_stages, num_teeth, embed_dim]
+        stage_outputs = torch.stack(stage_outputs, dim=1)
 
         # Predict ratios for all stages at once
         ratios = self.ratio_head(stage_outputs.view(-1, self.embed_dim))  # [B * max_stages * num_teeth, max_stages * 6]
-        ratios = ratios.view(B, self.max_stages, self.num_teeth, self.max_stages, 6)[:, :, :, 0, :]  # Select first stage, [B, max_stages, num_teeth, 6]
+        ratios = ratios.view(B, self.max_stages, self.num_teeth, self.max_stages, 6)[:, :, :, 0, :]  # [B, max_stages, num_teeth, 6]
         ratios_sequence = torch.softmax(ratios, dim=1)  # Softmax across stages per tooth/parameter
 
         # Predict directions for all stages
         directions = self.direction_head(stage_outputs.view(-1, self.embed_dim))  # [B * max_stages * num_teeth, max_stages * 6]
-        directions = directions.view(B, self.max_stages, self.num_teeth, self.max_stages, 6)[:, :, :, 0, :]  # Select first stage, [B, max_stages, num_teeth, 6]
+        directions = directions.view(B, self.max_stages, self.num_teeth, self.max_stages, 6)[:, :, :, 0, :]  # [B, max_stages, num_teeth, 6]
         directions_sequence = directions  # Logits, no sigmoid applied
 
         # Update previous sequences with predictions
-        prev_ratios_seq = [r.detach() for r in torch.unbind(ratios_sequence, dim=1)]
-        prev_directions_seq = [d.detach() for d in torch.unbind(directions_sequence, dim=1)]
+        prev_ratios_seq = [r.detach() for r in torch.unbind(ratios_sequence, dim=1)]  # List of [B, num_teeth, 6]
+        prev_directions_seq = [d.detach() for d in torch.unbind(directions_sequence, dim=1)]  # List of [B, num_teeth, 6]
 
         # Enforce zero stage-wise transforms where cumulative transform is zero
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)  # [B, 1, num_teeth, 6]
