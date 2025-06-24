@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import logging
 
-class TransformerDecoder(nn.Module):
+class GRUDecoder(nn.Module):
     def __init__(self, embed_dim, num_teeth, max_stages, num_layers=1, num_heads=4, mlp_ratio=4.0):
         super().__init__()
         self.embed_dim = embed_dim
@@ -15,26 +15,16 @@ class TransformerDecoder(nn.Module):
         self.ratio_embed = nn.Linear(6, embed_dim)  # Separate embedding for teacher-forced ratios
         self.direction_embed = nn.Linear(6, embed_dim)  # Separate embedding for teacher-forced directions
         
-        # Attention to aggregate previous stage embeddings
-        self.prev_targets_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
-        
-        # Attention for inter-tooth relationships
-        self.tooth_interaction_attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
-        
-        # Transformer decoder
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=0.3,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-            layer_norm_eps=1e-4
+        # GRU layer
+        self.gru = nn.GRU(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            num_layers=num_layers,
+            dropout=0.3 if num_layers > 1 else 0.0,
+            batch_first=True
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
-        # Enhanced prediction heads
+        # Prediction heads
         self.ratio_head = nn.Sequential(
             nn.Linear(embed_dim, 256),
             nn.GELU(),
@@ -55,7 +45,6 @@ class TransformerDecoder(nn.Module):
         )
         
         self.pre_norm = nn.LayerNorm(embed_dim, eps=1e-4)
-        self.interaction_norm = nn.LayerNorm(embed_dim, eps=1e-4)
         self.final_norm = nn.LayerNorm(embed_dim, eps=1e-4)
         self.tooth_pos_embed = nn.Parameter(torch.zeros(1, num_teeth, embed_dim))
         
@@ -70,16 +59,24 @@ class TransformerDecoder(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Parameter):
                 nn.init.trunc_normal_(m, std=0.01)
+            elif isinstance(m, nn.GRU):
+                for name, param in m.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
 
     def _get_teacher_forcing_params(self, epoch, total_epochs, stage_idx, val_loss=None, base_tf_prob=0.95):
         logger = logging.getLogger('TrainLogger')
         min_tf_prob = 0.3
         min_loss = 0.05
-        max_loss = 0.6
+        max_loss = 1.0
         
         if val_loss is not None:
             # Linear normalization of val_loss
-            normalized_loss = 2 * (val_loss - min_loss) / (max_loss - min_loss)
+            normalized_loss = (val_loss - min_loss) / (max_loss - min_loss)
             normalized_loss = max(0.0, min(1.0, normalized_loss))  # Clip to [0, 1]
             tf_prob = min_tf_prob + (base_tf_prob - min_tf_prob) * normalized_loss
             tf_prob = min(max(tf_prob, min_tf_prob), base_tf_prob)
@@ -127,9 +124,6 @@ class TransformerDecoder(nn.Module):
         if directions is not None:
             directions = torch.nan_to_num(directions, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Memory key padding mask
-        memory_key_padding_mask = torch.zeros(B, self.num_teeth, dtype=torch.bool, device=device)
-
         # Initialize outputs
         ratios_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
         directions_sequence = torch.zeros(B, self.max_stages, self.num_teeth, 6, device=device)
@@ -138,16 +132,18 @@ class TransformerDecoder(nn.Module):
         cumulative_embed = self.cumulative_embed(cumulative_transforms)  # [B, num_teeth, embed_dim]
         cumulative_embed = torch.nan_to_num(cumulative_embed, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Process each stage
+        # Prepare GRU input
+        stage_outputs = []
         prev_ratios_seq = []
         prev_directions_seq = []
-        stage_outputs = []
+        hidden = torch.zeros(1, B * self.num_teeth, self.embed_dim, device=device)  # GRU hidden state
+
         for stage_idx in range(self.max_stages):
             tf_prob = self._get_teacher_forcing_params(epoch, total_epochs, stage_idx, val_loss)
             effective_tf_prob = tf_prob if training else 0.0
             use_tf = training and stage_idx > 0 and torch.rand(1).item() < effective_tf_prob
 
-            # Prepare target embeddings
+            # Prepare input embeddings
             start_idx = max(0, stage_idx - 1)
             if use_tf and targets is not None and directions is not None:
                 ratios_prev = targets[:, start_idx:stage_idx, :, :]  # [B, num_stages_to_use, num_teeth, 6]
@@ -157,8 +153,6 @@ class TransformerDecoder(nn.Module):
                     embedded_directions = self.direction_embed(directions_prev)  # [B, num_stages_to_use, num_teeth, embed_dim]
                     embedded_prev = embedded_ratios + embedded_directions  # [B, num_stages_to_use, num_teeth, embed_dim]
                     embedded_prev = embedded_prev.mean(dim=1)  # Aggregate across stages: [B, num_teeth, embed_dim]
-                    query = self.pos_embed[:, stage_idx, :].unsqueeze(1).expand(B, 1, self.num_teeth, -1)
-                    embedded_prev, _ = self.prev_targets_attention(query.view(B, self.num_teeth, -1), embedded_prev, embedded_prev)  # [B, num_teeth, embed_dim]
                 else:
                     embedded_prev = self.ratio_embed(torch.zeros(B, self.num_teeth, 6, device=device))  # [B, num_teeth, embed_dim]
             else:
@@ -170,8 +164,6 @@ class TransformerDecoder(nn.Module):
                         embedded_directions = self.direction_embed(directions_prev)  # [B, num_stages_to_use, num_teeth, embed_dim]
                         embedded_prev = embedded_ratios + embedded_directions  # [B, num_stages_to_use, num_teeth, embed_dim]
                         embedded_prev = embedded_prev.mean(dim=1)  # Aggregate across stages: [B, num_teeth, embed_dim]
-                        query = self.pos_embed[:, stage_idx, :].unsqueeze(1).expand(B, 1, self.num_teeth, -1)
-                        embedded_prev, _ = self.prev_targets_attention(query.view(B, self.num_teeth, -1), embedded_prev, embedded_prev)  # [B, num_teeth, embed_dim]
                     else:
                         embedded_prev = self.ratio_embed(torch.zeros(B, self.num_teeth, 6, device=device))  # [B, num_teeth, embed_dim]
                 else:
@@ -183,12 +175,10 @@ class TransformerDecoder(nn.Module):
             tgt = embedded_prev + pos_embed + tooth_pos + cumulative_embed  # [B, num_teeth, embed_dim]
             tgt = self.pre_norm(tgt)
 
-            # Apply inter-tooth attention
-            tooth_interaction, _ = self.tooth_interaction_attention(tgt, tgt, tgt)  # [B, num_teeth, embed_dim]
-            tgt = self.interaction_norm(tgt + tooth_interaction)  # Residual connection
-
-            # Decoder forward pass
-            output = self.decoder(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)  # [B, num_teeth, embed_dim]
+            # GRU forward pass
+            tgt = tgt.view(B * self.num_teeth, 1, self.embed_dim)  # [B * num_teeth, 1, embed_dim]
+            output, hidden = self.gru(tgt, hidden)  # output: [B * num_teeth, 1, embed_dim], hidden: [1, B * num_teeth, embed_dim]
+            output = output.view(B, self.num_teeth, self.embed_dim)  # [B, num_teeth, embed_dim]
             output = self.final_norm(output)
             stage_outputs.append(output)
 
@@ -220,7 +210,6 @@ class TransformerDecoder(nn.Module):
         cumulative_zero_mask = (cumulative_transforms == 0).float().unsqueeze(1)  # [B, 1, num_teeth, 6]
         ratios_sequence = ratios_sequence * (1 - cumulative_zero_mask)
         directions_sequence = directions_sequence * (1 - cumulative_zero_mask)
-
 
         logger.debug(f"Ratios sequence mean: {ratios_sequence.mean().item():.4f}")
         logger.debug(f"Directions sequence mean: {directions_sequence.mean().item():.4f}")
