@@ -33,7 +33,7 @@ class CumulativeTransformationModel(nn.Module):
                 
         self.attn_ffn = FeedForward(embed_dim, embed_dim * 2)
         
-        # Enhanced MLP for transformation prediction
+        # Enhanced MLP for feature extraction
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.Linear(512, 450),
@@ -51,12 +51,45 @@ class CumulativeTransformationModel(nn.Module):
             nn.Linear(128, 64)
         )
 
-        self.cumulative_transform = nn.Linear(64, 6) # [2.5,1.5,0.3,0.4,0.5]
+        # Enhanced cumulative transformation head
+        self.cumulative_transform = nn.Sequential(
+            nn.Linear(64, 96),
+            nn.BatchNorm1d(96, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(96, 64),
+            nn.BatchNorm1d(64, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(64, 6)
+        )
+
         # Enhanced activity head
-        self.activity_head = nn.Linear(64, 1) #[1] [0]
+        self.activity_head = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(32, 1)
+        )
         
         # Enhanced parameter activity head
-        self.param_activity_head = nn.Linear(64, 6)# [0,1,1,0,1,1]
+        self.param_activity_head = nn.Sequential(
+            nn.Linear(64, 96),
+            nn.BatchNorm1d(96, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(96, 6)
+        )
+
+        # New directions head
+        self.directions_head = nn.Sequential(
+            nn.Linear(64, 96),
+            nn.BatchNorm1d(96, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(96, 6)
+        )
         
         self.norm = nn.LayerNorm(embed_dim, eps=1e-3)
         self.final_norm = nn.LayerNorm(6, eps=1e-3)
@@ -100,25 +133,17 @@ class CumulativeTransformationModel(nn.Module):
         out = self.mlp(x_flat)
         activity_logits = self.activity_head(out).view(batch_size, num_teeth)
         param_activity_logits = self.param_activity_head(out).view(batch_size, num_teeth, 6)
-        
-        # Apply hierarchical masking
-        activity_preds = torch.sigmoid(activity_logits) > 0.5
-        param_activity_preds = torch.sigmoid(param_activity_logits) > 0.5
+        directions_logits = self.directions_head(out).view(batch_size, num_teeth, 6)
         
         transforms = self.cumulative_transform(out)
         transforms = transforms.view(batch_size, num_teeth, 6)
         transforms = self.final_norm(transforms)
         
         self.logger.debug(f"MLP output (transforms) min: {transforms.min().item():.4f}, max: {transforms.max().item():.4f}, has_nan: {torch.isnan(transforms).any().item()}")
-        
-        # Apply activity and parameter activity masks
-        activity_mask = activity_preds.float().unsqueeze(-1)  # [batch_size, num_teeth, 1]
-        param_activity_mask = param_activity_preds.float()    # [batch_size, num_teeth, 6]
-        #print(f'activity_mask: {activity_preds},param_mask: {param_activity_preds}')
-        transforms = transforms * activity_mask * param_activity_mask
+        self.logger.debug(f"Directions logits min: {directions_logits.min().item():.4f}, max: {directions_logits.max().item():.4f}, has_nan: {torch.isnan(directions_logits).any().item()}")
         
         self.logger.debug(f"CumulativeTransformationModel output shape: transforms={transforms.shape}, "
-                         f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}")
+                         f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
+                         f"directions_logits={directions_logits.shape}")
         
-        return transforms, activity_logits, param_activity_logits
-    
+        return transforms, activity_logits, param_activity_logits, directions_logits
