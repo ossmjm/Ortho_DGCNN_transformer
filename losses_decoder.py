@@ -119,71 +119,7 @@ class DirectionLoss(nn.Module):
 
         return loss, f1  # Return weighted loss and F1 score
 
-class NumStagesLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
-        # Mapping of num_stages values to contiguous indices (0 to 20)
-        self.num_stages_map = {
-            1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
-            11: 10, 12: 11, 13: 12, 14: 13, 15: 14, 16: 15, 17: 16, 19: 17,
-            20: 18, 21: 19, 23: 20
-        }
-        self.max_valid_stage = 23  # Maximum valid num_stages value
-        self.num_classes = 21  # Number of classes (0 to 20)
-
-    def forward(self, num_stages_logits, num_stages, device):
-        # num_stages_logits: [B, num_classes], predicted logits for 21 classes
-        # num_stages: [B], ground truth number of stages
-        # device: torch.device
-        logger = logging.getLogger('TrainLogger')
-        B, num_classes = num_stages_logits.shape  # B: batch, num_classes: 21
-
-        # Clamp num_stages to valid range and convert to mapped indices
-        num_stages = num_stages.clamp(min=1, max=self.max_valid_stage).long()
-        mapped_stages = torch.zeros_like(num_stages, device=device, dtype=torch.long)
-        unmapped_values = []
-
-        for i in range(B):
-            stage = num_stages[i].item()
-            if stage in self.num_stages_map:
-                mapped_stages[i] = self.num_stages_map[stage]
-            else:
-                unmapped_values.append(stage)
-                mapped_stages[i] = self.num_stages_map[self.max_valid_stage]  # Default to max stage
-
-        if unmapped_values:
-            logger.warning(f"Unmapped num_stages values encountered: {unmapped_values}. Defaulting to max stage index.")
-
-        # Convert mapped_stages to one-hot encoding: [B, num_classes]
-        target = torch.zeros(B, num_classes, device=device)
-        target[torch.arange(B, device=device), mapped_stages] = 1.0
-
-        # Compute class weights to handle imbalance
-        class_counts = target.sum(dim=0).clamp(min=1.0)  # [num_classes]
-        total_samples = B
-        class_weights = total_samples / (num_classes * class_counts)  # [num_classes]
-        class_weights = class_weights.clamp(min=0.1, max=10.0)  # Clip to avoid extreme weights
-        weights = class_weights.unsqueeze(0).expand(B, -1)  # [B, num_classes]
-
-        # Compute weighted BCE with logits
-        pred = num_stages_logits  # [B, num_classes], logits
-        loss = (self.bce_loss(pred, target) * weights).sum() / B  # Scalar
-
-        # Compute F1 score
-        pred_probs = torch.sigmoid(pred)  # [B, num_classes], probabilities
-        pred_binary = (pred_probs > 0.5).float()  # [B, num_classes], binary predictions
-        true_binary = target  # [B, num_classes], binary ground truth
-        tp = (pred_binary * true_binary).sum()  # True positives
-        fp = (pred_binary * (1 - true_binary)).sum()  # False positives
-        fn = ((1 - pred_binary) * true_binary).sum()  # False negatives
-        precision = tp / (tp + fp + 1e-6)  # Avoid division by zero
-        recall = tp / (tp + fn + 1e-6)  # Avoid division by zero
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-6)  # F1 score
-
-        return loss, f1  # Return weighted loss and F1 score
-
-def compute_loss(ratios_sequence, directions_sequence, num_stages_logits, ratios, directions, num_stages, device, args):
+def compute_loss(ratios_sequence, directions_sequence, ratios, directions, num_stages, device, args):
     # ratios_sequence, directions_sequence, ratios, directions: [B, S, T, P]
     # num_stages_logits: [B, num_classes]
     # num_stages: [B]
@@ -192,29 +128,23 @@ def compute_loss(ratios_sequence, directions_sequence, num_stages_logits, ratios
     padded_loss_fn = PaddedLoss().to(device)
     consistency_loss_fn = ConsistencyLoss().to(device)
     direction_loss_fn = DirectionLoss().to(device)
-    num_stages_loss_fn = NumStagesLoss().to(device)
 
     loss_trans = transform_loss_fn(ratios_sequence, ratios, num_stages, device)
     loss_padded = padded_loss_fn(ratios_sequence, num_stages, device)
     loss_consistency = consistency_loss_fn(ratios_sequence, ratios, num_stages, device)
     loss_directions, f1_directions = direction_loss_fn(directions_sequence, directions, ratios, num_stages, device)
-    loss_num_stages, f1_num_stages = num_stages_loss_fn(num_stages_logits, num_stages, device)
 
     losses = {
         'loss_trans': loss_trans,
         'loss_padded': loss_padded,
         'loss_consistency': loss_consistency,
         'loss_directions': loss_directions,
-        'loss_directions_f1': f1_directions,
-        'loss_num_stages': loss_num_stages,
-        'loss_num_stages_f1': f1_num_stages
+        'loss_directions_f1': f1_directions
     }
     total_loss = (
         loss_trans * args.w_trans +
         loss_padded * args.w_padded +
         loss_consistency * args.w_consistency +
-        loss_directions * args.w_directions +
-        loss_num_stages * args.w_num_stages
-    )
+        loss_directions * args.w_directions    )
 
     return total_loss, losses
