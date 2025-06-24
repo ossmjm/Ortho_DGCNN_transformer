@@ -134,8 +134,12 @@ class JawTeethDataset(Dataset):
             return None
 
         columns = [
-            "Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
-            "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
+            "Left/Right (mm",
+            "Forward/Backward (mm)",
+            "Extrude/Intrude (mm)",
+            "Buccal/Lingual (degrees)",
+            "Mesial/Distal (degrees)",
+            "Rotation (degrees)"
         ]
         for col in columns:
             df[col] = df[col].apply(clean_numeric)
@@ -322,8 +326,12 @@ class JawTeethDataset(Dataset):
         if not self.inference and self.split == 'train' and self.use_scaler:
             all_cumulative_transforms = [[] for _ in range(6)]
             columns = [
-                "Left/Right (mm", "Forward/Backward (mm)", "Extrude/Intrude (mm)",
-                "Buccal/Lingual (degrees)", "Mesial/Distal (degrees)", "Rotation (degrees)"
+                "Left/Right (mm",
+                "Forward/Backward (mm)",
+                "Extrude/Intrude (mm)",
+                "Buccal/Lingual (degrees)",
+                "Mesial/Distal (degrees)",
+                "Rotation (degrees)"
             ]
             for case in train_cases:
                 cumulative_file = os.path.join(self.data_dir, case, "cumulative_transformations.xlsx")
@@ -488,6 +496,7 @@ class JawTeethDataset(Dataset):
     def get_scalers(self):
         """Return the parameter-specific scalers for external use (e.g., inference)."""
         return self.scalers
+
 class CumulativeJawTeethDataset(Dataset):
     def __init__(
         self,
@@ -571,10 +580,13 @@ class CumulativeJawTeethDataset(Dataset):
 
     def _load_transformations(self, jaw_id, cumulative_df):
         cumulative_transformations = torch.zeros(self.num_teeth, 6)
+        # Initialize directions with ones (default positive) for training
+        directions = torch.ones(self.num_teeth, 6, dtype=torch.float32) if not self.inference else None
+
         if cumulative_df is not None:
             for _, row in cumulative_df.iterrows():
                 tooth_idx = self.FDI_TO_INDEX[row["Tooth_ID"]]
-                cumulative_transformations[tooth_idx] = torch.tensor([
+                values = torch.tensor([
                     row["Left/Right (mm"],
                     row["Forward/Backward (mm)"],
                     row["Extrude/Intrude (mm)"],
@@ -582,6 +594,10 @@ class CumulativeJawTeethDataset(Dataset):
                     row["Mesial/Distal (degrees)"],
                     row["Rotation (degrees)"]
                 ], dtype=torch.float32)
+                cumulative_transformations[tooth_idx] = values
+                # Compute directions (0 for negative, 1 for positive) before scaling, only for training
+                if not self.inference:
+                    directions[tooth_idx] = torch.tensor([1.0 if x >= 0 else 0.0 for x in values], dtype=torch.float32)
 
         # Compute cumulative_activity and cumulative_param_activity before scaling
         activity_threshold = 1e-6
@@ -610,7 +626,7 @@ class CumulativeJawTeethDataset(Dataset):
                     except Exception as e:
                         self.logger.error(f"Failed to inverse scale parameter {p} for Jaw_ID {jaw_id}: {e}")
 
-        return cumulative_transformations, cumulative_activity, cumulative_param_activity
+        return cumulative_transformations, cumulative_activity, cumulative_param_activity, directions
 
     def _preprocess_json(self, json_file, jaw_id):
         try:
@@ -755,9 +771,9 @@ class CumulativeJawTeethDataset(Dataset):
                     self.logger.error(f"Failed to load cumulative_transformations.xlsx for case {case}: {e}")
 
             cumulative_data = self._preprocess_excel(cumulative_df, case) if not self.inference else None
-            cumulative_transformations, cumulative_activity, cumulative_param_activity = self._load_transformations(
+            cumulative_transformations, cumulative_activity, cumulative_param_activity, directions = self._load_transformations(
                 case, cumulative_data
-            ) if not self.inference else (torch.zeros(self.num_teeth, 6), torch.zeros(self.num_teeth), torch.zeros(self.num_teeth, 6))
+            ) if not self.inference else (torch.zeros(self.num_teeth, 6), torch.zeros(self.num_teeth), torch.zeros(self.num_teeth, 6), None)
 
             feats = self._preprocess_json(json_file, case)
             if feats is None:
@@ -769,8 +785,11 @@ class CumulativeJawTeethDataset(Dataset):
                 'feats': feats,
                 'cumulative_transformations': cumulative_transformations,
                 'cumulative_activity': cumulative_activity,
-                'cumulative_param_activity': cumulative_param_activity
+                'cumulative_param_activity': cumulative_param_activity,
             }
+            if not self.inference:
+                case_data['directions'] = directions
+
             try:
                 with open(cache_file, 'wb') as f:
                     pickle.dump(case_data, f)
@@ -797,7 +816,8 @@ class CumulativeJawTeethDataset(Dataset):
             data['feats'],
             data['cumulative_transformations'],
             data['cumulative_activity'],
-            data['cumulative_param_activity']
+            data['cumulative_param_activity'],
+            data['directions']
         )
 
     def get_scalers(self):
