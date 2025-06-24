@@ -3,8 +3,8 @@ import torch.nn as nn
 import logging
 from models.DGCNN import DGCNN
 from models.pointnet2 import PointNetPlusPlus
-from models.TransformerDecoder import GRUDecoder
-from models.PerToothTransformer import PerToothTransformerDecoder
+from models.GRUDecoder import GRUDecoder
+from models.TransformerDecoder import TransformerDecoder
 
 class OrthoDGCNNModel(nn.Module):
     def __init__(
@@ -45,11 +45,11 @@ class OrthoDGCNNModel(nn.Module):
             )
 
         # Validate decoder type
-        valid_decoder_types = ['transformer', 'per_tooth']
+        valid_decoder_types = ['transformer', 'gru']
         if decoder_type not in valid_decoder_types:
             raise ValueError(f"Invalid decoder_type: {decoder_type}. Must be one of {valid_decoder_types}")
 
-        if decoder_type == 'transformer':
+        if decoder_type == 'gru':
             self.decoder = GRUDecoder(
                 embed_dim=embed_dim,
                 num_teeth=num_teeth,
@@ -58,8 +58,8 @@ class OrthoDGCNNModel(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio
             )
-        elif decoder_type == 'per_tooth':
-            self.decoder = PerToothTransformerDecoder(
+        elif decoder_type == 'transformer':
+            self.decoder = TransformerDecoder(
                 embed_dim=embed_dim,
                 num_teeth=num_teeth,
                 max_stages=max_stages,
