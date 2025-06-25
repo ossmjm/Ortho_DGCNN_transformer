@@ -9,6 +9,7 @@ from dataset import CumulativeJawTeethDataset
 from models.OrthoDGCNN import OrthoDGCNNModel
 from losses_cumulative import compute_loss
 import numpy as np
+from optimizers import Optimizers, LRSchedulers
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -76,8 +77,27 @@ def train(args):
         encoder_type=args.encoder_type
     ).to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = Optimizers(
+        optimizer_name=args.optimizer_name,
+        parameters=model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=args.betas,
+        eps=args.eps
+    ).get_optimizer()
+    
+    scheduler = LRSchedulers(
+        scheduler_name=args.scheduler_name,
+        optimizer=optimizer,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        warmup_start_factor=args.warmup_start_factor,
+        use_scheduler=args.use_scheduler,
+        eta_min=args.eta_min,
+        factor=args.factor,
+        patience=args.patience_scheduler,
+        end_factor=args.end_factor
+    ).get_scheduler()
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -159,7 +179,10 @@ def train(args):
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             logger.debug(f"Gradient norm: {grad_norm:.4f}")
             optimizer.step()
-            scheduler.step()
+            if scheduler is not None and args.scheduler_name == 'reduceonplateau':
+                scheduler.step(metrics=total_loss.item())
+            elif scheduler is not None:
+                scheduler.step()
 
             train_losses['total'] += total_loss.item()
             for key in losses:
@@ -273,6 +296,7 @@ def train(args):
                 'encoder_state_dict': model.encoder.state_dict(),
                 'model_state_dict': model.cumulative_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'val_loss': val_losses['total']
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
@@ -306,6 +330,7 @@ def train(args):
                 'encoder_state_dict': model.encoder.state_dict(),
                 'model_state_dict': model.cumulative_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'val_loss': best_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
@@ -335,6 +360,7 @@ def train(args):
                 'encoder_state_dict': model.encoder.state_dict(),
                 'model_state_dict': model.cumulative_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'val_loss': last_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
@@ -381,6 +407,17 @@ if __name__ == "__main__":
     parser.add_argument('--w_cumulative_param_activity', type=float, default=5.0, help='Weight for cumulative param activity loss')
     parser.add_argument('--w_cumulative_direction', type=float, default=5.0, help='Weight for cumulative direction loss')
     parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--optimizer_name', type=str, default='adamw', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan'], help='Optimizer type')
+    parser.add_argument('--use_scheduler', type=bool, default=True, help='Use learning rate scheduler')
+    parser.add_argument('--scheduler_name', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'], help='Scheduler type')
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of warmup epochs')
+    parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Warmup start factor')
+    parser.add_argument('--eta_min', type=float, default=0.0, help='Minimum learning rate for CosineAnnealing')
+    parser.add_argument('--factor', type=float, default=0.5, help='Factor for ReduceLROnPlateau')
+    parser.add_argument('--patience_scheduler', type=int, default=5, help='Patience for ReduceLROnPlateau')
+    parser.add_argument('--end_factor', type=float, default=0.1, help='End factor for LinearLR')
+    parser.add_argument('--betas', type=tuple, default=(0.9, 0.999), help='Betas for optimizers')
+    parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizers')
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
