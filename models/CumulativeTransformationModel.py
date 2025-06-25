@@ -33,66 +33,106 @@ class CumulativeTransformationModel(nn.Module):
                 
         self.attn_ffn = FeedForward(embed_dim, embed_dim * 2)
         
-        # Enhanced MLP for feature extraction
-        self.mlp = nn.Sequential(
+        # Shared MLP for initial feature extraction
+        self.shared_mlp = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.Linear(512, 450),
             nn.BatchNorm1d(450, eps=1e-3),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.3)
+        )
+
+        # Shared MLP for translation path
+        self.shared_mlp_trans = nn.Sequential(
             nn.Linear(450, 256),
             nn.Linear(256, 200),
             nn.BatchNorm1d(200, eps=1e-3),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.3)
+        )
+
+        # Shared MLP for rotation path
+        self.shared_mlp_rot = nn.Sequential(
+            nn.Linear(450, 256),
+            nn.Linear(256, 200),
+            nn.BatchNorm1d(200, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Translation-specific heads
+        self.cumulative_transform_trans = nn.Sequential(
             nn.Linear(200, 128),
             nn.BatchNorm1d(128, eps=1e-3),
             nn.ReLU(),
-            nn.Linear(128, 64)
-        )
-
-        # Enhanced cumulative transformation head
-        self.cumulative_transform = nn.Sequential(
-            nn.Linear(64, 96),
+            nn.Dropout(0.4),
+            nn.Linear(128, 96),
             nn.BatchNorm1d(96, eps=1e-3),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(96, 64),
-            nn.BatchNorm1d(64, eps=1e-3),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(64, 6)
+            nn.Linear(96, 3)  # First 3 parameters (translations)
         )
 
-        # Enhanced activity head
+        self.param_activity_head_trans = nn.Sequential(
+            nn.Linear(200, 128),
+            nn.BatchNorm1d(128, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 3)  # First 3 parameters (translations)
+        )
+
+        # Rotation-specific heads
+        self.cumulative_transform_rot = nn.Sequential(
+            nn.Linear(200, 128),
+            nn.BatchNorm1d(128, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 96),
+            nn.BatchNorm1d(96, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(96, 3)  # Last 3 parameters (rotations)
+        )
+
         self.activity_head = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32, eps=1e-3),
+            nn.Linear(450, 200),
+            nn.BatchNorm1d(200, eps=1e-3),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(32, 1)
-        )
-        
-        # Enhanced parameter activity head
-        self.param_activity_head = nn.Sequential(
-            nn.Linear(64, 96),
-            nn.BatchNorm1d(96, eps=1e-3),
+            nn.Linear(200, 64),
             nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(96, 6)
+            nn.Linear(64, 1)  # One output per tooth input
         )
 
-        # New directions head
-        self.directions_head = nn.Sequential(
-            nn.Linear(64, 96),
-            nn.BatchNorm1d(96, eps=1e-3),
+        self.param_activity_head_rot = nn.Sequential(
+            nn.Linear(200, 128),
+            nn.BatchNorm1d(128, eps=1e-3),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(96, 6)
+            nn.Linear(128, 3)  # Last 3 parameters (rotations)
+        )
+
+        # Shared directions head
+        self.directions_trans = nn.Sequential(
+            nn.Linear(200, 128),
+            nn.BatchNorm1d(128, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 3)
+        )
+
+        # Shared directions head
+        self.directions_rot = nn.Sequential(
+            nn.Linear(200, 128),
+            nn.BatchNorm1d(128, eps=1e-3),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 3)
         )
         
         self.norm = nn.LayerNorm(embed_dim, eps=1e-3)
-        self.final_norm = nn.LayerNorm(6, eps=1e-3)
+        self.final_norm_trans = nn.LayerNorm(3, eps=1e-3)  # Separate norms for translations and rotations
+        self.final_norm_rot = nn.LayerNorm(3, eps=1e-3)
         
         self._init_weights()
         
@@ -129,21 +169,47 @@ class CumulativeTransformationModel(nn.Module):
         # Flatten for MLP processing
         x_flat = x.view(batch_size * num_teeth, embed_dim)
         
-        # Predict transformations
-        out = self.mlp(x_flat)
-        activity_logits = self.activity_head(out).view(batch_size, num_teeth)
-        param_activity_logits = self.param_activity_head(out).view(batch_size, num_teeth, 6)
-        directions_logits = self.directions_head(out).view(batch_size, num_teeth, 6)
+        # Shared MLP for initial feature extraction
+        x = self.shared_mlp(x_flat)
+
+        activity_logits = self.activity_head(x).view(batch_size, num_teeth, -1)[:, :, 0]  # Reshape and take the single logit per tooth
+        # Split into translation and rotation paths
+        x_trans = self.shared_mlp_trans(x)
+        x_rot = self.shared_mlp_rot(x)
         
-        transforms = self.cumulative_transform(out)
-        transforms = transforms.view(batch_size, num_teeth, 6)
-        transforms = self.final_norm(transforms)
+        # Predict translations
+        transforms_trans = self.cumulative_transform_trans(x_trans)
+        param_activity_logits_trans = self.param_activity_head_trans(x_trans).view(batch_size, num_teeth, 3)
         
-        self.logger.debug(f"MLP output (transforms) min: {transforms.min().item():.4f}, max: {transforms.max().item():.4f}, has_nan: {torch.isnan(transforms).any().item()}")
-        self.logger.debug(f"Directions logits min: {directions_logits.min().item():.4f}, max: {directions_logits.max().item():.4f}, has_nan: {torch.isnan(directions_logits).any().item()}")
+        transforms_trans = transforms_trans.view(batch_size, num_teeth, 3)
+        transforms_trans = self.final_norm_trans(transforms_trans)
         
-        self.logger.debug(f"CumulativeTransformationModel output shape: transforms={transforms.shape}, "
-                         f"activity_logits={activity_logits.shape}, param_activity_logits={param_activity_logits.shape}, "
-                         f"directions_logits={directions_logits.shape}")
+        self.logger.debug(f"MLP output (transforms_trans) min: {transforms_trans.min().item():.4f}, max: {transforms_trans.max().item():.4f}, has_nan: {torch.isnan(transforms_trans).any().item()}")
         
-        return transforms, activity_logits, param_activity_logits, directions_logits
+        # Predict rotations
+        transforms_rot = self.cumulative_transform_rot(x_rot)
+        param_activity_logits_rot = self.param_activity_head_rot(x_rot).view(batch_size, num_teeth, 3)
+        
+        transforms_rot = transforms_rot.view(batch_size, num_teeth, 3)
+        transforms_rot = self.final_norm_rot(transforms_rot)
+        
+        self.logger.debug(f"MLP output (transforms_rot) min: {transforms_rot.min().item():.4f}, max: {transforms_rot.max().item():.4f}, has_nan: {torch.isnan(transforms_rot).any().item()}")
+        
+        # Predict directions (shared for both paths)
+        directions_logits_rot = self.directions_rot(x_rot).view(batch_size, num_teeth, 3)
+        
+        directions_logits_trans = self.directions_trans(x_trans).view(batch_size, num_teeth, 3)
+
+        
+        self.logger.debug(f"Directions rot min: {directions_logits_rot.min().item():.4f}, max: {directions_logits_rot.max().item():.4f}, has_nan: {torch.isnan(directions_logits_rot).any().item()}")
+        self.logger.debug(f"Directions trans min: {directions_logits_trans.min().item():.4f}, max: {directions_logits_trans.max().item():.4f}, has_nan: {torch.isnan(directions_logits_trans).any().item()}")
+        
+        self.logger.debug(f"CumulativeTransformationModel output shapes: transforms_trans={transforms_trans.shape} "
+                         f"param_activity_logits_trans={param_activity_logits_trans.shape}, transforms_rot={transforms_rot.shape}, "
+                         f"activity_logits={activity_logits.shape}, param_activity_logits_rot={param_activity_logits_rot.shape}, "
+                         f"directions_rot={directions_logits_rot.shape},"
+                        f"directions_trans={directions_logits_trans.shape}")
+        
+        return (transforms_trans, activity_logits, param_activity_logits_trans, 
+                transforms_rot, param_activity_logits_rot, 
+                directions_logits_rot, directions_logits_trans)

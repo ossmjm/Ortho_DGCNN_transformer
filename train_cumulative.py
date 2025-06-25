@@ -26,6 +26,12 @@ def setup_logging(log_file):
     logger.addHandler(console_handler)
     return logger
 
+def get_scalar_value(value):
+    """Helper function to safely convert tensor or float to scalar."""
+    if torch.is_tensor(value):
+        return value.item() if value.numel() == 1 else value.mean().item()
+    return value
+
 def train(args):
     logger = setup_logging(args.log_file)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -78,36 +84,51 @@ def train(args):
 
     train_loss_history = {
         'total': [],
-        'loss_cumulative': [],
+        'loss_cumulative_trans': [],
+        'loss_cumulative_rot': [],
         'loss_cumulative_activity': [],
-        'loss_cumulative_param_activity': [],
-        'loss_cumulative_direction': [],
+        'loss_cumulative_param_activity_trans': [],
+        'loss_cumulative_param_activity_rot': [],
+        'loss_cumulative_direction_trans': [],
+        'loss_cumulative_direction_rot': [],
         'activity_f1_scores': [],
-        'param_activity_f1_scores': [],
-        'direction_f1_scores': []
+        'param_activity_f1_scores_trans': [],
+        'param_activity_f1_scores_rot': [],
+        'direction_f1_scores_trans': [],
+        'direction_f1_scores_rot': []
     }
     val_loss_history = {
         'total': [],
-        'loss_cumulative': [],
+        'loss_cumulative_trans': [],
+        'loss_cumulative_rot': [],
         'loss_cumulative_activity': [],
-        'loss_cumulative_param_activity': [],
-        'loss_cumulative_direction': [],
+        'loss_cumulative_param_activity_trans': [],
+        'loss_cumulative_param_activity_rot': [],
+        'loss_cumulative_direction_trans': [],
+        'loss_cumulative_direction_rot': [],
         'activity_f1_scores': [],
-        'param_activity_f1_scores': [],
-        'direction_f1_scores': []
+        'param_activity_f1_scores_trans': [],
+        'param_activity_f1_scores_rot': [],
+        'direction_f1_scores_trans': [],
+        'direction_f1_scores_rot': []
     }
 
     for epoch in range(args.epochs):
         model.train()
         train_losses = {
             'total': 0.0,
-            'loss_cumulative': 0.0,
+            'loss_cumulative_trans': 0.0,
+            'loss_cumulative_rot': 0.0,
             'loss_cumulative_activity': 0.0,
-            'loss_cumulative_param_activity': 0.0,
-            'loss_cumulative_direction': 0.0,
+            'loss_cumulative_param_activity_trans': 0.0,
+            'loss_cumulative_param_activity_rot': 0.0,
+            'loss_cumulative_direction_trans': 0.0,
+            'loss_cumulative_direction_rot': 0.0,
             'activity_f1_scores': 0.0,
-            'param_activity_f1_scores': 0.0,
-            'direction_f1_scores': 0.0
+            'param_activity_f1_scores_trans': 0.0,
+            'param_activity_f1_scores_rot': 0.0,
+            'direction_f1_scores_trans': 0.0,
+            'direction_f1_scores_rot': 0.0
         }
         for batch_idx, (jaw_id, feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions) in enumerate(train_loader):
             feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions = [
@@ -122,10 +143,14 @@ def train(args):
             
             optimizer.zero_grad()
 
-            pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits = model(feats)
+            (pred_cumulative_trans, pred_activity_logits, pred_param_activity_logits_trans,
+             pred_cumulative_rot, pred_param_activity_logits_rot,
+             directions_logits_rot, directions_logits_trans) = model(feats)
 
             total_loss, losses = compute_loss(
-                pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits,
+                pred_cumulative_trans, pred_cumulative_rot, pred_activity_logits,
+                pred_param_activity_logits_trans, pred_param_activity_logits_rot,
+                directions_logits_trans, directions_logits_rot,
                 cumulative_transforms, cumulative_activity, cumulative_param_activity, directions,
                 device, logger, args
             )
@@ -138,21 +163,26 @@ def train(args):
 
             train_losses['total'] += total_loss.item()
             for key in losses:
-                if key.endswith('_f1_scores'):
-                    train_losses[key] += losses[key].mean().item()  # Average F1 scores
+                if losses[key].numel() > 1:  # Check if tensor has multiple elements
+                    train_losses[key] += losses[key].mean().item()
                 else:
                     train_losses[key] += losses[key].item()
 
             if batch_idx % 10 == 0:
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, "
-                            f"Cumulative: {losses['loss_cumulative'].item():.4f}, "
-                            f"Cumulative_Activity: {losses['loss_cumulative_activity'].item():.4f}, "
-                            f"Cumulative_Param_Activity: {losses['loss_cumulative_param_activity'].item():.4f}, "
-                            f"Cumulative_Direction: {losses['loss_cumulative_direction'].item():.4f}, "
-                            f"Activity_F1: {losses['activity_f1_scores'].mean().item():.4f}, "
-                            f"Param_Activity_F1: {losses['param_activity_f1_scores'].mean().item():.4f}, "
-                            f"Direction_F1: {losses['direction_f1_scores'].mean().item():.4f}")
+                            f"Cumulative_Trans: {get_scalar_value(losses['loss_cumulative_trans']):.4f}, "
+                            f"Cumulative_Rot: {get_scalar_value(losses['loss_cumulative_rot']):.4f}, "
+                            f"Cumulative_Activity: {get_scalar_value(losses['loss_cumulative_activity']):.4f}, "
+                            f"Cumulative_Param_Activity_Trans: {get_scalar_value(losses['loss_cumulative_param_activity_trans']):.4f}, "
+                            f"Cumulative_Param_Activity_Rot: {get_scalar_value(losses['loss_cumulative_param_activity_rot']):.4f}, "
+                            f"Cumulative_Direction_trans: {get_scalar_value(losses['loss_cumulative_direction_trans']):.4f}, "
+                            f"Cumulative_Direction_rot: {get_scalar_value(losses['loss_cumulative_direction_rot']):.4f}, "
+                            f"Activity_F1: {get_scalar_value(losses['activity_f1_scores']):.4f}, "
+                            f"Param_Activity_F1_Trans: {get_scalar_value(losses['param_activity_f1_scores_trans']):.4f}, "
+                            f"Param_Activity_F1_Rot: {get_scalar_value(losses['param_activity_f1_scores_rot']):.4f}, "
+                            f"Direction_F1_trans: {get_scalar_value(losses['direction_f1_scores_trans']):.4f}, "
+                            f"Direction_F1_rot: {get_scalar_value(losses['direction_f1_scores_rot']):.4f}")
 
         for key in train_losses:
             train_losses[key] /= len(train_loader)
@@ -164,13 +194,18 @@ def train(args):
         model.eval()
         val_losses = {
             'total': 0.0,
-            'loss_cumulative': 0.0,
+            'loss_cumulative_trans': 0.0,
+            'loss_cumulative_rot': 0.0,
             'loss_cumulative_activity': 0.0,
-            'loss_cumulative_param_activity': 0.0,
-            'loss_cumulative_direction': 0.0,
+            'loss_cumulative_param_activity_trans': 0.0,
+            'loss_cumulative_param_activity_rot': 0.0,
+            'loss_cumulative_direction_trans': 0.0,
+            'loss_cumulative_direction_rot': 0.0,
             'activity_f1_scores': 0.0,
-            'param_activity_f1_scores': 0.0,
-            'direction_f1_scores': 0.0
+            'param_activity_f1_scores_trans': 0.0,
+            'param_activity_f1_scores_rot': 0.0,
+            'direction_f1_scores_trans': 0.0,
+            'direction_f1_scores_rot': 0.0
         }
         with torch.no_grad():
             for jaw_id, feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions in val_loader:
@@ -178,18 +213,22 @@ def train(args):
                     x.to(device) for x in [feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions]
                 ]
 
-                pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits = model(feats)
+                (pred_cumulative_trans, pred_activity_logits, pred_param_activity_logits_trans,
+                 pred_cumulative_rot, pred_param_activity_logits_rot,
+                 directions_logits_rot, directions_logits_trans) = model(feats)
 
                 total_loss, losses = compute_loss(
-                    pred_cumulative, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits,
+                    pred_cumulative_trans, pred_cumulative_rot, pred_activity_logits,
+                    pred_param_activity_logits_trans, pred_param_activity_logits_rot,
+                    directions_logits_trans, directions_logits_rot,
                     cumulative_transforms, cumulative_activity, cumulative_param_activity, directions,
                     device, logger, args
                 )
             
                 val_losses['total'] += total_loss.item()
                 for key in losses:
-                    if key.endswith('_f1_scores'):
-                        val_losses[key] += losses[key].mean().item()  # Average F1 scores
+                    if losses[key].numel() > 1:  # Check if tensor has multiple elements
+                        val_losses[key] += losses[key].mean().item()
                     else:
                         val_losses[key] += losses[key].item()
 
@@ -201,22 +240,32 @@ def train(args):
             val_loss_history[key].append(val_losses[key])
 
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Train Loss: {train_losses['total']:.4f} (Cumulative: {train_losses['loss_cumulative']:.4f}, "
-                    f"Cumulative_Activity: {train_losses['loss_cumulative_activity']:.4f}, "
-                    f"Cumulative_Param_Activity: {train_losses['loss_cumulative_param_activity']:.4f}, "
-                    f"Cumulative_Direction: {train_losses['loss_cumulative_direction']:.4f}, "
-                    f"Activity_F1: {train_losses['activity_f1_scores']:.4f}, "
-                    f"Param_Activity_F1: {train_losses['param_activity_f1_scores']:.4f}, "
-                    f"Direction_F1: {train_losses['direction_f1_scores']:.4f})")
-        
+                    f"Train Loss: {get_scalar_value(train_losses['total']):.4f} (Cumulative_Trans: {get_scalar_value(train_losses['loss_cumulative_trans']):.4f}, "
+                    f"Cumulative_Rot: {get_scalar_value(train_losses['loss_cumulative_rot']):.4f}, "
+                    f"Cumulative_Activity: {get_scalar_value(train_losses['loss_cumulative_activity']):.4f}, "
+                    f"Cumulative_Param_Activity_Trans: {get_scalar_value(train_losses['loss_cumulative_param_activity_trans']):.4f}, "
+                    f"Cumulative_Param_Activity_Rot: {get_scalar_value(train_losses['loss_cumulative_param_activity_rot']):.4f}, "
+                    f"Cumulative_Direction_trans: {get_scalar_value(train_losses['loss_cumulative_direction_trans']):.4f}, "
+                    f"Cumulative_Direction_rot: {get_scalar_value(train_losses['loss_cumulative_direction_rot']):.4f}, "
+                    f"Activity_F1: {get_scalar_value(train_losses['activity_f1_scores']):.4f}, "
+                    f"Param_Activity_F1_Trans: {get_scalar_value(train_losses['param_activity_f1_scores_trans']):.4f}, "
+                    f"Param_Activity_F1_Rot: {get_scalar_value(train_losses['param_activity_f1_scores_rot']):.4f}, "
+                    f"Direction_F1_trans: {get_scalar_value(train_losses['direction_f1_scores_trans']):.4f}, "
+                    f"Direction_F1_rot: {get_scalar_value(train_losses['direction_f1_scores_rot']):.4f})")
+
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Val Loss: {val_losses['total']:.4f} (Cumulative: {val_losses['loss_cumulative']:.4f}, "
-                    f"Cumulative_Activity: {val_losses['loss_cumulative_activity']:.4f}, "
-                    f"Cumulative_Param_Activity: {val_losses['loss_cumulative_param_activity']:.4f}, "
-                    f"Cumulative_Direction: {val_losses['loss_cumulative_direction']:.4f}, "
-                    f"Activity_F1: {val_losses['activity_f1_scores']:.4f}, "
-                    f"Param_Activity_F1: {val_losses['param_activity_f1_scores']:.4f}, "
-                    f"Direction_F1: {val_losses['direction_f1_scores']:.4f})")
+                    f"Val Loss: {get_scalar_value(val_losses['total']):.4f} (Cumulative_Trans: {get_scalar_value(val_losses['loss_cumulative_trans']):.4f}, "
+                    f"Cumulative_Rot: {get_scalar_value(val_losses['loss_cumulative_rot']):.4f}, "
+                    f"Cumulative_Activity: {get_scalar_value(val_losses['loss_cumulative_activity']):.4f}, "
+                    f"Cumulative_Param_Activity_Trans: {get_scalar_value(val_losses['loss_cumulative_param_activity_trans']):.4f}, "
+                    f"Cumulative_Param_Activity_Rot: {get_scalar_value(val_losses['loss_cumulative_param_activity_rot']):.4f}, "
+                    f"Cumulative_Direction_trans: {get_scalar_value(val_losses['loss_cumulative_direction_trans']):.4f}, "
+                    f"Cumulative_Direction_rot: {get_scalar_value(val_losses['loss_cumulative_direction_rot']):.4f}, "
+                    f"Activity_F1: {get_scalar_value(val_losses['activity_f1_scores']):.4f}, "
+                    f"Param_Activity_F1_Trans: {get_scalar_value(val_losses['param_activity_f1_scores_trans']):.4f}, "
+                    f"Param_Activity_F1_Rot: {get_scalar_value(val_losses['param_activity_f1_scores_rot']):.4f}, "
+                    f"Direction_F1_trans: {get_scalar_value(val_losses['direction_f1_scores_trans']):.4f}, "
+                    f"Direction_F1_rot: {get_scalar_value(val_losses['direction_f1_scores_rot']):.4f})")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
@@ -227,13 +276,20 @@ def train(args):
                 'val_loss': val_losses['total']
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'model_epoch_{epoch + 1}.pth'))
-            logger.info(f"Saved full model at epoch {epoch+1} with val_loss {val_losses['total']:.4f}")
+            logger.info(f"Saved full model at epoch {epoch+1} with val_loss {get_scalar_value(val_losses['total']):.4f}")
 
             for key in train_loss_history:
-                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
+                np.save(
+                    os.path.join(args.output_dir, f'train_{key}_history.npy'),
+                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+                )
                 logger.info(f"Saved train {key} history")
+
             for key in val_loss_history:
-                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
+                np.save(
+                    os.path.join(args.output_dir, f'val_{key}_history.npy'),
+                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+                )
                 logger.info(f"Saved validation {key} history")
 
         if val_losses['total'] < best_val_loss:
@@ -253,14 +309,22 @@ def train(args):
                 'val_loss': best_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, f'best_model.pth'))
+
             for key in train_loss_history:
-                np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
+                np.save(
+                    os.path.join(args.output_dir, f'train_{key}_history.npy'),
+                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+                )
                 logger.info(f"Saved train {key} history")
+
             for key in val_loss_history:
-                np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
+                np.save(
+                    os.path.join(args.output_dir, f'val_{key}_history.npy'),
+                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+                )
                 logger.info(f"Saved validation {key} history")
 
-            logger.info(f"Saved best full model at epoch {best_epoch} with val_loss {best_val_loss:.4f}")
+            logger.info(f"Saved best full model at epoch {best_epoch} with val_loss {get_scalar_value(best_val_loss):.4f}")
             logger.info(f"Early stopping triggered at epoch {epoch+1}")
             break
 
@@ -274,15 +338,22 @@ def train(args):
                 'val_loss': last_val_loss
             }
             torch.save(checkpoint, os.path.join(args.output_dir, 'last_model.pth'))
-            logger.info(f"Saved last full model at epoch {epoch + 1} with val_loss {last_val_loss:.4f}")
+            logger.info(f"Saved last full model at epoch {epoch + 1} with val_loss {get_scalar_value(last_val_loss):.4f}")
 
     for key in train_loss_history:
-        np.save(os.path.join(args.output_dir, f'train_{key}_history.npy'), np.array(train_loss_history[key]))
+        np.save(
+            os.path.join(args.output_dir, f'train_{key}_history.npy'),
+            np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+        )
         logger.info(f"Saved train {key} history")
-    
+
     for key in val_loss_history:
-        np.save(os.path.join(args.output_dir, f'val_{key}_history.npy'), np.array(val_loss_history[key]))
+        np.save(
+            os.path.join(args.output_dir, f'val_{key}_history.npy'),
+            np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+        )
         logger.info(f"Saved validation {key} history")
+
     logger.info("Training completed")
 
 if __name__ == "__main__":
@@ -304,10 +375,11 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
-    parser.add_argument('--w_cumulative', type=float, default=1.0, help='Weight for cumulative loss')
-    parser.add_argument('--w_cumulative_activity', type=float, default=1.0, help='Weight for cumulative activity loss')
-    parser.add_argument('--w_cumulative_param_activity', type=float, default=1.0, help='Weight for cumulative param activity loss')
-    parser.add_argument('--w_cumulative_direction', type=float, default=1.0, help='Weight for cumulative direction loss')
+    parser.add_argument('--w_cumulative_trans', type=float, default=5.0, help='Weight for cumulative loss')
+    parser.add_argument('--w_cumulative_rot', type=float, default=1.0, help='Weight for cumulative loss')
+    parser.add_argument('--w_cumulative_activity', type=float, default=5.0, help='Weight for cumulative activity loss')
+    parser.add_argument('--w_cumulative_param_activity', type=float, default=5.0, help='Weight for cumulative param activity loss')
+    parser.add_argument('--w_cumulative_direction', type=float, default=5.0, help='Weight for cumulative direction loss')
     parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
 
     args = parser.parse_args()

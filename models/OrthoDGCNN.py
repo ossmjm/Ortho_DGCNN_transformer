@@ -75,13 +75,10 @@ class OrthoDGCNNModel(nn.Module):
             
         features = self.feature_norm(features)
         
-        cumulative_transforms, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits = self.cumulative_model(features)
+        transforms_trans, activity_logits, param_activity_logits_trans, transforms_rot, param_activity_logits_rot, directions_logits_rot,directions_logits_trans = self.cumulative_model(features)
         
-        if torch.isnan(cumulative_transforms).any():
-            logger.info("NaN values detected in cumulative_transforms")
-            cumulative_transforms = torch.nan_to_num(cumulative_transforms, nan=0.0, posinf=1.0, neginf=-1.0)
-        # print(cumulative_transforms)   
-        outputs = [cumulative_transforms, cumulative_activity_logits, cumulative_param_activity_logits, directions_logits]
+        outputs = [transforms_trans, activity_logits, param_activity_logits_trans, 
+                transforms_rot, param_activity_logits_rot, directions_logits_rot,directions_logits_trans]
         
         for i, output in enumerate(outputs):
             if torch.isnan(output).any():
