@@ -73,57 +73,45 @@ class CumulativeDirectionLoss(nn.Module):
         
         return loss, f1_scores
 
-class CumulativeActivityLoss(nn.Module):
-    def __init__(self):
+class CumulativeZeroLoss(nn.Module):
+    def __init__(self, lambda_zero=1e-3):
         super().__init__()
+        self.lambda_zero = lambda_zero
+        self.mae_loss = nn.L1Loss(reduction='none')
     
-    def forward(self, activity_logits, activity_labels):
-        """Compute weighted BCE loss for activity over all parameters."""
-        batch_size, num_teeth, num_params = activity_labels.shape
-        # Compute pos_weight for class imbalance
-        pos_samples = activity_labels.sum(dim=0)  # [num_teeth, num_params]
-        neg_samples = batch_size - pos_samples  # [num_teeth, num_params]
-        pos_weight = neg_samples / (pos_samples + 1e-6)  # [num_teeth, num_params]
-        pos_weight = pos_weight.clamp(max=100.0)  # Prevent extreme weights
-        
-        logger = logging.getLogger('TrainLogger')
-        logger.debug(f"Activity pos_weight: {[f'{x:.2f}' for x in pos_weight.mean(dim=0)]}")
-        
-        # Compute weighted BCE
-        loss = F.binary_cross_entropy_with_logits(
-            activity_logits,
-            activity_labels,
-            reduction='none',
-            pos_weight=pos_weight
-        )
-        loss = loss.mean()  # Mean over batch, teeth, and params
-        
-        # Compute F1 scores
-        f1_scores = compute_f1_score(
-            torch.sigmoid(activity_logits).view(batch_size, -1),
-            activity_labels.view(batch_size, -1)
-        ).view(num_teeth, num_params).mean(dim=0)
-        
-        return loss, f1_scores
+    def forward(self, pred_translations, pred_rotations, cumulative_transforms):
+        """Compute MAE loss for zero elements in cumulative_transforms."""
+        # Identify zero elements (inactive) in cumulative_transforms
+        zero_mask = (cumulative_transforms.abs() < 1e-6).float()  # [batch_size, 14, 6]
+        # Split into translation and rotation
+        zero_mask_trans = zero_mask[:, :, :3]  # [batch_size, 14, 3]
+        zero_mask_rot = zero_mask[:, :, 3:]    # [batch_size, 14, 3]
+        # Compute MAE loss only for zero elements
+        trans_loss = self.mae_loss(pred_translations, torch.zeros_like(pred_translations))
+        rot_loss = self.mae_loss(pred_rotations, torch.zeros_like(pred_rotations))
+        trans_loss = (trans_loss * zero_mask_trans).sum()
+        rot_loss = (rot_loss * zero_mask_rot).sum()
+        num_zero = zero_mask.sum().clamp(min=1e-6)
+        return (trans_loss + rot_loss) / num_zero
 
 class CumulativeL1Regularization(nn.Module):
-    def __init__(self, lambda_l1=1e-5):
+    def __init__(self, lambda_l1=1e-3):
         super().__init__()
         self.lambda_l1 = lambda_l1
     
     def forward(self, trans_magnitude, rot_magnitude):
         """Compute L1 regularization on magnitude predictions."""
-        return self.lambda_l1 * (trans_magnitude.sum() + rot_magnitude.sum())
+        return self.lambda_l1 * (trans_magnitude.abs().sum() + rot_magnitude.abs().sum())
 
-def compute_loss(trans_magnitude, rot_magnitude, directions_logits, activity_logits,
+def compute_loss(trans_magnitude, rot_magnitude, directions_logits,
                  cumulative_transforms, direction_labels, activity_labels, device, logger, args):
     """Compute all loss components and total loss for training."""
     # Move inputs to device
     cumulative_transforms = cumulative_transforms.to(device)
     direction_labels = direction_labels.to(device)
     activity_labels = activity_labels.to(device)
-    trans_magnitude, rot_magnitude, directions_logits, activity_logits = [
-        x.to(device) for x in [trans_magnitude, rot_magnitude, directions_logits, activity_logits]
+    trans_magnitude, rot_magnitude, directions_logits = [
+        x.to(device) for x in [trans_magnitude, rot_magnitude, directions_logits]
     ]
     
     # Split activity_labels and cumulative_transforms into trans and rot
@@ -136,7 +124,7 @@ def compute_loss(trans_magnitude, rot_magnitude, directions_logits, activity_log
     translation_loss_fn = CumulativeTranslationLoss().to(device)
     rotation_loss_fn = CumulativeRotationLoss().to(device)
     direction_loss_fn = CumulativeDirectionLoss().to(device)
-    activity_loss_fn = CumulativeActivityLoss().to(device)
+    zero_loss_fn = CumulativeZeroLoss().to(device)
     l1_loss_fn = CumulativeL1Regularization().to(device)
     
     # Log prediction statistics
@@ -145,11 +133,11 @@ def compute_loss(trans_magnitude, rot_magnitude, directions_logits, activity_log
     logger.debug(f"Rot mag min: {rot_magnitude.min():.4f}, max: {rot_magnitude.max():.4f}, "
                  f"has_nan: {torch.isnan(rot_magnitude).any()}")
     
-    # Compute individual losses (no scaling, assuming pre-scaled inputs)
+    # Compute individual losses
     loss_trans = translation_loss_fn(trans_magnitude, cumulative_transforms_trans, activity_mask_trans)
     loss_rot = rotation_loss_fn(rot_magnitude, cumulative_transforms_rot, activity_mask_rot)
     loss_direction, direction_f1_scores = direction_loss_fn(directions_logits, direction_labels, activity_labels)
-    loss_activity, activity_f1_scores = activity_loss_fn(activity_logits, activity_labels)
+    loss_zero = zero_loss_fn(trans_magnitude, rot_magnitude, cumulative_transforms)
     loss_l1 = l1_loss_fn(trans_magnitude, rot_magnitude)
     
     # Collect losses and metrics
@@ -157,10 +145,9 @@ def compute_loss(trans_magnitude, rot_magnitude, directions_logits, activity_log
         'loss_trans': loss_trans,
         'loss_rot': loss_rot,
         'loss_direction': loss_direction,
-        'loss_activity': loss_activity,
+        'loss_zero': loss_zero,
         'loss_l1': loss_l1,
-        'direction_f1_scores': direction_f1_scores,
-        'activity_f1_scores': activity_f1_scores
+        'direction_f1_scores': direction_f1_scores
     }
     
     # Check for NaN/Inf
@@ -173,7 +160,7 @@ def compute_loss(trans_magnitude, rot_magnitude, directions_logits, activity_log
         args.w_trans * loss_trans +
         args.w_rot * loss_rot +
         args.w_direction * loss_direction +
-        args.w_activity * loss_activity +
+        args.w_zero * loss_zero +
         args.w_l1 * loss_l1
     )
     

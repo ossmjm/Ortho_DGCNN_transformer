@@ -75,8 +75,8 @@ def train(args):
         embed_dim=args.embed_dim,
         k=args.k,
         encoder_type=args.encoder_type,
-        num_layers= args.num_layers,
-        nhead = args.nhead
+        num_layers=args.num_layers,
+        nhead=args.nhead
     ).to(device)
     
     optimizer = Optimizers(
@@ -109,20 +109,18 @@ def train(args):
         'loss_trans': [],
         'loss_rot': [],
         'loss_direction': [],
-        'loss_activity': [],
+        'loss_zero': [],
         'loss_l1': [],
-        'direction_f1_scores': [],
-        'activity_f1_scores': []
+        'direction_f1_scores': []
     }
     val_loss_history = {
         'total': [],
         'loss_trans': [],
         'loss_rot': [],
         'loss_direction': [],
-        'loss_activity': [],
+        'loss_zero': [],
         'loss_l1': [],
-        'direction_f1_scores': [],
-        'activity_f1_scores': []
+        'direction_f1_scores': []
     }
 
     for epoch in range(args.epochs):
@@ -132,10 +130,9 @@ def train(args):
             'loss_trans': 0.0,
             'loss_rot': 0.0,
             'loss_direction': 0.0,
-            'loss_activity': 0.0,
+            'loss_zero': 0.0,
             'loss_l1': 0.0,
-            'direction_f1_scores': 0.0,
-            'activity_f1_scores': 0.0
+            'direction_f1_scores': 0.0
         }
         for batch_idx, batch in enumerate(train_loader):
             jaw_id, point_cloud, cumulative_transforms, cumulative_activity, activity_labels, direction_labels = batch
@@ -151,13 +148,12 @@ def train(args):
             
             optimizer.zero_grad()
 
-            trans_mag, rot_mag, directions, activities = model(point_cloud)
+            trans_mag, rot_mag, directions = model(point_cloud)
 
             total_loss, losses = compute_loss(
                 trans_magnitude=trans_mag,
                 rot_magnitude=rot_mag,
                 directions_logits=directions,
-                activity_logits=activities,
                 cumulative_transforms=cumulative_transforms,
                 direction_labels=direction_labels,
                 activity_labels=activity_labels,
@@ -185,10 +181,9 @@ def train(args):
                             f"Trans: {get_scalar_value(losses['loss_trans']):.4f}, "
                             f"Rot: {get_scalar_value(losses['loss_rot']):.4f}, "
                             f"Direction: {get_scalar_value(losses['loss_direction']):.4f}, "
-                            f"Activity: {get_scalar_value(losses['loss_activity']):.4f}, "
+                            f"Zero: {get_scalar_value(losses['loss_zero']):.4f}, "
                             f"L1: {get_scalar_value(losses['loss_l1']):.4f}, "
-                            f"Direction_F1: {get_scalar_value(losses['direction_f1_scores']):.4f}, "
-                            f"Activity_F1: {get_scalar_value(losses['activity_f1_scores']):.4f}")
+                            f"Direction_F1: {get_scalar_value(losses['direction_f1_scores']):.4f}")
 
         for key in train_losses:
             train_losses[key] /= len(train_loader)
@@ -203,10 +198,9 @@ def train(args):
             'loss_trans': 0.0,
             'loss_rot': 0.0,
             'loss_direction': 0.0,
-            'loss_activity': 0.0,
+            'loss_zero': 0.0,
             'loss_l1': 0.0,
-            'direction_f1_scores': 0.0,
-            'activity_f1_scores': 0.0
+            'direction_f1_scores': 0.0
         }
         with torch.no_grad():
             for batch in val_loader:
@@ -216,13 +210,12 @@ def train(args):
                 direction_labels = direction_labels.to(device)  # (batch_size, num_teeth, 6)
                 activity_labels = activity_labels.to(device)  # (batch_size, num_teeth, 6)
 
-                trans_mag, rot_mag, directions, activities = model(point_cloud)
+                trans_mag, rot_mag, directions = model(point_cloud)
 
                 total_loss, losses = compute_loss(
                     trans_magnitude=trans_mag,
                     rot_magnitude=rot_mag,
                     directions_logits=directions,
-                    activity_logits=activities,
                     cumulative_transforms=cumulative_transforms,
                     direction_labels=direction_labels,
                     activity_labels=activity_labels,
@@ -246,19 +239,17 @@ def train(args):
                     f"Train Loss: {get_scalar_value(train_losses['total']):.4f} (Trans: {get_scalar_value(train_losses['loss_trans']):.4f}, "
                     f"Rot: {get_scalar_value(train_losses['loss_rot']):.4f}, "
                     f"Direction: {get_scalar_value(train_losses['loss_direction']):.4f}, "
-                    f"Activity: {get_scalar_value(train_losses['loss_activity']):.4f}, "
+                    f"Zero: {get_scalar_value(train_losses['loss_zero']):.4f}, "
                     f"L1: {get_scalar_value(train_losses['loss_l1']):.4f}, "
-                    f"Direction_F1: {get_scalar_value(train_losses['direction_f1_scores']):.4f}, "
-                    f"Activity_F1: {get_scalar_value(train_losses['activity_f1_scores']):.4f})")
+                    f"Direction_F1: {get_scalar_value(train_losses['direction_f1_scores']):.4f})")
 
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
                     f"Val Loss: {get_scalar_value(val_losses['total']):.4f} (Trans: {get_scalar_value(val_losses['loss_trans']):.4f}, "
                     f"Rot: {get_scalar_value(val_losses['loss_rot']):.4f}, "
                     f"Direction: {get_scalar_value(val_losses['loss_direction']):.4f}, "
-                    f"Activity: {get_scalar_value(val_losses['loss_activity']):.4f}, "
+                    f"Zero: {get_scalar_value(val_losses['loss_zero']):.4f}, "
                     f"L1: {get_scalar_value(val_losses['loss_l1']):.4f}, "
-                    f"Direction_F1: {get_scalar_value(val_losses['direction_f1_scores']):.4f}, "
-                    f"Activity_F1: {get_scalar_value(val_losses['activity_f1_scores']):.4f})")
+                    f"Direction_F1: {get_scalar_value(val_losses['direction_f1_scores']):.4f})")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
@@ -376,7 +367,7 @@ if __name__ == "__main__":
     parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for translation loss')
     parser.add_argument('--w_rot', type=float, default=1.0, help='Weight for rotation loss')
     parser.add_argument('--w_direction', type=float, default=0.5, help='Weight for direction loss')
-    parser.add_argument('--w_activity', type=float, default=0.5, help='Weight for activity loss')
+    parser.add_argument('--w_zero', type=float, default=0.5, help='Weight for zero loss')
     parser.add_argument('--w_l1', type=float, default=1.0, help='Weight for L1 regularization')
     parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
     parser.add_argument('--optimizer_name', type=str, default='adamw', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan'], help='Optimizer type')

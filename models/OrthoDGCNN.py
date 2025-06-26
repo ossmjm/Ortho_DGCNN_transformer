@@ -85,13 +85,13 @@ class OrthoDGCNNModel(nn.Module):
             
         features = self.feature_norm(features)  # (batch_size, 14, embed_dim)
         
-        trans_mag, rot_mag, directions, activities = self.cumulative_model(features)
+        trans_mag, rot_mag, directions = self.cumulative_model(features)
         # trans_mag: (batch_size, 14, 3) for |Left/Right|, |Forward/Backward|, |Extrude/Intrude|
         # rot_mag: (batch_size, 14, 3) for |Buccal/Lingual|, |Mesial/Distal|, |Rotation|
         # directions: (batch_size, 14, 6) for direction probabilities (0=negative, 1=positive)
         # activities: (batch_size, 14, 6) for activity probabilities (0=inactive, 1=active)
         
-        outputs = [trans_mag, rot_mag, directions, activities]
+        outputs = [trans_mag, rot_mag, directions]
         
         for i, output in enumerate(outputs):
             if torch.isnan(output).any():
