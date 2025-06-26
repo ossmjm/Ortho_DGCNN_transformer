@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import logging
-from models.CumulativeTransformationModel import CumulativeTransformationModel
+from models.CumulativeTransformationModel import TransformerModel
 from models.DGCNN import DGCNN
 from models.pointnet2 import PointNetPlusPlus
 
@@ -11,12 +11,16 @@ class OrthoDGCNNModel(nn.Module):
         num_teeth: int = 14,
         num_points: int = 256,
         channels: int = 4,
-        embed_dim: int = 384,
+        embed_dim: int = 256,  # Must match TransformerModel's d_model
         k: int = 20,
-        encoder_type: str = 'dgcnn'  # New parameter to choose encoder
+        encoder_type: str = 'dgcnn',  # Choose encoder: 'dgcnn' or 'pointnet2'
+        num_layers: int = 4,
+        nhead: int = 8
     ):
         super().__init__()
         self.encoder_type = encoder_type
+        self.num_layers = num_layers
+        self.nhead = nhead
         valid_encoder_types = ['dgcnn', 'pointnet2']
         if encoder_type not in valid_encoder_types:
             raise ValueError(f"Invalid encoder_type: {encoder_type}. Must be one of {valid_encoder_types}")
@@ -37,7 +41,13 @@ class OrthoDGCNNModel(nn.Module):
                 num_teeth=num_teeth,
                 num_points=num_points
             )
-        self.cumulative_model = CumulativeTransformationModel(num_teeth=num_teeth, embed_dim=embed_dim)
+        self.cumulative_model = TransformerModel(
+            d_model=embed_dim,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=512,
+            dropout=0.1
+        )
         self.num_teeth = num_teeth
         self.embed_dim = embed_dim
         
@@ -66,23 +76,26 @@ class OrthoDGCNNModel(nn.Module):
             logger.error("NaN values detected in input coordinates")
             coordinates = torch.nan_to_num(coordinates, nan=0.0, posinf=1.0, neginf=-1.0)
             
-        features = self.encoder(coordinates)
-        logger.debug(f"size after dgcnn: {features.shape}")
+        features = self.encoder(coordinates)  # (batch_size, 14, embed_dim)
+        logger.debug(f"size after {self.encoder_type}: {features.shape}")
         
         if torch.isnan(features).any():
-            logger.error("NaN values detected in DGCNN features")
+            logger.error(f"NaN values detected in {self.encoder_type} features")
             features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
             
-        features = self.feature_norm(features)
+        features = self.feature_norm(features)  # (batch_size, 14, embed_dim)
         
-        transforms_trans, activity_logits, param_activity_logits_trans, transforms_rot, param_activity_logits_rot, directions_logits_rot,directions_logits_trans = self.cumulative_model(features)
+        trans_mag, rot_mag, directions, activities = self.cumulative_model(features)
+        # trans_mag: (batch_size, 14, 3) for |Left/Right|, |Forward/Backward|, |Extrude/Intrude|
+        # rot_mag: (batch_size, 14, 3) for |Buccal/Lingual|, |Mesial/Distal|, |Rotation|
+        # directions: (batch_size, 14, 6) for direction probabilities (0=negative, 1=positive)
+        # activities: (batch_size, 14, 6) for activity probabilities (0=inactive, 1=active)
         
-        outputs = [transforms_trans, activity_logits, param_activity_logits_trans, 
-                transforms_rot, param_activity_logits_rot, directions_logits_rot,directions_logits_trans]
+        outputs = [trans_mag, rot_mag, directions, activities]
         
         for i, output in enumerate(outputs):
             if torch.isnan(output).any():
-                print(f"NaN values detected in output {i}")
+                logger.error(f"NaN values detected in output {i}")
                 outputs[i] = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
                 
         return outputs

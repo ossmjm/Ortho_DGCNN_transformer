@@ -74,7 +74,9 @@ def train(args):
         channels=args.channels,
         embed_dim=args.embed_dim,
         k=args.k,
-        encoder_type=args.encoder_type
+        encoder_type=args.encoder_type,
+        num_layers= args.num_layers,
+        nhead = args.nhead
     ).to(device)
     
     optimizer = Optimizers(
@@ -104,75 +106,64 @@ def train(args):
 
     train_loss_history = {
         'total': [],
-        'loss_cumulative_trans': [],
-        'loss_cumulative_rot': [],
-        'loss_cumulative_activity': [],
-        'loss_cumulative_param_activity_trans': [],
-        'loss_cumulative_param_activity_rot': [],
-        'loss_cumulative_direction_trans': [],
-        'loss_cumulative_direction_rot': [],
-        'activity_f1_scores': [],
-        'param_activity_f1_scores_trans': [],
-        'param_activity_f1_scores_rot': [],
-        'direction_f1_scores_trans': [],
-        'direction_f1_scores_rot': []
+        'loss_trans': [],
+        'loss_rot': [],
+        'loss_direction': [],
+        'loss_activity': [],
+        'loss_l1': [],
+        'direction_f1_scores': [],
+        'activity_f1_scores': []
     }
     val_loss_history = {
         'total': [],
-        'loss_cumulative_trans': [],
-        'loss_cumulative_rot': [],
-        'loss_cumulative_activity': [],
-        'loss_cumulative_param_activity_trans': [],
-        'loss_cumulative_param_activity_rot': [],
-        'loss_cumulative_direction_trans': [],
-        'loss_cumulative_direction_rot': [],
-        'activity_f1_scores': [],
-        'param_activity_f1_scores_trans': [],
-        'param_activity_f1_scores_rot': [],
-        'direction_f1_scores_trans': [],
-        'direction_f1_scores_rot': []
+        'loss_trans': [],
+        'loss_rot': [],
+        'loss_direction': [],
+        'loss_activity': [],
+        'loss_l1': [],
+        'direction_f1_scores': [],
+        'activity_f1_scores': []
     }
 
     for epoch in range(args.epochs):
         model.train()
         train_losses = {
             'total': 0.0,
-            'loss_cumulative_trans': 0.0,
-            'loss_cumulative_rot': 0.0,
-            'loss_cumulative_activity': 0.0,
-            'loss_cumulative_param_activity_trans': 0.0,
-            'loss_cumulative_param_activity_rot': 0.0,
-            'loss_cumulative_direction_trans': 0.0,
-            'loss_cumulative_direction_rot': 0.0,
-            'activity_f1_scores': 0.0,
-            'param_activity_f1_scores_trans': 0.0,
-            'param_activity_f1_scores_rot': 0.0,
-            'direction_f1_scores_trans': 0.0,
-            'direction_f1_scores_rot': 0.0
+            'loss_trans': 0.0,
+            'loss_rot': 0.0,
+            'loss_direction': 0.0,
+            'loss_activity': 0.0,
+            'loss_l1': 0.0,
+            'direction_f1_scores': 0.0,
+            'activity_f1_scores': 0.0
         }
-        for batch_idx, (jaw_id, feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions) in enumerate(train_loader):
-            feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions = [
-                x.to(device) for x in [feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions]
-            ]
+        for batch_idx, batch in enumerate(train_loader):
+            jaw_id, point_cloud, cumulative_transforms, cumulative_activity, activity_labels, direction_labels = batch
+            point_cloud = point_cloud.to(device)  # (batch_size, num_teeth, num_points, channels)
+            cumulative_transforms = cumulative_transforms.to(device)  # (batch_size, num_teeth, 6)
+            direction_labels = direction_labels.to(device)  # (batch_size, num_teeth, 6)
+            activity_labels = activity_labels.to(device)  # (batch_size, num_teeth, 6)
             
-            logger.debug(f"Batch {batch_idx} shapes: feats={feats.shape}, "
-                        f"cumulative_transforms={cumulative_transforms.shape}, "
-                        f"cumulative_activity={cumulative_activity.shape}, "
-                        f"cumulative_param_activity={cumulative_param_activity.shape}, "
-                        f"directions={directions.shape}")
+            logger.debug(f"Batch {batch_idx} shapes: point_cloud={point_cloud.shape}, "
+                         f"cumulative_transforms={cumulative_transforms.shape}, "
+                         f"direction_labels={direction_labels.shape}, "
+                         f"activity_labels={activity_labels.shape}")
             
             optimizer.zero_grad()
 
-            (pred_cumulative_trans, pred_activity_logits, pred_param_activity_logits_trans,
-             pred_cumulative_rot, pred_param_activity_logits_rot,
-             directions_logits_rot, directions_logits_trans) = model(feats)
+            trans_mag, rot_mag, directions, activities = model(point_cloud)
 
             total_loss, losses = compute_loss(
-                pred_cumulative_trans, pred_cumulative_rot, pred_activity_logits,
-                pred_param_activity_logits_trans, pred_param_activity_logits_rot,
-                directions_logits_trans, directions_logits_rot,
-                cumulative_transforms, cumulative_activity, cumulative_param_activity, directions,
-                device, logger, args
+                trans_magnitude=trans_mag,
+                rot_magnitude=rot_mag,
+                directions_logits=directions,
+                activity_logits=activities,
+                cumulative_transforms=cumulative_transforms,
+                direction_labels=direction_labels,
+                activity_labels=activity_labels,
+                device=device,
+                logger=logger,
+                args=args
             )
 
             total_loss.backward()
@@ -186,26 +177,18 @@ def train(args):
 
             train_losses['total'] += total_loss.item()
             for key in losses:
-                if losses[key].numel() > 1:  # Check if tensor has multiple elements
-                    train_losses[key] += losses[key].mean().item()
-                else:
-                    train_losses[key] += losses[key].item()
+                train_losses[key] += get_scalar_value(losses[key])
 
             if batch_idx % 10 == 0:
                 logger.info(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, "
                             f"Total Loss: {total_loss.item():.4f}, "
-                            f"Cumulative_Trans: {get_scalar_value(losses['loss_cumulative_trans']):.4f}, "
-                            f"Cumulative_Rot: {get_scalar_value(losses['loss_cumulative_rot']):.4f}, "
-                            f"Cumulative_Activity: {get_scalar_value(losses['loss_cumulative_activity']):.4f}, "
-                            f"Cumulative_Param_Activity_Trans: {get_scalar_value(losses['loss_cumulative_param_activity_trans']):.4f}, "
-                            f"Cumulative_Param_Activity_Rot: {get_scalar_value(losses['loss_cumulative_param_activity_rot']):.4f}, "
-                            f"Cumulative_Direction_trans: {get_scalar_value(losses['loss_cumulative_direction_trans']):.4f}, "
-                            f"Cumulative_Direction_rot: {get_scalar_value(losses['loss_cumulative_direction_rot']):.4f}, "
-                            f"Activity_F1: {get_scalar_value(losses['activity_f1_scores']):.4f}, "
-                            f"Param_Activity_F1_Trans: {get_scalar_value(losses['param_activity_f1_scores_trans']):.4f}, "
-                            f"Param_Activity_F1_Rot: {get_scalar_value(losses['param_activity_f1_scores_rot']):.4f}, "
-                            f"Direction_F1_trans: {get_scalar_value(losses['direction_f1_scores_trans']):.4f}, "
-                            f"Direction_F1_rot: {get_scalar_value(losses['direction_f1_scores_rot']):.4f}")
+                            f"Trans: {get_scalar_value(losses['loss_trans']):.4f}, "
+                            f"Rot: {get_scalar_value(losses['loss_rot']):.4f}, "
+                            f"Direction: {get_scalar_value(losses['loss_direction']):.4f}, "
+                            f"Activity: {get_scalar_value(losses['loss_activity']):.4f}, "
+                            f"L1: {get_scalar_value(losses['loss_l1']):.4f}, "
+                            f"Direction_F1: {get_scalar_value(losses['direction_f1_scores']):.4f}, "
+                            f"Activity_F1: {get_scalar_value(losses['activity_f1_scores']):.4f}")
 
         for key in train_losses:
             train_losses[key] /= len(train_loader)
@@ -217,43 +200,40 @@ def train(args):
         model.eval()
         val_losses = {
             'total': 0.0,
-            'loss_cumulative_trans': 0.0,
-            'loss_cumulative_rot': 0.0,
-            'loss_cumulative_activity': 0.0,
-            'loss_cumulative_param_activity_trans': 0.0,
-            'loss_cumulative_param_activity_rot': 0.0,
-            'loss_cumulative_direction_trans': 0.0,
-            'loss_cumulative_direction_rot': 0.0,
-            'activity_f1_scores': 0.0,
-            'param_activity_f1_scores_trans': 0.0,
-            'param_activity_f1_scores_rot': 0.0,
-            'direction_f1_scores_trans': 0.0,
-            'direction_f1_scores_rot': 0.0
+            'loss_trans': 0.0,
+            'loss_rot': 0.0,
+            'loss_direction': 0.0,
+            'loss_activity': 0.0,
+            'loss_l1': 0.0,
+            'direction_f1_scores': 0.0,
+            'activity_f1_scores': 0.0
         }
         with torch.no_grad():
-            for jaw_id, feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions in val_loader:
-                feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions = [
-                    x.to(device) for x in [feats, cumulative_transforms, cumulative_activity, cumulative_param_activity, directions]
-                ]
+            for batch in val_loader:
+                jaw_id, point_cloud, cumulative_transforms, cumulative_activity, activity_labels, direction_labels = batch
+                point_cloud = point_cloud.to(device)  # (batch_size, num_teeth, num_points, channels)
+                cumulative_transforms = cumulative_transforms.to(device)  # (batch_size, num_teeth, 6)
+                direction_labels = direction_labels.to(device)  # (batch_size, num_teeth, 6)
+                activity_labels = activity_labels.to(device)  # (batch_size, num_teeth, 6)
 
-                (pred_cumulative_trans, pred_activity_logits, pred_param_activity_logits_trans,
-                 pred_cumulative_rot, pred_param_activity_logits_rot,
-                 directions_logits_rot, directions_logits_trans) = model(feats)
+                trans_mag, rot_mag, directions, activities = model(point_cloud)
 
                 total_loss, losses = compute_loss(
-                    pred_cumulative_trans, pred_cumulative_rot, pred_activity_logits,
-                    pred_param_activity_logits_trans, pred_param_activity_logits_rot,
-                    directions_logits_trans, directions_logits_rot,
-                    cumulative_transforms, cumulative_activity, cumulative_param_activity, directions,
-                    device, logger, args
+                    trans_magnitude=trans_mag,
+                    rot_magnitude=rot_mag,
+                    directions_logits=directions,
+                    activity_logits=activities,
+                    cumulative_transforms=cumulative_transforms,
+                    direction_labels=direction_labels,
+                    activity_labels=activity_labels,
+                    device=device,
+                    logger=logger,
+                    args=args
                 )
             
                 val_losses['total'] += total_loss.item()
                 for key in losses:
-                    if losses[key].numel() > 1:  # Check if tensor has multiple elements
-                        val_losses[key] += losses[key].mean().item()
-                    else:
-                        val_losses[key] += losses[key].item()
+                    val_losses[key] += get_scalar_value(losses[key])
 
         for key in val_losses:
             val_losses[key] /= len(val_loader)
@@ -263,32 +243,22 @@ def train(args):
             val_loss_history[key].append(val_losses[key])
 
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Train Loss: {get_scalar_value(train_losses['total']):.4f} (Cumulative_Trans: {get_scalar_value(train_losses['loss_cumulative_trans']):.4f}, "
-                    f"Cumulative_Rot: {get_scalar_value(train_losses['loss_cumulative_rot']):.4f}, "
-                    f"Cumulative_Activity: {get_scalar_value(train_losses['loss_cumulative_activity']):.4f}, "
-                    f"Cumulative_Param_Activity_Trans: {get_scalar_value(train_losses['loss_cumulative_param_activity_trans']):.4f}, "
-                    f"Cumulative_Param_Activity_Rot: {get_scalar_value(train_losses['loss_cumulative_param_activity_rot']):.4f}, "
-                    f"Cumulative_Direction_trans: {get_scalar_value(train_losses['loss_cumulative_direction_trans']):.4f}, "
-                    f"Cumulative_Direction_rot: {get_scalar_value(train_losses['loss_cumulative_direction_rot']):.4f}, "
-                    f"Activity_F1: {get_scalar_value(train_losses['activity_f1_scores']):.4f}, "
-                    f"Param_Activity_F1_Trans: {get_scalar_value(train_losses['param_activity_f1_scores_trans']):.4f}, "
-                    f"Param_Activity_F1_Rot: {get_scalar_value(train_losses['param_activity_f1_scores_rot']):.4f}, "
-                    f"Direction_F1_trans: {get_scalar_value(train_losses['direction_f1_scores_trans']):.4f}, "
-                    f"Direction_F1_rot: {get_scalar_value(train_losses['direction_f1_scores_rot']):.4f})")
+                    f"Train Loss: {get_scalar_value(train_losses['total']):.4f} (Trans: {get_scalar_value(train_losses['loss_trans']):.4f}, "
+                    f"Rot: {get_scalar_value(train_losses['loss_rot']):.4f}, "
+                    f"Direction: {get_scalar_value(train_losses['loss_direction']):.4f}, "
+                    f"Activity: {get_scalar_value(train_losses['loss_activity']):.4f}, "
+                    f"L1: {get_scalar_value(train_losses['loss_l1']):.4f}, "
+                    f"Direction_F1: {get_scalar_value(train_losses['direction_f1_scores']):.4f}, "
+                    f"Activity_F1: {get_scalar_value(train_losses['activity_f1_scores']):.4f})")
 
         logger.info(f"Epoch {epoch+1}/{args.epochs}, "
-                    f"Val Loss: {get_scalar_value(val_losses['total']):.4f} (Cumulative_Trans: {get_scalar_value(val_losses['loss_cumulative_trans']):.4f}, "
-                    f"Cumulative_Rot: {get_scalar_value(val_losses['loss_cumulative_rot']):.4f}, "
-                    f"Cumulative_Activity: {get_scalar_value(val_losses['loss_cumulative_activity']):.4f}, "
-                    f"Cumulative_Param_Activity_Trans: {get_scalar_value(val_losses['loss_cumulative_param_activity_trans']):.4f}, "
-                    f"Cumulative_Param_Activity_Rot: {get_scalar_value(val_losses['loss_cumulative_param_activity_rot']):.4f}, "
-                    f"Cumulative_Direction_trans: {get_scalar_value(val_losses['loss_cumulative_direction_trans']):.4f}, "
-                    f"Cumulative_Direction_rot: {get_scalar_value(val_losses['loss_cumulative_direction_rot']):.4f}, "
-                    f"Activity_F1: {get_scalar_value(val_losses['activity_f1_scores']):.4f}, "
-                    f"Param_Activity_F1_Trans: {get_scalar_value(val_losses['param_activity_f1_scores_trans']):.4f}, "
-                    f"Param_Activity_F1_Rot: {get_scalar_value(val_losses['param_activity_f1_scores_rot']):.4f}, "
-                    f"Direction_F1_trans: {get_scalar_value(val_losses['direction_f1_scores_trans']):.4f}, "
-                    f"Direction_F1_rot: {get_scalar_value(val_losses['direction_f1_scores_rot']):.4f})")
+                    f"Val Loss: {get_scalar_value(val_losses['total']):.4f} (Trans: {get_scalar_value(val_losses['loss_trans']):.4f}, "
+                    f"Rot: {get_scalar_value(val_losses['loss_rot']):.4f}, "
+                    f"Direction: {get_scalar_value(val_losses['loss_direction']):.4f}, "
+                    f"Activity: {get_scalar_value(val_losses['loss_activity']):.4f}, "
+                    f"L1: {get_scalar_value(val_losses['loss_l1']):.4f}, "
+                    f"Direction_F1: {get_scalar_value(val_losses['direction_f1_scores']):.4f}, "
+                    f"Activity_F1: {get_scalar_value(val_losses['activity_f1_scores']):.4f})")
 
         if (epoch + 1) % 5 == 0 and epoch != 0:
             checkpoint = {
@@ -305,14 +275,14 @@ def train(args):
             for key in train_loss_history:
                 np.save(
                     os.path.join(args.output_dir, f'train_{key}_history.npy'),
-                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+                    np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in train_loss_history[key]])
                 )
                 logger.info(f"Saved train {key} history")
 
             for key in val_loss_history:
                 np.save(
                     os.path.join(args.output_dir, f'val_{key}_history.npy'),
-                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+                    np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in val_loss_history[key]])
                 )
                 logger.info(f"Saved validation {key} history")
 
@@ -338,14 +308,14 @@ def train(args):
             for key in train_loss_history:
                 np.save(
                     os.path.join(args.output_dir, f'train_{key}_history.npy'),
-                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+                    np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in train_loss_history[key]])
                 )
                 logger.info(f"Saved train {key} history")
 
             for key in val_loss_history:
                 np.save(
                     os.path.join(args.output_dir, f'val_{key}_history.npy'),
-                    np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+                    np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in val_loss_history[key]])
                 )
                 logger.info(f"Saved validation {key} history")
 
@@ -369,14 +339,14 @@ def train(args):
     for key in train_loss_history:
         np.save(
             os.path.join(args.output_dir, f'train_{key}_history.npy'),
-            np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in train_loss_history[key]])
+            np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in train_loss_history[key]])
         )
         logger.info(f"Saved train {key} history")
 
     for key in val_loss_history:
         np.save(
             os.path.join(args.output_dir, f'val_{key}_history.npy'),
-            np.array([x.detach().cpu().item() if torch.is_tensor(x) else x for x in val_loss_history[key]])
+            np.array([x if not torch.is_tensor(x) else x.detach().cpu().item() for x in val_loss_history[key]])
         )
         logger.info(f"Saved validation {key} history")
 
@@ -391,22 +361,24 @@ if __name__ == "__main__":
     parser.add_argument('--num_points', type=int, default=256, help='Number of points per tooth')
     parser.add_argument('--channels', type=int, default=3, help='Number of feature channels')
     parser.add_argument('--train_ratio', type=float, default=0.8, help='Train/validation split ratio')
-    parser.add_argument('--use_scaler', type=bool, default=False, help='Apply scaler to transformations')
+    parser.add_argument('--use_scaler', type=bool, default=True, help='Apply scaler to transformations')
     parser.add_argument('--scaler_type', type=str, default='robust', choices=['robust', 'standard'], help='Scaler type')
     parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
     parser.add_argument('--encoder_type', type=str, default='dgcnn', help='Encoder type (DGCNN or pointnet++)')
     parser.add_argument('--k', type=int, default=20, help='Number of k in DGCNN')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of layers in transformer encoder')
+    parser.add_argument('--nhead', type=int, default=8, help='Number of heads in transformer encoder')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='Weight decay')
     parser.add_argument('--num_teeth', type=int, default=14, help='Number of teeth')
-    parser.add_argument('--w_cumulative_trans', type=float, default=5.0, help='Weight for cumulative loss')
-    parser.add_argument('--w_cumulative_rot', type=float, default=1.0, help='Weight for cumulative loss')
-    parser.add_argument('--w_cumulative_activity', type=float, default=5.0, help='Weight for cumulative activity loss')
-    parser.add_argument('--w_cumulative_param_activity', type=float, default=5.0, help='Weight for cumulative param activity loss')
-    parser.add_argument('--w_cumulative_direction', type=float, default=5.0, help='Weight for cumulative direction loss')
-    parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for translation loss')
+    parser.add_argument('--w_rot', type=float, default=1.0, help='Weight for rotation loss')
+    parser.add_argument('--w_direction', type=float, default=0.5, help='Weight for direction loss')
+    parser.add_argument('--w_activity', type=float, default=0.5, help='Weight for activity loss')
+    parser.add_argument('--w_l1', type=float, default=1.0, help='Weight for L1 regularization')
+    parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
     parser.add_argument('--optimizer_name', type=str, default='adamw', choices=['adamw', 'radam', 'lion', 'sparseadam', 'adan'], help='Optimizer type')
     parser.add_argument('--use_scheduler', type=bool, default=True, help='Use learning rate scheduler')
     parser.add_argument('--scheduler_name', type=str, default='cosineannealing', choices=['cosineannealing', 'reduceonplateau', 'linear'], help='Scheduler type')
