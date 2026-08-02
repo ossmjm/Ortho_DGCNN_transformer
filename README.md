@@ -1,4 +1,4 @@
-# tooth-movement-prediction
+# ortho-tooth-transform-predictor
 
 Deep learning pipeline for predicting **per-tooth orthodontic movement** (clear‑aligner staging) directly from **3D tooth point clouds**. Given a segmented lower-arch scan at the start of treatment, the model predicts the **cumulative 6‑degree‑of‑freedom transformation** (3 translation + 3 rotation components) each tooth undergoes by the end of treatment, along with which parameters are actively involved in the movement and their direction.
 
